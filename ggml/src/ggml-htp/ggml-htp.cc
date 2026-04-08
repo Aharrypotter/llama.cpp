@@ -236,7 +236,7 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
 // backend interface
 
 static const char * ggml_backend_htp_get_name(ggml_backend_t backend) {
-    return "MyHTP";
+    return "HTP";
 
     GGML_UNUSED(backend);
 }
@@ -303,6 +303,7 @@ static struct ggml_backend_i htp_backend_i = {
     /* .graph_compute           = */ ggml_backend_htp_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
+    /* .graph_optimize          = */ nullptr,
 };
 
 static ggml_guid_t ggml_backend_htp_guid(void) {
@@ -421,7 +422,7 @@ static const struct ggml_backend_device_i ggml_backend_htp_device_i = {
 // backend reg interface
 
 static const char * ggml_backend_htp_reg_get_name(ggml_backend_reg_t reg) {
-    return "MyHTP";
+    return "HTP";
 
     GGML_UNUSED(reg);
 }

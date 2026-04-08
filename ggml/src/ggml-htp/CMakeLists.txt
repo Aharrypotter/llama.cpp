@@ -1,4 +1,4 @@
-message(STATUS "Using My Hexagon backend")
+message(STATUS "Including HTP backend")
 
 set(GGML_SOURCES_HTP 
     ggml-htp.cc
