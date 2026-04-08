@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <hexagon_protos.h>
+#include <hvx_hexagon_protos.h>
 #include <string.h>
 
 #include <HAP_farf.h>
@@ -788,7 +790,8 @@ static int hmx_mat_mul_permuted_w16a32_batched_legacy(struct htp_context *ctx,
                                               hmx_matmul_activation_batch_ptr(params, b2, b3),
                                               hmx_matmul_weight_batch_ptr(params, b2, b3),
                                               params->m, params->k, params->n,
-                                              params->act_stride, params->weight_stride);
+                                              params->act_stride, params->weight_stride,
+                                              false, 0);
         }
     }
     return ret;
@@ -986,9 +989,522 @@ int hmx_mat_mul_permuted_w16a32_batched(struct htp_context *ctx, const hmx_matmu
   return 0;
 }
 
+#ifdef GGML_HEXAGON_HMX_EXPERIMENTAL
+static bool htp_hmx_support_exp_matmul(const struct htp_general_req *req, size_t n_bufs) {
+    if (!req || n_bufs < 3) {
+        return false;
+    }
+
+    if (!(req->flags & HTP_OPFLAGS_PREFER_EXP_KERNEL)) {
+        return false;
+    }
+
+    if (req->dst.type != HTP_TYPE_F32 || req->src1.type != HTP_TYPE_F32) {
+        return false;
+    }
+
+    if (req->src0.ne[1] % 32 != 0 || req->src1.ne[1] == 0) {
+        return false;
+    }
+
+    if (req->src0.nb[0] > req->src0.nb[1] || req->src1.nb[0] > req->src1.nb[1]) {
+        return false;
+    }
+
+    const bool is_batched = (req->src0.ne[2] * req->src0.ne[3] > 1 ||
+                             req->src1.ne[2] * req->src1.ne[3] > 1);
+
+    switch (req->src0.type) {
+        case HTP_TYPE_F16:
+            return req->src0.ne[0] % 32 == 0;
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_Q8_0:
+        case HTP_TYPE_IQ4_NL:
+        case HTP_TYPE_MXFP4:
+            return !is_batched && req->src0.ne[0] % 256 == 0;
+        default:
+            return false;
+    }
+}
+
+static bool htp_weight_cache_match(const struct htp_weight_cache_entry *entry,
+                                   const struct htp_general_req *req,
+                                   const void *src0,
+                                   size_t src0_size) {
+    return entry &&
+           entry->valid &&
+           entry->src_addr == (uintptr_t) src0 &&
+           entry->size == src0_size &&
+           entry->type == req->src0.type &&
+           entry->ne0 == req->src0.ne[0] &&
+           entry->ne1 == req->src0.ne[1] &&
+           entry->nb0 == req->src0.nb[0] &&
+           entry->nb1 == req->src0.nb[1] &&
+           entry->vtcm_ptr != NULL;
+}
+
+static const uint8_t *htp_weight_cache_lookup(struct htp_context *ctx,
+                                              const struct htp_general_req *req,
+                                              const void *src0,
+                                              size_t src0_size) {
+    if (!ctx || !req || !src0 || src0_size == 0) {
+        return NULL;
+    }
+
+    if (ctx->weight_cache.slot_size == 0 || ctx->weight_cache.base == NULL) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < HTP_WEIGHT_CACHE_NWAYS; ++i) {
+        struct htp_weight_cache_entry *entry = &ctx->weight_cache.entries[i];
+        if (htp_weight_cache_match(entry, req, src0, src0_size) && entry->epoch == ctx->weight_cache.epoch) {
+            ctx->weight_cache_stats.raw_hit++;
+            return entry->vtcm_ptr;
+        }
+    }
+
+    ctx->weight_cache_stats.raw_miss++;
+    return NULL;
+}
+
+static const uint8_t *htp_weight_cache_insert(struct htp_context *ctx,
+                                              const struct htp_general_req *req,
+                                              const uint8_t *src0,
+                                              size_t src0_size) {
+    if (!ctx || !req || !src0 || src0_size == 0) {
+        return NULL;
+    }
+
+    if (ctx->weight_cache.slot_size == 0 || ctx->weight_cache.base == NULL || src0_size > ctx->weight_cache.slot_size) {
+        return NULL;
+    }
+
+    const uint32_t slot = ctx->weight_cache.next_victim++ % HTP_WEIGHT_CACHE_NWAYS;
+    uint8_t *dst = ctx->weight_cache.base + slot * ctx->weight_cache.slot_size;
+
+    memcpy(dst, src0, src0_size);
+
+    struct htp_weight_cache_entry *entry = &ctx->weight_cache.entries[slot];
+    entry->src_addr = (uintptr_t) src0;
+    entry->size     = src0_size;
+    entry->epoch    = ctx->weight_cache.epoch;
+    entry->type     = req->src0.type;
+    entry->ne0      = req->src0.ne[0];
+    entry->ne1      = req->src0.ne[1];
+    entry->nb0      = req->src0.nb[0];
+    entry->nb1      = req->src0.nb[1];
+    entry->vtcm_ptr = dst;
+    entry->valid    = 1;
+
+    return dst;
+}
+
+static int htp_weight_cache_stats_type_idx(int weight_type) {
+    switch (weight_type) {
+        case HTP_TYPE_F16:
+            return 0;
+        case HTP_TYPE_Q4_0:
+            return 1;
+        case HTP_TYPE_Q8_0:
+            return 2;
+        case HTP_TYPE_IQ4_NL:
+            return 3;
+        case HTP_TYPE_MXFP4:
+            return 4;
+        default:
+            return -1;
+    }
+}
+
+static void htp_weight_tile_cache_count_hit(struct htp_context *ctx, int weight_type) {
+    const int idx = htp_weight_cache_stats_type_idx(weight_type);
+    if (ctx && idx >= 0 && idx < HTP_WEIGHT_CACHE_STATS_TYPES) {
+        ctx->weight_cache_stats.tile_hit[idx]++;
+    }
+}
+
+static void htp_weight_tile_cache_count_miss(struct htp_context *ctx, int weight_type) {
+    const int idx = htp_weight_cache_stats_type_idx(weight_type);
+    if (ctx && idx >= 0 && idx < HTP_WEIGHT_CACHE_STATS_TYPES) {
+        ctx->weight_cache_stats.tile_miss[idx]++;
+    }
+}
+
+static void htp_weight_tile_cache_count_fill(struct htp_context *ctx, int weight_type) {
+    const int idx = htp_weight_cache_stats_type_idx(weight_type);
+    if (ctx && idx >= 0 && idx < HTP_WEIGHT_CACHE_STATS_TYPES) {
+        ctx->weight_cache_stats.tile_fill[idx]++;
+    }
+}
+
+static void htp_weight_tile_cache_count_evict(struct htp_context *ctx, int weight_type) {
+    const int idx = htp_weight_cache_stats_type_idx(weight_type);
+    if (ctx && idx >= 0 && idx < HTP_WEIGHT_CACHE_STATS_TYPES) {
+        ctx->weight_cache_stats.tile_evict[idx]++;
+    }
+}
+
+static void htp_weight_tile_cache_log_stats(struct htp_context *ctx) {
+#if defined(ENABLE_PROFILE_TIMERS)
+    if (!ctx) {
+        return;
+    }
+    FARF(HIGH, "  cache raw hit=%llu miss=%llu",
+         (unsigned long long) ctx->weight_cache_stats.raw_hit,
+         (unsigned long long) ctx->weight_cache_stats.raw_miss);
+    FARF(HIGH,
+         "  cache tile F16 h/m/f/e=%llu/%llu/%llu/%llu Q4 h/m/f/e=%llu/%llu/%llu/%llu Q8 h/m/f/e=%llu/%llu/%llu/%llu IQ4 h/m/f/e=%llu/%llu/%llu/%llu MXFP4 h/m/f/e=%llu/%llu/%llu/%llu",
+         (unsigned long long) ctx->weight_cache_stats.tile_hit[0],
+         (unsigned long long) ctx->weight_cache_stats.tile_miss[0],
+         (unsigned long long) ctx->weight_cache_stats.tile_fill[0],
+         (unsigned long long) ctx->weight_cache_stats.tile_evict[0],
+         (unsigned long long) ctx->weight_cache_stats.tile_hit[1],
+         (unsigned long long) ctx->weight_cache_stats.tile_miss[1],
+         (unsigned long long) ctx->weight_cache_stats.tile_fill[1],
+         (unsigned long long) ctx->weight_cache_stats.tile_evict[1],
+         (unsigned long long) ctx->weight_cache_stats.tile_hit[2],
+         (unsigned long long) ctx->weight_cache_stats.tile_miss[2],
+         (unsigned long long) ctx->weight_cache_stats.tile_fill[2],
+         (unsigned long long) ctx->weight_cache_stats.tile_evict[2],
+         (unsigned long long) ctx->weight_cache_stats.tile_hit[3],
+         (unsigned long long) ctx->weight_cache_stats.tile_miss[3],
+         (unsigned long long) ctx->weight_cache_stats.tile_fill[3],
+         (unsigned long long) ctx->weight_cache_stats.tile_evict[3],
+         (unsigned long long) ctx->weight_cache_stats.tile_hit[4],
+         (unsigned long long) ctx->weight_cache_stats.tile_miss[4],
+         (unsigned long long) ctx->weight_cache_stats.tile_fill[4],
+         (unsigned long long) ctx->weight_cache_stats.tile_evict[4]);
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
+static size_t htp_weight_tile_bytes(size_t n_cols, size_t k) {
+    return n_cols * k * sizeof(__fp16);
+}
+
+static bool htp_weight_tile_cache_match(const struct htp_weight_tile_cache_entry *entry,
+                                        uintptr_t src0_key,
+                                        int weight_type,
+                                        int k,
+                                        int n,
+                                        size_t row_stride,
+                                        size_t chunk_col,
+                                        size_t chunk_cols,
+                                        size_t payload_size,
+                                        uint32_t cache_epoch) {
+    return entry &&
+           entry->valid &&
+           entry->epoch == cache_epoch &&
+           entry->src_addr == src0_key &&
+           entry->payload_size == payload_size &&
+           entry->type == (uint32_t) weight_type &&
+           entry->k == (uint32_t) k &&
+           entry->n == (uint32_t) n &&
+           entry->row_stride == (uint32_t) row_stride &&
+           entry->chunk_col == (uint32_t) chunk_col &&
+           entry->chunk_cols == (uint32_t) chunk_cols &&
+           entry->vtcm_ptr != NULL;
+}
+
+static const __fp16 *htp_weight_tile_cache_lookup(struct htp_context *ctx,
+                                                  uintptr_t src0_key,
+                                                  int weight_type,
+                                                  int k,
+                                                  int n,
+                                                  size_t row_stride,
+                                                  size_t chunk_col,
+                                                  size_t chunk_cols,
+                                                  size_t payload_size) {
+    if (!ctx || !src0_key || payload_size == 0) {
+        return NULL;
+    }
+
+    if (ctx->weight_tile_cache.slot_size == 0 || ctx->weight_tile_cache.base == NULL) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < HTP_WEIGHT_TILE_CACHE_NWAYS; ++i) {
+        struct htp_weight_tile_cache_entry *entry = &ctx->weight_tile_cache.entries[i];
+        if (htp_weight_tile_cache_match(entry, src0_key, weight_type, k, n, row_stride, chunk_col, chunk_cols, payload_size, ctx->weight_tile_cache.epoch)) {
+            htp_weight_tile_cache_count_hit(ctx, weight_type);
+            return (const __fp16 *) entry->vtcm_ptr;
+        }
+    }
+
+    htp_weight_tile_cache_count_miss(ctx, weight_type);
+    return NULL;
+}
+
+static __fp16 *htp_weight_tile_cache_reserve(struct htp_context *ctx,
+                                             size_t payload_size,
+                                             uint32_t *slot_out) {
+    if (!ctx || !slot_out || payload_size == 0) {
+        return NULL;
+    }
+
+    if (ctx->weight_tile_cache.slot_size == 0 ||
+        ctx->weight_tile_cache.base == NULL ||
+        payload_size > ctx->weight_tile_cache.slot_size) {
+        return NULL;
+    }
+
+    const uint32_t slot = ctx->weight_tile_cache.next_victim++ % HTP_WEIGHT_TILE_CACHE_NWAYS;
+    struct htp_weight_tile_cache_entry *entry = &ctx->weight_tile_cache.entries[slot];
+    if (entry->valid && entry->epoch == ctx->weight_tile_cache.epoch) {
+        htp_weight_tile_cache_count_evict(ctx, (int) entry->type);
+    }
+    ctx->weight_tile_cache.entries[slot].valid = 0;
+    *slot_out = slot;
+    return (__fp16 *) (ctx->weight_tile_cache.base + slot * ctx->weight_tile_cache.slot_size);
+}
+
+static void htp_weight_tile_cache_store(struct htp_context *ctx,
+                                        uint32_t slot,
+                                        uintptr_t src0_key,
+                                        int weight_type,
+                                        int k,
+                                        int n,
+                                        size_t row_stride,
+                                        size_t chunk_col,
+                                        size_t chunk_cols,
+                                        size_t payload_size) {
+    if (!ctx || slot >= HTP_WEIGHT_TILE_CACHE_NWAYS) {
+        return;
+    }
+
+    struct htp_weight_tile_cache_entry *entry = &ctx->weight_tile_cache.entries[slot];
+    entry->src_addr    = src0_key;
+    entry->payload_size = payload_size;
+    entry->epoch       = ctx->weight_tile_cache.epoch;
+    entry->type        = (uint32_t) weight_type;
+    entry->k           = (uint32_t) k;
+    entry->n           = (uint32_t) n;
+    entry->row_stride  = (uint32_t) row_stride;
+    entry->chunk_col   = (uint32_t) chunk_col;
+    entry->chunk_cols  = (uint32_t) chunk_cols;
+    entry->vtcm_ptr    = ctx->weight_tile_cache.base + slot * ctx->weight_tile_cache.slot_size;
+    entry->valid       = 1;
+    htp_weight_tile_cache_count_fill(ctx, weight_type);
+}
+
+static const void *htp_hmx_prepare_src0_once(struct htp_context *ctx,
+                                             const struct htp_general_req *req,
+                                             const struct dspqueue_buffer *bufs,
+                                             size_t n_bufs) {
+    if (!ctx || !req || !bufs || n_bufs < 3 || bufs[0].ptr == NULL || bufs[0].size == 0) {
+        return NULL;
+    }
+
+    const uint8_t *src0 = (const uint8_t *) bufs[0].ptr;
+
+    if (!(req->flags & HTP_OPFLAGS_SRC0_STATIC) || !ctx->vtcm_valid) {
+        return src0;
+    }
+
+    const uint8_t *cached = htp_weight_cache_lookup(ctx, req, src0, bufs[0].size);
+    if (cached != NULL) {
+        return cached;
+    }
+
+    cached = htp_weight_cache_insert(ctx, req, src0, bufs[0].size);
+    return cached != NULL ? cached : src0;
+}
+
+static int htp_hmx_preload_activation_tiles(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs) {
+    if (!ctx || !req || !bufs || n_bufs < 3) {
+        return -1;
+    }
+
+    if (!(req->flags & HTP_OPFLAGS_PREFER_PRELOAD) || !ctx->matmul_cfg.prefer_preload) {
+        return 0;
+    }
+
+    return 0;
+}
+
+static int htp_hmx_preload_weight_tiles(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs) {
+    if (!ctx || !req || !bufs || n_bufs < 3) {
+        return -1;
+    }
+
+    if (!(req->flags & HTP_OPFLAGS_PREFER_PRELOAD) || !ctx->matmul_cfg.prefer_preload) {
+        return 0;
+    }
+
+    return htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs) != NULL ? 0 : -1;
+}
+
+static int htp_hmx_matmul_exp_f16_f32(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs, int m) {
+    const void *prepared_weight = htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs);
+    if (prepared_weight == NULL) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_activation_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_weight_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    const bool is_batched = (req->src0.ne[2] * req->src0.ne[3] > 1 ||
+                             req->src1.ne[2] * req->src1.ne[3] > 1);
+    const int k = (int) req->src0.ne[0];
+    const int n = (int) req->src0.ne[1];
+    const int act_stride = (int) (req->src1.nb[1] / sizeof(float));
+    const int weight_stride = (int) (req->src0.nb[1] / sizeof(__fp16));
+    const bool src0_static = (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0;
+    const uintptr_t src0_key = (uintptr_t) bufs[0].ptr;
+
+    if (is_batched) {
+        hmx_matmul_w16a32_batched_params_t batch_params = {
+            .dst             = (float *) bufs[2].ptr,
+            .activation      = (const float *) bufs[1].ptr,
+            .permuted_weight = (const __fp16 *) prepared_weight,
+            .m               = m,
+            .k               = k,
+            .n               = n,
+            .act_stride      = act_stride,
+            .weight_stride   = weight_stride,
+            .dst_stride      = (int) (req->dst.nb[1] / sizeof(float)),
+            .ne02            = (int) req->src0.ne[2],
+            .ne03            = (int) req->src0.ne[3],
+            .ne12            = (int) req->src1.ne[2],
+            .ne13            = (int) req->src1.ne[3],
+            .src0_nb2        = req->src0.nb[2],
+            .src0_nb3        = req->src0.nb[3],
+            .src1_nb2        = req->src1.nb[2],
+            .src1_nb3        = req->src1.nb[3],
+            .dst_nb2         = req->dst.nb[2],
+            .dst_nb3         = req->dst.nb[3],
+        };
+
+        return hmx_mat_mul_permuted_w16a32_batched(ctx, &batch_params);
+    }
+
+    return hmx_mat_mul_permuted_w16a32(ctx,
+                                       (float *) bufs[2].ptr,
+                                       (const float *) bufs[1].ptr,
+                                       (const __fp16 *) prepared_weight,
+                                       m,
+                                       k,
+                                       n,
+                                       act_stride,
+                                       weight_stride,
+                                       src0_static,
+                                       src0_key);
+}
+
+static int htp_hmx_matmul_exp_q4_0_f32(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs, int m) {
+    const void *prepared_weight = htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs);
+    if (prepared_weight == NULL) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_activation_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_weight_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    return hmx_mat_mul_permuted_qk_0_d16a32(ctx, (float *) bufs[2].ptr, (const float *) bufs[1].ptr, (const uint8_t *) prepared_weight,
+                                            m, (int) req->src0.ne[0], (int) req->src0.ne[1], HTP_TYPE_Q4_0,
+                                            (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0, (uintptr_t) bufs[0].ptr);
+}
+
+static int htp_hmx_matmul_exp_q8_0_f32(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs, int m) {
+    const void *prepared_weight = htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs);
+    if (prepared_weight == NULL) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_activation_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_weight_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    return hmx_mat_mul_permuted_qk_0_d16a32(ctx, (float *) bufs[2].ptr, (const float *) bufs[1].ptr, (const uint8_t *) prepared_weight,
+                                            m, (int) req->src0.ne[0], (int) req->src0.ne[1], HTP_TYPE_Q8_0,
+                                            (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0, (uintptr_t) bufs[0].ptr);
+}
+
+static int htp_hmx_matmul_exp_iq4_nl_f32(struct htp_context *ctx, const struct htp_general_req *req, const struct dspqueue_buffer *bufs, size_t n_bufs, int m) {
+    const void *prepared_weight = htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs);
+    if (prepared_weight == NULL) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_activation_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    if (htp_hmx_preload_weight_tiles(ctx, req, bufs, n_bufs) != 0) {
+        return -1;
+    }
+
+    return hmx_mat_mul_permuted_qk_0_d16a32(ctx, (float *) bufs[2].ptr, (const float *) bufs[1].ptr, (const uint8_t *) prepared_weight,
+                                            m, (int) req->src0.ne[0], (int) req->src0.ne[1], HTP_TYPE_IQ4_NL,
+                                            (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0, (uintptr_t) bufs[0].ptr);
+}
+
+int htp_hmx_matmul_try_exp(struct htp_context *ctx,
+                           const struct htp_general_req *req,
+                           const struct dspqueue_buffer *bufs,
+                           size_t n_bufs,
+                           int m) {
+    if (!htp_hmx_support_exp_matmul(req, n_bufs)) {
+        return 1;
+    }
+
+    switch (req->src0.type) {
+        case HTP_TYPE_F16:
+            return htp_hmx_matmul_exp_f16_f32(ctx, req, bufs, n_bufs, m);
+        case HTP_TYPE_Q4_0:
+            return htp_hmx_matmul_exp_q4_0_f32(ctx, req, bufs, n_bufs, m);
+        case HTP_TYPE_Q8_0:
+            return htp_hmx_matmul_exp_q8_0_f32(ctx, req, bufs, n_bufs, m);
+        case HTP_TYPE_IQ4_NL:
+            return htp_hmx_matmul_exp_iq4_nl_f32(ctx, req, bufs, n_bufs, m);
+        case HTP_TYPE_MXFP4:
+            {
+                const void *prepared_weight = htp_hmx_prepare_src0_once(ctx, req, bufs, n_bufs);
+                if (prepared_weight == NULL) {
+                    return -1;
+                }
+                return hmx_mat_mul_permuted_qk_0_d16a32(ctx, (float *) bufs[2].ptr, (const float *) bufs[1].ptr, (const uint8_t *) prepared_weight,
+                                                        m, (int) req->src0.ne[0], (int) req->src0.ne[1], HTP_TYPE_MXFP4,
+                                                        (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0, (uintptr_t) bufs[0].ptr);
+            }
+        default:
+            return 1;
+    }
+}
+#else
+int htp_hmx_matmul_try_exp(struct htp_context *ctx,
+                           const struct htp_general_req *req,
+                           const struct dspqueue_buffer *bufs,
+                           size_t n_bufs,
+                           int m) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(req);
+    GGML_UNUSED(bufs);
+    GGML_UNUSED(n_bufs);
+    GGML_UNUSED(m);
+    return 1;
+}
+#endif
+
 int hmx_mat_mul_permuted_w16a32(struct htp_context *ctx, float *restrict dst, const float *restrict activation,
                                 const __fp16 *restrict permuted_weight, int m, int k, int n,
-                                int act_stride, int weight_stride) {
+                                int act_stride, int weight_stride,
+                                bool src0_static, uintptr_t src0_key) {
     if (!dst || !activation || !permuted_weight || !m || !n || !k) { return -1; }
     if (act_stride < k || weight_stride < k) { return -1; }
     if (k % 32 != 0 || n % 32 != 0) { return -1; }
@@ -1078,60 +1594,98 @@ int hmx_mat_mul_permuted_w16a32(struct htp_context *ctx, float *restrict dst, co
         }
         TIMER_STOP(activation_load);
 
-        const size_t fp16_row_bytes    = (size_t) k * sizeof(__fp16);
-        const size_t weight_row_bytes  = (size_t) weight_stride * sizeof(__fp16);
+        const size_t fp16_row_bytes   = (size_t) k * sizeof(__fp16);
+        const size_t weight_row_bytes = (size_t) weight_stride * sizeof(__fp16);
+        const bool use_tile_cache = src0_static && src0_key != 0 && ctx->weight_tile_cache.slot_size >= weight_area_size;
 
-        void *buf_curr = vtcm_scratch0;
-        void *buf_next = vtcm_scratch1;
+        if (use_tile_cache) {
+            void *buf_curr = vtcm_scratch0;
+            for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
+                const size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+                const size_t tile_bytes = htp_weight_tile_bytes(n_cols, k);
+                const __fp16 *weight_tiles = htp_weight_tile_cache_lookup(ctx, src0_key, HTP_TYPE_F16, k, n,
+                                                                          (size_t) weight_stride, nc, n_cols, tile_bytes);
 
-        // issue async DMA for the first weight chunk
-        // NOTE: use 2D DMA (n_cols rows x fp16_row_bytes) to avoid 16-bit roiwidth overflow.
-        // The source rows can be strided (e.g. KV-cache K after ggml_permute).
-        {
-            const size_t n_cols_first = hex_smin(n, n_chunk_n_cols);
+                TIMER_START(weight_load);
+                if (weight_tiles == NULL) {
+                    uint32_t cache_slot = 0;
+                    __fp16 *tile_dst = htp_weight_tile_cache_reserve(ctx, tile_bytes, &cache_slot);
+                    weight_tiles = tile_dst != NULL ? tile_dst : vtcm_weight;
 
-            dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, permuted_weight),
-                              fp16_row_bytes, weight_row_bytes, fp16_row_bytes, n_cols_first);
-        }
+                    const __fp16 *weight_chunk = permuted_weight + nc * weight_stride;
+                    dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, weight_chunk),
+                                   fp16_row_bytes, weight_row_bytes, fp16_row_bytes, n_cols);
+                    dma_queue_pop(ctx->dma[0]);
+                    interleave_fp16_weight_chunk_to_tiles((__fp16 *) weight_tiles, (const __fp16 *) buf_curr, n_cols, k);
 
-        for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
-            size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
-
-            TIMER_START(weight_load);
-            {
-                dma_queue_pop(ctx->dma[0]);  // wait until current weight chunk is ready
-
-                // issue async DMA for the next weight chunk (double buffering)
-                const size_t nc_next = nc + n_chunk_n_cols;
-                if (nc_next < n) {
-                    const size_t n_cols_next       = hex_smin(n - nc_next, n_chunk_n_cols);
-                    const __fp16 *next_weight_chunk = permuted_weight + nc_next * weight_stride;
-
-                    dma_queue_push(ctx->dma[0], dma_make_ptr(buf_next, next_weight_chunk),
-                                      fp16_row_bytes, weight_row_bytes, fp16_row_bytes, n_cols_next);
+                    if (tile_dst != NULL) {
+                        htp_weight_tile_cache_store(ctx, cache_slot, src0_key, HTP_TYPE_F16, k, n,
+                                                    (size_t) weight_stride, nc, n_cols, tile_bytes);
+                    }
                 }
+                TIMER_STOP(weight_load);
 
-                // interleave row-major fp16 from scratch into tile-major in vtcm_weight
-                interleave_fp16_weight_chunk_to_tiles(vtcm_weight, (const __fp16 *)buf_curr, n_cols, k);
+                TIMER_START(hmx_core);
+                {
+                    const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+                    const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+                    core_dot_chunk_fp16(vtcm_output, vtcm_activation, weight_tiles, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                }
+                TIMER_STOP(hmx_core);
 
-                swap_ptr(&buf_curr, &buf_next);
+                TIMER_START(output_store);
+                {
+                    float *output = dst + (mr * n + nc);
+                    transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+                }
+                TIMER_STOP(output_store);
             }
-            TIMER_STOP(weight_load);
-
-            TIMER_START(hmx_core);
+        } else {
+            void *buf_curr = vtcm_scratch0;
+            void *buf_next = vtcm_scratch1;
             {
-                const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
-                const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
-                core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                const size_t n_cols_first = hex_smin(n, n_chunk_n_cols);
+                dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, permuted_weight),
+                               fp16_row_bytes, weight_row_bytes, fp16_row_bytes, n_cols_first);
             }
-            TIMER_STOP(hmx_core);
 
-            TIMER_START(output_store);
-            {
-                float *output = dst + (mr * n + nc);
-                transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+            for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
+                size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+
+                TIMER_START(weight_load);
+                {
+                    dma_queue_pop(ctx->dma[0]);
+
+                    const size_t nc_next = nc + n_chunk_n_cols;
+                    if (nc_next < n) {
+                        const size_t n_cols_next = hex_smin(n - nc_next, n_chunk_n_cols);
+                        const __fp16 *next_weight_chunk = permuted_weight + nc_next * weight_stride;
+
+                        dma_queue_push(ctx->dma[0], dma_make_ptr(buf_next, next_weight_chunk),
+                                       fp16_row_bytes, weight_row_bytes, fp16_row_bytes, n_cols_next);
+                    }
+
+                    interleave_fp16_weight_chunk_to_tiles(vtcm_weight, (const __fp16 *) buf_curr, n_cols, k);
+
+                    swap_ptr(&buf_curr, &buf_next);
+                }
+                TIMER_STOP(weight_load);
+
+                TIMER_START(hmx_core);
+                {
+                    const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+                    const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+                    core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                }
+                TIMER_STOP(hmx_core);
+
+                TIMER_START(output_store);
+                {
+                    float *output = dst + (mr * n + nc);
+                    transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+                }
+                TIMER_STOP(output_store);
             }
-            TIMER_STOP(output_store);
         }
 
     }
@@ -1149,6 +1703,7 @@ int hmx_mat_mul_permuted_w16a32(struct htp_context *ctx, float *restrict dst, co
         float  bandwidth   = 1e-3f * weight_size / (float)TIMER_US(weight_load);
         FARF(HIGH, "  weight load bandwidth: %.2f GB/s", bandwidth);
     }
+    htp_weight_tile_cache_log_stats(ctx);
 #endif
 
     return 0;
@@ -1159,7 +1714,7 @@ int mat_mul_qk_0_d16a32_out_stationary(struct htp_context *ctx, float *restrict 
 
 int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict dst, const float *restrict activation,
                                      const uint8_t *restrict permuted_weight, int m, int k, int n,
-                                     int weight_type) {
+                                     int weight_type, bool src0_static, uintptr_t src0_key) {
     if (!dst || !activation || !permuted_weight || !m || !n || !k) { return -1; }
     if (k % 32 != 0 || n % 32 != 0) { return -1; }
 
@@ -1222,6 +1777,9 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
         scratch1_size = scratch0_size;                                                    // x4x2 DMA buf 1
         scratch2_size = 0;                                                                // unused
     }
+    const size_t tile_chunk_area_size = hex_align_up(n_chunk_n_cols * vec_dot_size, HMX_FP16_TILE_SIZE);
+    const bool use_tile_cache = !use_pipeline && src0_static && src0_key != 0 && ctx->weight_tile_cache.slot_size >= tile_chunk_area_size;
+    const bool use_tile_cache_pipeline = use_pipeline && src0_static && src0_key != 0 && ctx->weight_tile_cache.slot_size >= tile_chunk_area_size;
 
     uint8_t *vtcm_ptr        = (uint8_t *) ctx->vtcm_base;
     __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size);
@@ -1270,38 +1828,125 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
             }
             TIMER_STOP(activation_load);
 
-            void *buf_curr = vtcm_scratch0;
-            void *buf_next = vtcm_scratch1;
+            if (use_tile_cache) {
+                void *buf_curr = vtcm_scratch0;
+                for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
+                    const size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+                    const size_t tile_bytes = htp_weight_tile_bytes(n_cols, k);
+                    const __fp16 *weight_tiles = htp_weight_tile_cache_lookup(ctx, src0_key, weight_type, k, n,
+                                                                              row_stride, nc, n_cols, tile_bytes);
 
-            // issue async DDR data transfer for the first weight chunk
-            // NOTE: use 2D DMA (n_cols rows x row_stride bytes) instead of 1D
-            // because UDMA roiwidth is 16-bit and total size can exceed 65535.
-            {
-                const size_t n_cols_first = hex_smin(n, n_chunk_n_cols);
-                dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, permuted_weight), row_stride, row_stride, row_stride, n_cols_first);
+                    TIMER_START(weight_load);
+                    if (weight_tiles == NULL) {
+                        uint32_t cache_slot = 0;
+                        __fp16 *tile_dst = htp_weight_tile_cache_reserve(ctx, tile_bytes, &cache_slot);
+                        weight_tiles = tile_dst != NULL ? tile_dst : vtcm_weight;
+
+                        const uint8_t *weight_chunk = permuted_weight + nc * row_stride;
+                        dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, weight_chunk), row_stride, row_stride, row_stride, n_cols);
+                        dma_queue_pop(ctx->dma[0]);
+                        dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, (__fp16 *) weight_tiles, buf_curr, n_cols, k, row_stride, weight_type);
+
+                        if (tile_dst != NULL) {
+                            htp_weight_tile_cache_store(ctx, cache_slot, src0_key, weight_type, k, n,
+                                                        row_stride, nc, n_cols, tile_bytes);
+                        }
+                    }
+                    TIMER_STOP(weight_load);
+
+                    TIMER_START(hmx_core);
+                    {
+                        const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+                        const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+                        core_dot_chunk_fp16(vtcm_output, vtcm_activation, weight_tiles, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                    }
+                    TIMER_STOP(hmx_core);
+
+                    TIMER_START(output_store);
+                    {
+                        float *output = dst + (mr * n + nc);
+                        transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+                    }
+                    TIMER_STOP(output_store);
+                }
+            } else {
+                void *buf_curr = vtcm_scratch0;
+                void *buf_next = vtcm_scratch1;
+                {
+                    const size_t n_cols_first = hex_smin(n, n_chunk_n_cols);
+                    dma_queue_push(ctx->dma[0], dma_make_ptr(buf_curr, permuted_weight), row_stride, row_stride, row_stride, n_cols_first);
+                }
+
+                for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
+                    size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+
+                    TIMER_START(weight_load);
+                    {
+                        dma_queue_pop(ctx->dma[0]);
+
+                        const size_t nc_next = nc + n_chunk_n_cols;
+                        if (nc_next < n) {
+                            const size_t n_cols_next = hex_smin(n - nc_next, n_chunk_n_cols);
+                            const uint8_t *next_weight_chunk = permuted_weight + nc_next * row_stride;
+
+                            dma_queue_push(ctx->dma[0], dma_make_ptr(buf_next, next_weight_chunk), row_stride, row_stride, row_stride, n_cols_next);
+                        }
+
+                        dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight, buf_curr, n_cols, k, row_stride, weight_type);
+
+                        swap_ptr(&buf_curr, &buf_next);
+                    }
+                    TIMER_STOP(weight_load);
+
+                    TIMER_START(hmx_core);
+                    {
+                        const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+                        const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+                        core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                    }
+                    TIMER_STOP(hmx_core);
+
+                    TIMER_START(output_store);
+                    {
+                        float *output = dst + (mr * n + nc);
+                        transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+                    }
+                    TIMER_STOP(output_store);
+                }
             }
+        }
+    } else if (use_tile_cache_pipeline) {
+        for (size_t mr = 0; mr < m; mr += m_chunk_n_rows) {
+            const size_t n_rows = hex_smin(m - mr, m_chunk_n_rows);
+
+            TIMER_START(activation_load);
+            {
+                const float *activation_chunk = activation + mr * k;
+                transfer_activation_chunk_threaded(ctx, vtcm_activation, activation_chunk, n_rows, k, k);
+            }
+            TIMER_STOP(activation_load);
 
             for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
-                size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+                const size_t n_cols = hex_smin(n - nc, n_chunk_n_cols);
+                const size_t tile_bytes = htp_weight_tile_bytes(n_cols, k);
+                const __fp16 *weight_tiles = htp_weight_tile_cache_lookup(ctx, src0_key, weight_type, k, n,
+                                                                          row_stride, nc, n_cols, tile_bytes);
 
                 TIMER_START(weight_load);
-                {
-                    dma_queue_pop(ctx->dma[0]);  // wait until current weight chunk become ready
+                if (weight_tiles == NULL) {
+                    uint32_t cache_slot = 0;
+                    __fp16 *tile_dst = htp_weight_tile_cache_reserve(ctx, tile_bytes, &cache_slot);
+                    weight_tiles = tile_dst != NULL ? tile_dst : vtcm_scratch0;
 
-                    const size_t nc_next = nc + n_chunk_n_cols;
-                    if (nc_next < n) {
-                        const size_t n_cols_next = hex_smin(n - nc_next, n_chunk_n_cols);
+                    const uint8_t *weight_chunk = permuted_weight + nc * row_stride;
+                    dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_weight, weight_chunk), row_stride, row_stride, row_stride, n_cols);
+                    dma_queue_pop(ctx->dma[0]);
+                    dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, (__fp16 *) weight_tiles, vtcm_weight, n_cols, k, row_stride, weight_type);
 
-                        const uint8_t *next_weight_chunk = permuted_weight + nc_next * row_stride;
-
-                        dma_queue_push(ctx->dma[0], dma_make_ptr(buf_next, next_weight_chunk), row_stride, row_stride, row_stride, n_cols_next);
+                    if (tile_dst != NULL) {
+                        htp_weight_tile_cache_store(ctx, cache_slot, src0_key, weight_type, k, n,
+                                                    row_stride, nc, n_cols, tile_bytes);
                     }
-
-                    // Dequant + vscatter writes directly to [K, N] transposed tiles.
-                    // HMX computes C = A x B, where A=[M,K] activation, B=[K,N] weight.
-                    dequantize_x4x2_weight_chunk_to_fp16_tiles(ctx, vtcm_weight, buf_curr, n_cols, k, row_stride, weight_type);
-
-                    swap_ptr(&buf_curr, &buf_next);
                 }
                 TIMER_STOP(weight_load);
 
@@ -1309,14 +1954,14 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
                 {
                     const int n_row_tiles = hmx_ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
                     const int n_col_tiles = hmx_ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
-                    core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+                    core_dot_chunk_fp16(vtcm_output, vtcm_activation, weight_tiles, vtcm_scales, n_row_tiles, n_col_tiles, k / HMX_FP16_TILE_N_ROWS);
                 }
                 TIMER_STOP(hmx_core);
 
                 TIMER_START(output_store);
                 {
-                    float *output = dst + (mr * n + nc);
-                    transfer_output_chunk_threaded(ctx, output, vtcm_output, n_rows, n_cols, n);
+                    float *output_chunk = dst + (mr * n + nc);
+                    transfer_output_chunk_threaded(ctx, output_chunk, vtcm_output, n_rows, n_cols, n);
                 }
                 TIMER_STOP(output_store);
             }
@@ -1431,6 +2076,7 @@ int hmx_mat_mul_permuted_qk_0_d16a32(struct htp_context *ctx, float *restrict ds
         float  bandwidth   = 1e-3f * weight_size / (float)TIMER_US(weight_load);
         FARF(HIGH, "  weight load bandwidth: %.2f GB/s", bandwidth);
     }
+    htp_weight_tile_cache_log_stats(ctx);
 #endif
 
     return 0;
