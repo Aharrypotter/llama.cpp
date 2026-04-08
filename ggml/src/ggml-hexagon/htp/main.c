@@ -29,6 +29,71 @@
 #include "hmx-ops.h"
 #endif // HTP_HAS_HMX
 
+#define HTP_WEIGHT_CACHE_ALIGN 128
+#define HTP_WEIGHT_TILE_CACHE_ALIGN 2048
+
+static void htp_reset_weight_cache(struct htp_context * ctx) {
+    const uint32_t epoch = (ctx->weight_cache_epoch + 1u) == 0 ? 1u : (ctx->weight_cache_epoch + 1u);
+    const uint64_t raw_hits = ctx->weight_cache_stats.raw_hit;
+    const uint64_t raw_miss = ctx->weight_cache_stats.raw_miss;
+    uint64_t tile_hits = 0;
+    uint64_t tile_miss = 0;
+    for (int i = 0; i < HTP_WEIGHT_CACHE_STATS_TYPES; ++i) {
+        tile_hits += ctx->weight_cache_stats.tile_hit[i];
+        tile_miss += ctx->weight_cache_stats.tile_miss[i];
+    }
+
+    memset(&ctx->weight_cache, 0, sizeof(ctx->weight_cache));
+    memset(&ctx->weight_tile_cache, 0, sizeof(ctx->weight_tile_cache));
+    ctx->weight_cache_epoch = epoch;
+    ctx->weight_cache.epoch = epoch;
+    ctx->weight_tile_cache.epoch = epoch;
+
+    const size_t total_size = ctx->matmul_cfg.weight_cache_size;
+    uint8_t *const base = ctx->matmul_cfg.weight_cache_base;
+
+    if (total_size == 0 || base == NULL) {
+        return;
+    }
+
+    size_t tile_weight = 3;
+    if (tile_hits + tile_miss >= 128 && tile_hits * 5 < (tile_hits + tile_miss)) {
+        tile_weight = 2;
+    }
+    if (raw_hits > raw_miss * 2) {
+        tile_weight = 2;
+    }
+
+    size_t tile_size = hex_align_down((total_size * tile_weight) / 4, HTP_WEIGHT_TILE_CACHE_ALIGN);
+    size_t raw_size  = hex_align_down(total_size - tile_size, HTP_WEIGHT_CACHE_ALIGN);
+
+    if (tile_size < HTP_WEIGHT_TILE_CACHE_ALIGN * HTP_WEIGHT_TILE_CACHE_NWAYS) {
+        tile_size = 0;
+        raw_size  = hex_align_down(total_size, HTP_WEIGHT_CACHE_ALIGN);
+    }
+
+    if (raw_size >= HTP_WEIGHT_CACHE_ALIGN * HTP_WEIGHT_CACHE_NWAYS) {
+        ctx->weight_cache.base = base;
+        ctx->weight_cache.size = raw_size;
+        ctx->weight_cache.slot_size = hex_align_down(raw_size / HTP_WEIGHT_CACHE_NWAYS, HTP_WEIGHT_CACHE_ALIGN);
+        if (ctx->weight_cache.slot_size < HTP_WEIGHT_CACHE_ALIGN) {
+            memset(&ctx->weight_cache, 0, sizeof(ctx->weight_cache));
+            raw_size = 0;
+        }
+    } else {
+        raw_size = 0;
+    }
+
+    if (tile_size >= HTP_WEIGHT_TILE_CACHE_ALIGN * HTP_WEIGHT_TILE_CACHE_NWAYS) {
+        ctx->weight_tile_cache.base = base + raw_size;
+        ctx->weight_tile_cache.size = tile_size;
+        ctx->weight_tile_cache.slot_size = hex_align_down(tile_size / HTP_WEIGHT_TILE_CACHE_NWAYS, HTP_WEIGHT_TILE_CACHE_ALIGN);
+        if (ctx->weight_tile_cache.slot_size < HTP_WEIGHT_TILE_CACHE_ALIGN) {
+            memset(&ctx->weight_tile_cache, 0, sizeof(ctx->weight_tile_cache));
+        }
+    }
+}
+
 AEEResult htp_iface_open(const char * uri, remote_handle64 * handle) {
     struct htp_context * ctx;
     int                  err = 0;
@@ -164,6 +229,7 @@ static int vtcm_acquire(struct htp_context * ctx) {
             abort();
         }
         ctx->vtcm_valid = true;
+        htp_reset_weight_cache(ctx);
     }
 
     ctx->vtcm_inuse = true;
@@ -242,6 +308,23 @@ static int vtcm_alloc(struct htp_context * ctx) {
     return 0;
 }
 
+static void htp_init_matmul_runtime_config(struct htp_context * ctx) {
+    const size_t max_weight_cache_size = 2 * 1024 * 1024;
+    size_t       weight_cache_size = hex_align_down(hex_smin(ctx->vtcm_size / 4, max_weight_cache_size), HTP_WEIGHT_CACHE_ALIGN);
+
+    if (weight_cache_size < HTP_WEIGHT_CACHE_ALIGN * HTP_WEIGHT_CACHE_NWAYS) {
+        weight_cache_size = 0;
+    }
+
+    memset(&ctx->matmul_cfg, 0, sizeof(ctx->matmul_cfg));
+    ctx->matmul_cfg.weight_cache_base = ctx->vtcm_base + (ctx->vtcm_size - weight_cache_size);
+    ctx->matmul_cfg.weight_cache_size = weight_cache_size;
+    ctx->matmul_cfg.act_cache_base    = ctx->vtcm_base;
+    ctx->matmul_cfg.act_cache_size    = ctx->vtcm_size - weight_cache_size;
+    ctx->matmul_cfg.prefer_preload    = 1;
+    htp_reset_weight_cache(ctx);
+}
+
 static void vtcm_free(struct htp_context * ctx) {
     if (ctx->vtcm_rctx) {
         HAP_compute_res_release(ctx->vtcm_rctx);
@@ -287,9 +370,11 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32 sess_id, uint64 dsp_que
         return AEE_ENOMEMORY;
     }
 
+    htp_init_matmul_runtime_config(ctx);
+
 #ifdef HTP_HAS_HMX
     if (use_hmx) {
-        ctx->vtcm_scratch_size = ctx->vtcm_size;
+        ctx->vtcm_scratch_size = ctx->vtcm_size - ctx->matmul_cfg.weight_cache_size;
         ctx->hmx_enabled       = 1;
 
         FARF(HIGH, "HMX enabled: vtcm-scratch %zu", ctx->vtcm_scratch_size);
@@ -297,7 +382,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32 sess_id, uint64 dsp_que
         // HMX disabled: skip HMX initialisation so the
         // dispatch loop falls through to the HVX compute paths.
         ctx->hmx_enabled       = 0;
-        ctx->vtcm_scratch_size = ctx->vtcm_size;
+        ctx->vtcm_scratch_size = ctx->vtcm_size - ctx->matmul_cfg.weight_cache_size;
         FARF(HIGH, "HMX disabled (use_hmx=0): vtcm-scratch %zu", ctx->vtcm_scratch_size);
     }
 #endif
@@ -1193,58 +1278,63 @@ static void proc_hmx_matmul_req(struct htp_context *     ctx,
     profile_start(&prof);
 
     uint32_t rsp_status = HTP_STATUS_INTERNAL_ERR;
+    ctx->matmul_cfg.prefer_preload = (req->flags & HTP_OPFLAGS_PREFER_PRELOAD) != 0;
 
     // --- Phase 1: HMX on the first m_hmx (32-aligned) rows ---
     if (vtcm_acquire(ctx) == AEE_SUCCESS) {
-        int ret = -1;
+        int ret = htp_hmx_matmul_try_exp(ctx, req, bufs, n_bufs, m_hmx);
 
-        const int ne02 = (int) req->src0.ne[2];
-        const int ne03 = (int) req->src0.ne[3];
-        const int ne12 = (int) req->src1.ne[2];
-        const int ne13 = (int) req->src1.ne[3];
-        // Row strides in elements. For compact tensors these equal k; for
-        // permuted attention views they can be larger, so pass the real stride.
-        const int act_stride    = (int)(req->src1.nb[1] / sizeof(float));
-        const int weight_stride = (int)(req->src0.nb[1] / sizeof(__fp16));
+        if (ret != 0) {
+            const int ne02 = (int) req->src0.ne[2];
+            const int ne03 = (int) req->src0.ne[3];
+            const int ne12 = (int) req->src1.ne[2];
+            const int ne13 = (int) req->src1.ne[3];
+            const int act_stride    = (int)(req->src1.nb[1] / sizeof(float));
+            const int weight_stride = (int)(req->src0.nb[1] / sizeof(__fp16));
 
-        switch (req->src0.type) {
-            case HTP_TYPE_F16:
-                if (is_batched) {
-                    hmx_matmul_w16a32_batched_params_t batch_params = {
-                        .dst             = dst,
-                        .activation      = act,
-                        .permuted_weight = (const __fp16 *) wgt,
-                        .m               = m_hmx,
-                        .k               = k,
-                        .n               = n,
-                        .act_stride      = act_stride,
-                        .weight_stride   = weight_stride,
-                        .dst_stride      = (int)(req->dst.nb[1] / sizeof(float)),
-                        .ne02            = ne02,
-                        .ne03            = ne03,
-                        .ne12            = ne12,
-                        .ne13            = ne13,
-                        .src0_nb2        = req->src0.nb[2],
-                        .src0_nb3        = req->src0.nb[3],
-                        .src1_nb2        = req->src1.nb[2],
-                        .src1_nb3        = req->src1.nb[3],
-                        .dst_nb2         = req->dst.nb[2],
-                        .dst_nb3         = req->dst.nb[3],
-                    };
-                    ret = hmx_mat_mul_permuted_w16a32_batched(ctx, &batch_params);
-                } else {
-                    ret = hmx_mat_mul_permuted_w16a32(ctx, dst, act,
-                                                      (const __fp16 *) wgt,
-                                                      m_hmx, k, n,
-                                                      act_stride,
-                                                      weight_stride);
-                }
-                break;
-            default:
-                ret = hmx_mat_mul_permuted_qk_0_d16a32(ctx, dst, act,
-                                                       (const uint8_t *) wgt,
-                                                       m_hmx, k, n, (int) req->src0.type);
-                break;
+            switch (req->src0.type) {
+                case HTP_TYPE_F16:
+                    if (is_batched) {
+                        hmx_matmul_w16a32_batched_params_t batch_params = {
+                            .dst             = dst,
+                            .activation      = act,
+                            .permuted_weight = (const __fp16 *) wgt,
+                            .m               = m_hmx,
+                            .k               = k,
+                            .n               = n,
+                            .act_stride      = act_stride,
+                            .weight_stride   = weight_stride,
+                            .dst_stride      = (int)(req->dst.nb[1] / sizeof(float)),
+                            .ne02            = ne02,
+                            .ne03            = ne03,
+                            .ne12            = ne12,
+                            .ne13            = ne13,
+                            .src0_nb2        = req->src0.nb[2],
+                            .src0_nb3        = req->src0.nb[3],
+                            .src1_nb2        = req->src1.nb[2],
+                            .src1_nb3        = req->src1.nb[3],
+                            .dst_nb2         = req->dst.nb[2],
+                            .dst_nb3         = req->dst.nb[3],
+                        };
+                        ret = hmx_mat_mul_permuted_w16a32_batched(ctx, &batch_params);
+                    } else {
+                        ret = hmx_mat_mul_permuted_w16a32(ctx, dst, act,
+                                                          (const __fp16 *) wgt,
+                                                          m_hmx, k, n,
+                                                          act_stride,
+                                                          weight_stride,
+                                                          (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0,
+                                                          (uintptr_t) wgt);
+                    }
+                    break;
+                default:
+                    ret = hmx_mat_mul_permuted_qk_0_d16a32(ctx, dst, act,
+                                                           (const uint8_t *) wgt,
+                                                           m_hmx, k, n, (int) req->src0.type,
+                                                           (req->flags & HTP_OPFLAGS_SRC0_STATIC) != 0,
+                                                           (uintptr_t) wgt);
+                    break;
+            }
         }
 
         if (ret == 0) {
