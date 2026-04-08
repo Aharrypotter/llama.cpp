@@ -105,24 +105,19 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                float scale         = *reinterpret_cast<const float *>(&dst->op_params[0]);
-                float max_bias      = *reinterpret_cast<const float *>(&dst->op_params[1]);
-                float logit_softcap = *reinterpret_cast<const float *>(&dst->op_params[2]);
+                float scale = 0.0f;
+                std::memcpy(&scale, &dst->op_params[0], sizeof(scale));
+                float max_bias = 0.0f;
+                std::memcpy(&max_bias, &dst->op_params[1], sizeof(max_bias));
+                float logit_softcap = 0.0f;
+                std::memcpy(&logit_softcap, &dst->op_params[2], sizeof(logit_softcap));
 
                 auto * q    = dst->src[0];
                 auto * k    = dst->src[1];
                 auto * v    = dst->src[2];
                 auto * mask = dst->src[3];
 
-                auto print_tensor_info = [](const ggml_tensor * t) {
-                    printf("%s: shape [%ld,%ld,%ld,%ld] type %s\n", t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-                           ggml_type_name(t->type));
-                };
-                // print_tensor_info(dst);
-                // print_tensor_info(q);
-                // print_tensor_info(k);
-                // print_tensor_info(v);
-                // print_tensor_info(mask);
+                GGML_UNUSED(scale);
 
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && mask->type == GGML_TYPE_F16 && max_bias == 0 && logit_softcap == 0;
@@ -167,10 +162,10 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 }
 
                 RmsNormF32Params params{
-                    .dst = { dst_fd, (int32_t) dst_offset },
-                    .src = { src_fd, (int32_t) src_offset },
-                    .ne0 = (int32_t) dst->ne[0],
-                    .ne1 = (int32_t) ggml_nrows(dst),
+                    { dst_fd, (int32_t) dst_offset },
+                    { src_fd, (int32_t) src_offset },
+                    (int32_t) dst->ne[0],
+                    (int32_t) ggml_nrows(dst),
                 };
                 *reinterpret_cast<RmsNormF32Params *>(param_buf) = params;
 
@@ -196,12 +191,12 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 int n = weight->ne[1];
 
                 MatMulParams params{
-                    .output     = { output_fd,     (int32_t) output_offset     },
-                    .activation = { activation_fd, (int32_t) activation_offset },
-                    .weight     = { weight_fd,     (int32_t) weight_offset     },
-                    .m          = m,
-                    .k          = k,
-                    .n          = n,
+                    { output_fd,     (int32_t) output_offset     },
+                    { activation_fd, (int32_t) activation_offset },
+                    { weight_fd,     (int32_t) weight_offset     },
+                    m,
+                    k,
+                    n,
                 };
                 *reinterpret_cast<MatMulParams *>(param_buf) = params;
 
@@ -239,9 +234,6 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
             {
                 auto * q    = dst->src[0];
                 auto * k    = dst->src[1];
-                auto * v    = dst->src[2];
-                auto * mask = dst->src[3];
-
                 auto mappings = get_all_rpcmem_mappings(dst);
                 GGML_ASSERT(mappings.size() == 5);
 
@@ -258,16 +250,16 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 int n_kv_heads = k->ne[2];
 
                 FlashAttnParams params{
-                    .o          = { o_fd,    (int32_t) o_offset    },
-                    .q          = { q_fd,    (int32_t) q_offset    },
-                    .k          = { k_fd,    (int32_t) k_offset    },
-                    .v          = { v_fd,    (int32_t) v_offset    },
-                    .mask       = { mask_fd, (int32_t) mask_offset },
-                    .qo_len     = qo_len,
-                    .kv_len     = kv_len,
-                    .n_heads    = n_heads,
-                    .n_kv_heads = n_kv_heads,
-                    .head_dim   = head_dim,
+                    { o_fd,    (int32_t) o_offset    },
+                    { q_fd,    (int32_t) q_offset    },
+                    { k_fd,    (int32_t) k_offset    },
+                    { v_fd,    (int32_t) v_offset    },
+                    { mask_fd, (int32_t) mask_offset },
+                    qo_len,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
                 };
                 *reinterpret_cast<FlashAttnParams *>(param_buf) = params;
 
@@ -292,25 +284,22 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
     auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->ops_msg_chan);
 
-    // FIXME: this is very ugly
-    auto * d_ptr = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
-    // std::atomic_store_explicit(d_ptr, 0, std::memory_order_release);
+    auto * v0_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[0]));
+    auto * v1_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[1]));
 
-    // The memory order here is not very important
-    std::atomic_store(d_ptr, 0);
+    std::atomic_store_explicit(v0_ptr, 0, std::memory_order_relaxed);
+    std::atomic_store_explicit(v1_ptr, 0, std::memory_order_relaxed);
 
     msg_hdr->n_reqs         = n_reqs;
     msg_hdr->req_offsets[0] = message_header_size(msg_hdr);
     msg_hdr->req_offsets[1] = msg_hdr->req_offsets[0] + op_req_size;
 
     {
-        RequestHeader req_hdr{
-            .state = 0,
-            .type  = REQUEST_TYPE_OP_COMPUTE,
-        };
-        OpComputeRequest op_req{
-            .op = (uint32_t) op_index,
-        };
+        RequestHeader req_hdr{};
+        req_hdr.state = 0;
+        req_hdr.type  = REQUEST_TYPE_OP_COMPUTE;
+        OpComputeRequest op_req{};
+        op_req.op = (uint32_t) op_index;
 
         auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 0));
         write_buf(p, req_hdr);
@@ -322,14 +311,12 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         size_t map_req_size     = sizeof(RequestHeader) + sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t);
         msg_hdr->req_offsets[2] = msg_hdr->req_offsets[1] + map_req_size;
 
-        RequestHeader req_hdr{
-            .state = 0,
-            .type  = REQUEST_TYPE_RPCMEM_MAP,
-        };
-        RpcmemMapRequest map_req{
-            .n_puts = n_unmap_fds,
-            .n_gets = 0,
-        };
+        RequestHeader req_hdr{};
+        req_hdr.state = 0;
+        req_hdr.type  = REQUEST_TYPE_RPCMEM_MAP;
+        RpcmemMapRequest map_req{};
+        map_req.n_puts = n_unmap_fds;
+        map_req.n_gets = 0;
 
         auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 1));
         write_buf(p, req_hdr);
@@ -358,9 +345,6 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     // issue request
-    auto * v0_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[0]));
-    auto * v1_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[1]));
-
     // NOTE(hzx): make sure memory_order_release is used here to ensure all previous writes are valid
     std::atomic_store_explicit(v0_ptr, 1, std::memory_order_release);
 
@@ -369,7 +353,8 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         // TODO(hzx): use cpu_relax here
         usleep(1);
     }
-    d_ptr->store(0, std::memory_order_relaxed);
+    std::atomic_store_explicit(v0_ptr, 0, std::memory_order_relaxed);
+    std::atomic_store_explicit(v1_ptr, 0, std::memory_order_relaxed);
 
     if (has_unmap_reqs) {
         ctx->mapper.unmap_all_pending_buffers();

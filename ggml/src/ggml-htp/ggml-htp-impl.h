@@ -4,7 +4,7 @@
 #include "ggml.h"
 #include "rpcmem_mapper.h"
 
-static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
+extern const char * const HTP_OPS_DL_PATH_DEFAULT;
 
 // singleton HTP backend context
 struct ggml_backend_htp_context {

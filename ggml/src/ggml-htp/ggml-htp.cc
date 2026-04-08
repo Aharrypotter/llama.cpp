@@ -13,6 +13,13 @@
 #include "ggml-cpu.h"
 #include "ggml-htp-impl.h"
 
+const char * const HTP_OPS_DL_PATH_DEFAULT = "libhtp_ops.so";
+
+static const char * ggml_backend_htp_ops_dl_path() {
+    const char * dl_path = getenv("HTP_OPS_DL_PATH");
+    return (dl_path && dl_path[0] != '\0') ? dl_path : HTP_OPS_DL_PATH_DEFAULT;
+}
+
 // real backend initialization work is done here. ggml_backend_htp_init is only a wrapper
 ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 * 1024, true) {
     fprintf(stderr, "Initializing HTP backend... (You should see this once)\n");
@@ -20,7 +27,8 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
     // rpcmem_init & rpcmem_deinit are actually not required on modern Hexagon processors
     rpcmem_init();
 
-    ops_dl_handle = dlopen(HTP_OPS_DL_PATH, RTLD_LAZY | RTLD_LOCAL);
+    const char * dl_path = ggml_backend_htp_ops_dl_path();
+    ops_dl_handle = dlopen(dl_path, RTLD_LAZY | RTLD_LOCAL);
     if (ops_dl_handle != nullptr) {
         using open_session_fn_type = int(int, int);
         using init_htp_ops_fn_type = void();
@@ -40,7 +48,8 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
             fprintf(stderr, "Failed to open remote session on Hexagon NPU (0x%x)\n", err);
         }
     } else {
-        fprintf(stderr, "Cannot load HTP ops backend library, all OPs will fallback to CPU implementation\n");
+        fprintf(stderr, "Cannot load HTP ops backend library (%s), all OPs will fallback to CPU implementation\n",
+                dl_path);
     }
 
     if (getenv("SKIP_HTP_OPS")) {

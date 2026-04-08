@@ -4,12 +4,12 @@
 #include "htp-ops.h"
 #include "rpcmem_mapper.h"
 
-#include "../ggml-cpu/ggml-cpu-traits.h"
+#include "../ggml-cpu/traits.h"
 #include "../ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
-#include "../ggml-cpu/ggml-cpu-quants.h"
+#include "../ggml-cpu/quants.h"
 #include "ggml-threading.h"
 #include "ggml.h"
 
@@ -11588,6 +11588,7 @@ static void ggml_compute_forward_rwkv_wkv6(
 
 // ggml_compute_forward_map_unary
 
+#if defined(GGML_OP_MAP_UNARY)
 static void ggml_compute_forward_map_unary_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst,
@@ -11716,6 +11717,9 @@ static void ggml_compute_forward_map_custom2_f32(
 
 // ggml_compute_forward_map_custom3
 
+#endif
+
+#if defined(GGML_OP_MAP_CUSTOM1_F32) && defined(GGML_OP_MAP_CUSTOM2_F32) && defined(GGML_OP_MAP_CUSTOM3_F32)
 static void ggml_compute_forward_map_custom3_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst,
@@ -11731,6 +11735,7 @@ static void ggml_compute_forward_map_custom3_f32(
 
     fun(dst, a, b, c);
 }
+#endif
 
 // ggml_compute_forward_map_custom1
 
@@ -12347,6 +12352,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
             } break;
+#if defined(GGML_OP_MAP_UNARY)
         case GGML_OP_MAP_UNARY:
             {
                 ggml_unary_op_f32_t fun;
@@ -12361,6 +12367,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_binary(params, tensor, fun);
             }
             break;
+#endif
+#if defined(GGML_OP_MAP_CUSTOM1_F32) && defined(GGML_OP_MAP_CUSTOM2_F32) && defined(GGML_OP_MAP_CUSTOM3_F32)
         case GGML_OP_MAP_CUSTOM1_F32:
             {
                 ggml_custom1_op_f32_t fun;
@@ -12382,6 +12390,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_custom3_f32(params, tensor, fun);
             }
             break;
+#endif
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
