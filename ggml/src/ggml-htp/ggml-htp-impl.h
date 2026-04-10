@@ -1,6 +1,8 @@
 // This is a C++ header
 #pragma once
 
+#include <mutex>
+
 #include "ggml.h"
 #include "rpcmem_mapper.h"
 
@@ -17,6 +19,7 @@ struct ggml_backend_htp_context {
     int                      n_threads  = 0;
     struct ggml_threadpool * threadpool = nullptr;
     int                      threadpool_n_threads = 0;
+    std::mutex               threadpool_mutex;
 
     // TODO(hzx): add abort_callback & abort_callback_data
 

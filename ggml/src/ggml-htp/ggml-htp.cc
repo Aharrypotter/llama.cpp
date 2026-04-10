@@ -61,10 +61,13 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
 }
 
 ggml_backend_htp_context::~ggml_backend_htp_context() {
-    if (threadpool) {
-        ggml_threadpool_free_htp(threadpool);
-        threadpool = nullptr;
-        threadpool_n_threads = 0;
+    {
+        std::lock_guard<std::mutex> lock(threadpool_mutex);
+        if (threadpool) {
+            ggml_threadpool_free_htp(threadpool);
+            threadpool = nullptr;
+            threadpool_n_threads = 0;
+        }
     }
 
     delete[] work_data;
@@ -251,8 +254,15 @@ static const char * ggml_backend_htp_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_htp_free(ggml_backend_t backend) {
-    // ggml_backend_htp_context * ctx = (ggml_backend_htp_context *) backend->context;
-    // delete ctx;
+    auto * ctx = (ggml_backend_htp_context *) backend->context;
+    {
+        std::lock_guard<std::mutex> lock(ctx->threadpool_mutex);
+        if (ctx->threadpool) {
+            ggml_threadpool_free_htp(ctx->threadpool);
+            ctx->threadpool = nullptr;
+            ctx->threadpool_n_threads = 0;
+        }
+    }
     delete backend;
 }
 
@@ -279,6 +289,7 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
     }
 
     struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend->context;
+    std::lock_guard<std::mutex>      lock(ctx->threadpool_mutex);
 
     if (ctx->n_threads <= 0) {
         ctx->n_threads = GGML_DEFAULT_N_THREADS;
@@ -364,6 +375,7 @@ static void ggml_backend_htp_set_n_threads(ggml_backend_t backend_htp, int n_thr
     }
 
     struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend_htp->context;
+    std::lock_guard<std::mutex>      lock(ctx->threadpool_mutex);
     ctx->n_threads = n_threads;
 }
 
