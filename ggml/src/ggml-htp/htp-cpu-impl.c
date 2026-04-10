@@ -4,12 +4,12 @@
 #include "htp-ops.h"
 #include "rpcmem_mapper.h"
 
-#include "../ggml-cpu/ggml-cpu-traits.h"
+#include "../ggml-cpu/traits.h"
 #include "../ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
-#include "../ggml-cpu/ggml-cpu-quants.h"
+#include "../ggml-cpu/quants.h"
 #include "ggml-threading.h"
 #include "ggml.h"
 
@@ -90,6 +90,9 @@ ggml_backend_buffer_type_t ggml_backend_amx_buffer_type(void);
 
 // floating point type used to accumulate sums
 typedef double ggml_float;
+
+// ARM native FP16 type for HVX operations
+typedef __fp16 ggml_fp16_internal_t;
 
 #define GGML_GELU_FP16
 #define GGML_GELU_QUICK_FP16
@@ -1297,7 +1300,7 @@ struct ggml_threadpool {
     atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-    atomic_int current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -8678,6 +8681,7 @@ static void ggml_compute_forward_clamp(
 }
 
 // ggml_compute_forward_rope
+// NOTE(hzx): code here may be superseded by the newer implementation in ggml-cpu
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / MAX(0.001f, high - low);
@@ -12060,6 +12064,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_add(params, tensor);
             } break;
+        case GGML_OP_ADD_ID:
+            {
+                GGML_ASSERT(false && "use implementation from ggml-cpu/ops.h");
+                // ggml_compute_forward_add_id(params, tensor);
+            } break;
         case GGML_OP_ADD1:
             {
                 ggml_compute_forward_add1(params, tensor);
@@ -12156,6 +12165,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_group_norm(params, tensor);
             } break;
+        case GGML_OP_L2_NORM:
+            {
+                GGML_ASSERT(false && "not implemented");
+                // ggml_compute_forward_l2_norm(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 if (htp_ops_support_op(tensor)) {
@@ -12211,6 +12225,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GET_ROWS_BACK:
             {
                 ggml_compute_forward_get_rows_back(params, tensor);
+            } break;
+        case GGML_OP_SET_ROWS:
+            {
+                // from ggml-cpu/ops.h
+                void ggml_compute_forward_set_rows(
+                        const struct ggml_compute_params * params,
+                        struct ggml_tensor * dst);
+                ggml_compute_forward_set_rows(params, tensor);
             } break;
         case GGML_OP_DIAG:
             {
@@ -12757,6 +12779,8 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
+    bool enable_htp_profile = getenv("HTP_PROFILE") != NULL;
+
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
 
@@ -12806,19 +12830,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // }
 
         int64_t elapsed_time = ggml_time_us() - t1;
-        if (state->ith == 0) {
-            // fprintf(stderr, "node %s, op %s, shape (%ld, %ld, %ld, %ld), %ld us\n", node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], elapsed_time);
+        if (enable_htp_profile && state->ith == 0) {
+            fprintf(stderr, "node %s, op %s, shape (%ld, %ld, %ld, %ld), %ld us",
+                    node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], elapsed_time);
             if (htp_ops_support_op(node)) {
+                fprintf(stderr, " on NPU\n");
                 npu_us += elapsed_time;
             } else {
+                fprintf(stderr, " on CPU (dst %s, src0 %s, src1 %s)\n",
+                        ggml_type_name(node->type),
+                        ggml_type_name(node->src[0]->type),
+                        node->src[1] ? ggml_type_name(node->src[1]->type) : "--");
                 cpu_us += elapsed_time;
             }
         }
     }
 
     int64_t elapsed_us = ggml_time_us() - t0;
-    if (state->ith == 0) {
-        // fprintf(stderr, "HTP: total %ld us, CPU %ld us, NPU %ld us\n", elapsed_us, cpu_us, npu_us);
+    if (enable_htp_profile && state->ith == 0) {
+        fprintf(stderr, "HTP: total %ld us, CPU %ld us, NPU %ld us\n", elapsed_us, cpu_us, npu_us);
     }
     return 0;
 }
