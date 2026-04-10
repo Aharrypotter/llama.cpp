@@ -8,7 +8,7 @@
 
 // #include "arg.h"
 #include "common.h"
-#include "json.hpp"
+#include "nlohmann/json.hpp"
 // #include "llama-cpp.h" // for llama_sampler_ptr
 #include "llama.h"
 #include "reward_model.h"
@@ -224,10 +224,10 @@ int main(int argc, char ** argv) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx                = 65536;
     // default n_batch and n_ubatch should be enough for most cases
-    ctx_params.flash_attn           = true;
+    ctx_params.flash_attn_type      = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     ctx_params.no_perf              = false;
 
-    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
         GGML_ABORT("%s: error: failed to create the llama_context\n", __func__);
     }
@@ -243,7 +243,7 @@ int main(int argc, char ** argv) {
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(42));
 
     // prompt prefill
-    auto prompt_tokens = common_tokenize(model, prompt, true);
+    auto prompt_tokens = common_tokenize(ctx, prompt, true);
     auto prompt_batch  = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
     if (llama_decode(ctx, prompt_batch)) {
         GGML_ABORT("prompt prefill failed\n");
@@ -279,7 +279,7 @@ int main(int argc, char ** argv) {
         beam.eos_found     = false;
 
         // "copy" shared prompt prefix
-        llama_kv_cache_seq_cp(ctx, 0, beam.id, 0, prompt_tokens.size());
+        llama_memory_seq_cp(llama_get_memory(ctx), 0, beam.id, 0, prompt_tokens.size());
         beam.seq_len = prompt_tokens.size();
 
         // llama_sampler * new_sampler = llama_sampler_clone(sampler);
@@ -292,7 +292,7 @@ int main(int argc, char ** argv) {
     }
 
     // remove seq_id 0 (prompt part) from kv cache
-    llama_kv_cache_seq_rm(ctx, 0, 0, -1);
+    llama_memory_seq_rm(llama_get_memory(ctx), 0, 0, -1);
 
     auto gen_start = chrono::system_clock::now();
 
@@ -371,7 +371,7 @@ int main(int argc, char ** argv) {
                 for (auto & beam : beams) {
                     if (!beam.step_finished) {
                         auto last_token = beam.cur_tokens.back();
-                        bool is_eog     = llama_token_is_eog(model, last_token);
+                        bool is_eog     = llama_vocab_is_eog(llama_model_get_vocab(model), last_token);
                         if (beam.match_step_delimiters(step_delimiters) || is_eog) {
                             beam.step_finished = true;
                         }
@@ -509,12 +509,12 @@ int main(int argc, char ** argv) {
                 new_beam.step_finished = false;
                 new_beam.eos_found     = false;
 
-                llama_kv_cache_seq_cp(ctx, beam.id, new_beam.id, 0, -1);
+                llama_memory_seq_cp(llama_get_memory(ctx), beam.id, new_beam.id, 0, -1);
 
                 new_beams.emplace_back(std::move(new_beam));
             }
 
-            llama_kv_cache_seq_rm(ctx, beam.id, 0, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx), beam.id, 0, -1);
         }
         beams = std::move(new_beams);
     }

@@ -29,8 +29,7 @@ int main(int argc, char ** argv) {
 
     auto llama_init = common_init_from_params(params);
 
-    llama_model *   model = llama_init.model;
-    llama_context * ctx   = llama_init.context;
+    llama_context * ctx = llama_init->context();
 
     const int n_ctx = llama_n_ctx(ctx);
 
@@ -123,7 +122,7 @@ int main(int argc, char ** argv) {
                 seq_lengths[seq_id] = parent_seq_len + n_tokens;
 
                 if (parent_id != -1) {
-                    llama_kv_cache_seq_cp(ctx, parent_id, seq_id, -1, parent_seq_len);
+                    llama_memory_seq_cp(llama_get_memory(ctx), parent_id, seq_id, -1, parent_seq_len);
                 }
                 for (int i = 0; i < n_tokens; ++i) {
                     common_batch_add(batch, tokens[i], parent_seq_len + i, { seq_id }, false);
@@ -149,8 +148,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch_free(batch);
-    llama_free(ctx);
-    llama_free_model(model);
 
     llama_backend_free();
 

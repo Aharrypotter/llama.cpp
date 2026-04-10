@@ -3,7 +3,7 @@
 #include <stdexcept>
 
 #include "common.h"
-#include "json.hpp"
+#include "nlohmann/json.hpp"
 #include "llama.h"
 
 std::string LocalPRM::build_prompt(const std::string & question, const std::vector<std::string> & steps) const {
@@ -39,7 +39,7 @@ std::vector<float> LocalPRM::score(const std::string &                          
             prefix_len--;
         }
         if (prefix_len > 0) {
-            llama_kv_cache_seq_cp(ctx, src_seq_id, seq_id, 0, prefix_len);
+            llama_memory_seq_cp(llama_get_memory(ctx), src_seq_id, seq_id, 0, prefix_len);
         }
         // TODO: make sure at least one step tag token exist in this partial sequence
         for (size_t p = prefix_len; p < tokens.size(); ++p) {
