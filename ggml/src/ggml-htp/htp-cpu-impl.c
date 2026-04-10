@@ -13,6 +13,14 @@
 #include "ggml-threading.h"
 #include "ggml.h"
 
+#if defined(__ARM_NEON)
+#if defined(__FLT16_MAX__)
+typedef _Float16 ggml_fp16_internal_t;
+#else
+typedef __fp16 ggml_fp16_internal_t;
+#endif
+#endif
+
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
 ggml_backend_buffer_type_t ggml_backend_amx_buffer_type(void);
 #endif
@@ -12705,7 +12713,7 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
-void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+void ggml_threadpool_free_htp(struct ggml_threadpool * threadpool) {
     if (!threadpool) {
         return;
     }
@@ -13042,6 +13050,10 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     return threadpool;
 }
 
+struct ggml_threadpool * ggml_threadpool_new_htp(struct ggml_threadpool_params * tpp) {
+    return ggml_threadpool_new_impl(tpp, NULL, NULL);
+}
+
 // NOTE(hzx): This is a specialized version. Don't use ggml_cpu_init()
 static void ggml_htp_cpu_init(void) {
     // needed to initialize f16 tables
@@ -13140,7 +13152,7 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
     enum ggml_status ret = threadpool->ec;
 
     if (disposable_threadpool) {
-        ggml_threadpool_free(threadpool);
+        ggml_threadpool_free_htp(threadpool);
     }
 
     return ret;

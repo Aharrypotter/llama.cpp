@@ -16,6 +16,7 @@ struct ggml_backend_htp_context {
 
     int                      n_threads  = 0;
     struct ggml_threadpool * threadpool = nullptr;
+    int                      threadpool_n_threads = 0;
 
     // TODO(hzx): add abort_callback & abort_callback_data
 
@@ -42,4 +43,6 @@ struct ggml_backend_htp_context {
 extern "C" {
 
 enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+struct ggml_threadpool * ggml_threadpool_new_htp(struct ggml_threadpool_params * tpp);
+void ggml_threadpool_free_htp(struct ggml_threadpool * threadpool);
 }

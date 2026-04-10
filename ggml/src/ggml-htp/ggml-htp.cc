@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-htp-impl.h"
+#include "htp-ops.h"
 
 const char * const HTP_OPS_DL_PATH_DEFAULT = "libhtp_ops.so";
 
@@ -55,9 +56,17 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
     if (getenv("SKIP_HTP_OPS")) {
         skip_htp_ops = true;
     }
+
+    n_threads = GGML_DEFAULT_N_THREADS;
 }
 
 ggml_backend_htp_context::~ggml_backend_htp_context() {
+    if (threadpool) {
+        ggml_threadpool_free_htp(threadpool);
+        threadpool = nullptr;
+        threadpool_n_threads = 0;
+    }
+
     delete[] work_data;
 
     if (ops_dl_handle) {
@@ -271,6 +280,25 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
 
     struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend->context;
 
+    if (ctx->n_threads <= 0) {
+        ctx->n_threads = GGML_DEFAULT_N_THREADS;
+    }
+
+    if (ctx->threadpool == nullptr || ctx->threadpool_n_threads < ctx->n_threads) {
+        if (ctx->threadpool) {
+            ggml_threadpool_free_htp(ctx->threadpool);
+            ctx->threadpool = nullptr;
+            ctx->threadpool_n_threads = 0;
+        }
+
+        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(ctx->n_threads);
+        ctx->threadpool = ggml_threadpool_new_htp(&ttp);
+        if (ctx->threadpool == nullptr) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        ctx->threadpool_n_threads = ctx->n_threads;
+    }
+
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads, ctx->threadpool);
 
     if (ctx->work_size < cplan.work_size) {
@@ -280,6 +308,7 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             ctx->work_size = 0;
             return GGML_STATUS_ALLOC_FAILED;
         }
+        ctx->work_size = cplan.work_size;
     }
     cplan.work_data = (uint8_t *) ctx->work_data;
 
@@ -327,6 +356,15 @@ static ggml_backend_t ggml_backend_htp_init(void) {
 
 bool ggml_backend_is_htp(ggml_backend_t backend) {
     return backend != nullptr && ggml_guid_matches(backend->guid, ggml_backend_htp_guid());
+}
+
+static void ggml_backend_htp_set_n_threads(ggml_backend_t backend_htp, int n_threads) {
+    if (n_threads <= 0) {
+        n_threads = GGML_DEFAULT_N_THREADS;
+    }
+
+    struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend_htp->context;
+    ctx->n_threads = n_threads;
 }
 
 static const char * ggml_backend_htp_device_get_name(ggml_backend_dev_t dev) {
@@ -395,8 +433,7 @@ static bool ggml_backend_htp_device_supports_buft(ggml_backend_dev_t dev, ggml_b
 }
 
 static bool ggml_backend_htp_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    auto * cpu_dev = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
-    return ggml_backend_dev_supports_op(cpu_dev, op);
+    return htp_ops_support_op(op);
 
     GGML_UNUSED(dev);
 }
@@ -413,7 +450,7 @@ static const struct ggml_backend_device_i ggml_backend_htp_device_i = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_htp_device_supports_op,
     /* .supports_buft        = */ ggml_backend_htp_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_htp_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -446,11 +483,21 @@ static ggml_backend_dev_t ggml_backend_htp_reg_get_device(ggml_backend_reg_t reg
     return &ggml_backend_htp_device;
 }
 
+static void * ggml_backend_htp_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        ggml_backend_set_n_threads_t fct = ggml_backend_htp_set_n_threads;
+        return (void *) fct;
+    }
+
+    GGML_UNUSED(reg);
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_htp_reg_i = {
     /* .get_name         = */ ggml_backend_htp_reg_get_name,
     /* .get_device_count = */ ggml_backend_htp_reg_get_device_count,
     /* .get_device       = */ ggml_backend_htp_reg_get_device,
-    /* .get_proc_address = */ nullptr,
+    /* .get_proc_address = */ ggml_backend_htp_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_htp_reg(void) {
