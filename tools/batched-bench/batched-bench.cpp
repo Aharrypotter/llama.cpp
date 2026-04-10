@@ -106,7 +106,7 @@ int main(int argc, char ** argv) {
 
     // warm up
     {
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < 36; ++i) {
             common_batch_add(batch, get_token_rand(), i, { 0 }, false);
         }
 
