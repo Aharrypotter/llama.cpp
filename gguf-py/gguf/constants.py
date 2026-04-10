@@ -4061,6 +4061,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
 
+    MOSTLY_MIXED_Q4_0_F16  = 512
+    MOSTLY_MIXED_Q4_0_Q8_0 = 513
+
     GUESSED              = 1024  # not specified in the model file
 
 

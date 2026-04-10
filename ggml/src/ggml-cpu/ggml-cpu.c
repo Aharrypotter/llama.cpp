@@ -2672,6 +2672,14 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 #ifndef GGML_USE_OPENMP
     struct ggml_compute_state* workers = threadpool->workers;
 
+    // ggml_thread_t * thread_handles = malloc(n_threads * sizeof(ggml_thread_t));
+    // GGML_ASSERT(thread_handles);
+    static ggml_thread_t thread_handles[GGML_MAX_N_THREADS];
+    GGML_ASSERT(workers);
+    for (int i = 0; i < n_threads; i++) {
+        thread_handles[i] = workers[i].thrd;
+    }
+
     ggml_mutex_lock(&threadpool->mutex);
 
     threadpool->stop = true;
@@ -2681,13 +2689,17 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_mutex_unlock(&threadpool->mutex);
 
     for (int j = 1; j < n_threads; j++) {
-        int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
+        // fprintf(stderr, "%s: joining thread %d: %p\n", __func__, j, workers[j].thrd);
+        // int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
+        int32_t rc = ggml_thread_join(thread_handles[j], NULL);
         GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
         UNUSED(rc);
     }
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
+
+    // free(thread_handles);
 #endif // GGML_USE_OPENMP
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;

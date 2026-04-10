@@ -4,22 +4,14 @@
 #include "htp-ops.h"
 #include "rpcmem_mapper.h"
 
-#include "../ggml-cpu/traits.h"
+#include "../ggml-cpu/ggml-cpu-traits.h"
 #include "../ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
-#include "../ggml-cpu/quants.h"
+#include "../ggml-cpu/ggml-cpu-quants.h"
 #include "ggml-threading.h"
 #include "ggml.h"
-
-#if defined(__ARM_NEON)
-#if defined(__FLT16_MAX__)
-typedef _Float16 ggml_fp16_internal_t;
-#else
-typedef __fp16 ggml_fp16_internal_t;
-#endif
-#endif
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
 ggml_backend_buffer_type_t ggml_backend_amx_buffer_type(void);
@@ -11596,7 +11588,6 @@ static void ggml_compute_forward_rwkv_wkv6(
 
 // ggml_compute_forward_map_unary
 
-#if defined(GGML_OP_MAP_UNARY)
 static void ggml_compute_forward_map_unary_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst,
@@ -11725,9 +11716,6 @@ static void ggml_compute_forward_map_custom2_f32(
 
 // ggml_compute_forward_map_custom3
 
-#endif
-
-#if defined(GGML_OP_MAP_CUSTOM1_F32) && defined(GGML_OP_MAP_CUSTOM2_F32) && defined(GGML_OP_MAP_CUSTOM3_F32)
 static void ggml_compute_forward_map_custom3_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst,
@@ -11743,7 +11731,6 @@ static void ggml_compute_forward_map_custom3_f32(
 
     fun(dst, a, b, c);
 }
-#endif
 
 // ggml_compute_forward_map_custom1
 
@@ -12360,7 +12347,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rwkv_wkv6(params, tensor);
             } break;
-#if defined(GGML_OP_MAP_UNARY)
         case GGML_OP_MAP_UNARY:
             {
                 ggml_unary_op_f32_t fun;
@@ -12375,8 +12361,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_binary(params, tensor, fun);
             }
             break;
-#endif
-#if defined(GGML_OP_MAP_CUSTOM1_F32) && defined(GGML_OP_MAP_CUSTOM2_F32) && defined(GGML_OP_MAP_CUSTOM3_F32)
         case GGML_OP_MAP_CUSTOM1_F32:
             {
                 ggml_custom1_op_f32_t fun;
@@ -12398,7 +12382,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_map_custom3_f32(params, tensor, fun);
             }
             break;
-#endif
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -12713,7 +12696,7 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
-void ggml_threadpool_free_htp(struct ggml_threadpool * threadpool) {
+void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) {
         return;
     }
@@ -13050,10 +13033,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     return threadpool;
 }
 
-struct ggml_threadpool * ggml_threadpool_new_htp(struct ggml_threadpool_params * tpp) {
-    return ggml_threadpool_new_impl(tpp, NULL, NULL);
-}
-
 // NOTE(hzx): This is a specialized version. Don't use ggml_cpu_init()
 static void ggml_htp_cpu_init(void) {
     // needed to initialize f16 tables
@@ -13152,7 +13131,7 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
     enum ggml_status ret = threadpool->ec;
 
     if (disposable_threadpool) {
-        ggml_threadpool_free_htp(threadpool);
+        ggml_threadpool_free(threadpool);
     }
 
     return ret;

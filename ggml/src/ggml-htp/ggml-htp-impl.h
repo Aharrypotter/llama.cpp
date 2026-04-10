@@ -1,12 +1,10 @@
 // This is a C++ header
 #pragma once
 
-#include <mutex>
-
 #include "ggml.h"
 #include "rpcmem_mapper.h"
 
-extern const char * const HTP_OPS_DL_PATH_DEFAULT;
+static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 
 // singleton HTP backend context
 struct ggml_backend_htp_context {
@@ -18,8 +16,6 @@ struct ggml_backend_htp_context {
 
     int                      n_threads  = 0;
     struct ggml_threadpool * threadpool = nullptr;
-    int                      threadpool_n_threads = 0;
-    std::mutex               threadpool_mutex;
 
     // TODO(hzx): add abort_callback & abort_callback_data
 
@@ -46,6 +42,4 @@ struct ggml_backend_htp_context {
 extern "C" {
 
 enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
-struct ggml_threadpool * ggml_threadpool_new_htp(struct ggml_threadpool_params * tpp);
-void ggml_threadpool_free_htp(struct ggml_threadpool * threadpool);
 }

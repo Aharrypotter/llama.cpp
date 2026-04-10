@@ -12,14 +12,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-htp-impl.h"
-#include "htp-ops.h"
-
-const char * const HTP_OPS_DL_PATH_DEFAULT = "libhtp_ops.so";
-
-static const char * ggml_backend_htp_ops_dl_path() {
-    const char * dl_path = getenv("HTP_OPS_DL_PATH");
-    return (dl_path && dl_path[0] != '\0') ? dl_path : HTP_OPS_DL_PATH_DEFAULT;
-}
 
 // real backend initialization work is done here. ggml_backend_htp_init is only a wrapper
 ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 * 1024, true) {
@@ -28,8 +20,7 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
     // rpcmem_init & rpcmem_deinit are actually not required on modern Hexagon processors
     rpcmem_init();
 
-    const char * dl_path = ggml_backend_htp_ops_dl_path();
-    ops_dl_handle = dlopen(dl_path, RTLD_LAZY | RTLD_LOCAL);
+    ops_dl_handle = dlopen(HTP_OPS_DL_PATH, RTLD_LAZY | RTLD_LOCAL);
     if (ops_dl_handle != nullptr) {
         using open_session_fn_type = int(int, int);
         using init_htp_ops_fn_type = void();
@@ -49,27 +40,15 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
             fprintf(stderr, "Failed to open remote session on Hexagon NPU (0x%x)\n", err);
         }
     } else {
-        fprintf(stderr, "Cannot load HTP ops backend library (%s), all OPs will fallback to CPU implementation\n",
-                dl_path);
+        fprintf(stderr, "Cannot load HTP ops backend library, all OPs will fallback to CPU implementation\n");
     }
 
     if (getenv("SKIP_HTP_OPS")) {
         skip_htp_ops = true;
     }
-
-    n_threads = GGML_DEFAULT_N_THREADS;
 }
 
 ggml_backend_htp_context::~ggml_backend_htp_context() {
-    {
-        std::lock_guard<std::mutex> lock(threadpool_mutex);
-        if (threadpool) {
-            ggml_threadpool_free_htp(threadpool);
-            threadpool = nullptr;
-            threadpool_n_threads = 0;
-        }
-    }
-
     delete[] work_data;
 
     if (ops_dl_handle) {
@@ -138,7 +117,14 @@ static void * ggml_backend_htp_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    rpcmem_free(buffer->context);
+    // NOTE(hzx): This is a temporary workaround
+    // In a correct implementation, we should destroy all mappings (NPU side) associated with this buffer before freeint it
+    // Currently, we do not track the mappings of buffers and free them completely;
+    //   this may lead to stale mappings in sequences of free-then-alloc operations, causing subsequent mapping errors.
+    // As a workaround, we choose to do nothing when freeing the buffer,
+    //   leaving rpcmem to be handled uniformly when the process exits.
+
+    // rpcmem_free(buffer->context);
 }
 
 static void ggml_backend_htp_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
@@ -199,7 +185,9 @@ static ggml_backend_buffer_t ggml_backend_htp_buffer_type_alloc_buffer(ggml_back
     void * data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, size);
     GGML_ASSERT(data);
 
-    fprintf(stderr, "RPCMEM alloc size = %.5f MiB\n", size / 1024.0 / 1024.0);
+    int fd = rpcmem_to_fd(data);
+
+    fprintf(stderr, "RPCMEM alloc size = %.5f MiB, ptr %p, fd %d\n", size / 1024.0 / 1024.0, data, fd);
 
     return ggml_backend_buffer_init(buft, ggml_backend_htp_buffer_i, data, size);
 }
@@ -248,28 +236,15 @@ bool ggml_backend_buft_is_rpcmem(ggml_backend_buffer_type_t buft) {
 // backend interface
 
 static const char * ggml_backend_htp_get_name(ggml_backend_t backend) {
-    return "HTP";
+    return "MyHTP";
 
     GGML_UNUSED(backend);
 }
 
 static void ggml_backend_htp_free(ggml_backend_t backend) {
-    auto * ctx = (ggml_backend_htp_context *) backend->context;
-    {
-        std::lock_guard<std::mutex> lock(ctx->threadpool_mutex);
-        if (ctx->threadpool) {
-            ggml_threadpool_free_htp(ctx->threadpool);
-            ctx->threadpool = nullptr;
-            ctx->threadpool_n_threads = 0;
-        }
-    }
+    // ggml_backend_htp_context * ctx = (ggml_backend_htp_context *) backend->context;
+    // delete ctx;
     delete backend;
-}
-
-static void ggml_backend_htp_mul_mat(ggml_backend_htp_context * ctx, struct ggml_tensor * dst) {
-    // TODO
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
 }
 
 static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -289,26 +264,6 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
     }
 
     struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend->context;
-    std::lock_guard<std::mutex>      lock(ctx->threadpool_mutex);
-
-    if (ctx->n_threads <= 0) {
-        ctx->n_threads = GGML_DEFAULT_N_THREADS;
-    }
-
-    if (ctx->threadpool == nullptr || ctx->threadpool_n_threads < ctx->n_threads) {
-        if (ctx->threadpool) {
-            ggml_threadpool_free_htp(ctx->threadpool);
-            ctx->threadpool = nullptr;
-            ctx->threadpool_n_threads = 0;
-        }
-
-        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(ctx->n_threads);
-        ctx->threadpool = ggml_threadpool_new_htp(&ttp);
-        if (ctx->threadpool == nullptr) {
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-        ctx->threadpool_n_threads = ctx->n_threads;
-    }
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads, ctx->threadpool);
 
@@ -319,7 +274,6 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
             ctx->work_size = 0;
             return GGML_STATUS_ALLOC_FAILED;
         }
-        ctx->work_size = cplan.work_size;
     }
     cplan.work_data = (uint8_t *) ctx->work_data;
 
@@ -369,16 +323,6 @@ bool ggml_backend_is_htp(ggml_backend_t backend) {
     return backend != nullptr && ggml_guid_matches(backend->guid, ggml_backend_htp_guid());
 }
 
-static void ggml_backend_htp_set_n_threads(ggml_backend_t backend_htp, int n_threads) {
-    if (n_threads <= 0) {
-        n_threads = GGML_DEFAULT_N_THREADS;
-    }
-
-    struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend_htp->context;
-    std::lock_guard<std::mutex>      lock(ctx->threadpool_mutex);
-    ctx->n_threads = n_threads;
-}
-
 static const char * ggml_backend_htp_device_get_name(ggml_backend_dev_t dev) {
     return "HTP";
 
@@ -392,15 +336,15 @@ static const char * ggml_backend_htp_device_get_description(ggml_backend_dev_t d
 }
 
 static void ggml_backend_htp_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
+    *free  = 4 * (1UL << 30);
+    *total = 4 * (1UL << 30);
 
     GGML_UNUSED(dev);
 }
 
 static enum ggml_backend_dev_type ggml_backend_htp_device_get_type(ggml_backend_dev_t dev) {
     // TODO(hzx): use GGML_BACKEND_DEVICE_TYPE_GPU or GGML_BACKEND_DEVICE_TYPE_ACCEL?
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 
     GGML_UNUSED(dev);
 }
@@ -445,7 +389,8 @@ static bool ggml_backend_htp_device_supports_buft(ggml_backend_dev_t dev, ggml_b
 }
 
 static bool ggml_backend_htp_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    return htp_ops_support_op(op);
+    auto * cpu_dev = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    return ggml_backend_dev_supports_op(cpu_dev, op);
 
     GGML_UNUSED(dev);
 }
@@ -462,7 +407,7 @@ static const struct ggml_backend_device_i ggml_backend_htp_device_i = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_htp_device_supports_op,
     /* .supports_buft        = */ ggml_backend_htp_device_supports_buft,
-    /* .offload_op           = */ ggml_backend_htp_device_offload_op,
+    /* .offload_op           = */ nullptr,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -471,7 +416,7 @@ static const struct ggml_backend_device_i ggml_backend_htp_device_i = {
 // backend reg interface
 
 static const char * ggml_backend_htp_reg_get_name(ggml_backend_reg_t reg) {
-    return "HTP";
+    return "MyHTP";
 
     GGML_UNUSED(reg);
 }
@@ -495,21 +440,11 @@ static ggml_backend_dev_t ggml_backend_htp_reg_get_device(ggml_backend_reg_t reg
     return &ggml_backend_htp_device;
 }
 
-static void * ggml_backend_htp_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
-        ggml_backend_set_n_threads_t fct = ggml_backend_htp_set_n_threads;
-        return (void *) fct;
-    }
-
-    GGML_UNUSED(reg);
-    return nullptr;
-}
-
 static const struct ggml_backend_reg_i ggml_backend_htp_reg_i = {
     /* .get_name         = */ ggml_backend_htp_reg_get_name,
     /* .get_device_count = */ ggml_backend_htp_reg_get_device_count,
     /* .get_device       = */ ggml_backend_htp_reg_get_device,
-    /* .get_proc_address = */ ggml_backend_htp_get_proc_address,
+    /* .get_proc_address = */ nullptr,
 };
 
 ggml_backend_reg_t ggml_backend_htp_reg(void) {
