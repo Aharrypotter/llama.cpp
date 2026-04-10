@@ -190,9 +190,12 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            // NOTE(hzx): CPU device can have more than one buffer types
+            // ggml_backend_dev_buffer_type([CPU device]) returns the default CPU buffer type
+            // use buffer type from buft_list instead
+            buft = model.select_buft(il);
 
+            auto * dev = model.dev_layer(il);
             dev_name = ggml_backend_dev_name(dev);
         }
 

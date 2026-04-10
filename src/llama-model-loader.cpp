@@ -1200,6 +1200,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
+        // NOTE(hzx): keep token_embd.weight & output.weight on cpu when not using gpu
+        bool is_gpu_buft = buft_dev && (ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_GPU);
+        if ((tn_tensor == LLM_TENSOR_TOKEN_EMBD || tn_tensor == LLM_TENSOR_OUTPUT) && !is_gpu_buft) {
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error("no CPU backend found");
+            }
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
         if (buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {
                 first_tensor_moved_name = t_meta->name;

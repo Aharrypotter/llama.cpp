@@ -2208,19 +2208,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
-        if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
-                const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
-                        }
-                    }
-                }
-            }
-        }
+        // NOTE(hzx): This indeed cause problems when scheduling graph splits for multiple backends. Disable it for now
+        // const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
+        // if (ubatch.n_tokens < 32 || full_offload) {
+        //     if (il != -1 && strcmp(name, "norm") == 0) {
+        //         const auto & dev_layer = model.dev_layer(il);
+        //         for (const auto & backend : backends) {
+        //             if (ggml_backend_get_device(backend.get()) == dev_layer) {
+        //                 if (ggml_backend_supports_op(backend.get(), cur)) {
+        //                     ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
     };
 }
 
