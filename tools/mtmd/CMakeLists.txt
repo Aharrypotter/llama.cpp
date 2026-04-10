@@ -114,3 +114,11 @@ add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
 set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+
+# my-encode tool
+set(MY_TARGET my-encode)
+add_executable(${MY_TARGET} my-encode.cc)
+set_target_properties(${MY_TARGET} PROPERTIES OUTPUT_NAME my-encode)
+install(TARGETS ${MY_TARGET} RUNTIME)
+target_link_libraries(${MY_TARGET} PRIVATE common mtmd Threads::Threads)
+target_compile_features(${MY_TARGET} PRIVATE cxx_std_17)
