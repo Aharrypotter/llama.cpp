@@ -5489,3 +5489,66 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+void repack_q4_0_super_block_hvx(const block_q4_0 * src, void * dst, size_t size) {
+    const size_t super_block_size = sizeof(block_q4_0) * 8;
+    assert(size % super_block_size == 0);
+
+    ggml_fp16_t scales[8];
+    uint8_t quants_repacked[QK4_0 / 2 * 8];
+    uint8_t quants_unpacked[QK4_0 * 8];
+
+    uint8_t * p = (uint8_t *) dst;
+    const int64_t n = size / super_block_size;
+    for (int64_t i = 0; i < n; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            const int64_t blk_idx = i * 8 + j;
+            scales[j] = src[blk_idx].d;
+
+            for (int k = 0; k < QK4_0 / 2; ++k) {
+                const uint8_t q = src[blk_idx].qs[k];
+                quants_unpacked[j * QK4_0 + k + 0]       = q & 15;
+                quants_unpacked[j * QK4_0 + k + QK4_0/2] = q >> 4;
+            }
+        }
+
+        for (int j = 0; j < 64; ++j) {
+            quants_repacked[j * 2 + 0] = (quants_unpacked[j + 128] << 4) | quants_unpacked[j + 0];
+            quants_repacked[j * 2 + 1] = (quants_unpacked[j + 192] << 4) | quants_unpacked[j + 64];
+        }
+
+        memcpy(p, scales, 8 * sizeof(ggml_fp16_t));
+        p += 8 * sizeof(ggml_fp16_t);
+
+        memcpy(p, quants_repacked, QK4_0 / 2 * 8);
+        p += QK4_0 / 2 * 8;
+    }
+}
+
+void repack_q8_0_super_block_hvx(const block_q8_0 * src, void * dst, size_t size) {
+    const size_t super_block_size = sizeof(block_q8_0) * 8;
+    assert(size % super_block_size == 0);
+
+    ggml_fp16_t scales[8];
+    int8_t quants_repacked[QK8_0 * 8];
+
+    uint8_t * p = (uint8_t *) dst;
+    const int64_t n = size / super_block_size;
+    for (int64_t i = 0; i < n; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            const int64_t blk_idx = i * 8 + j;
+            scales[j] = src[blk_idx].d;
+            memcpy(quants_repacked + j * QK8_0, src[blk_idx].qs, sizeof(src[blk_idx].qs));
+        }
+
+        memcpy(p, scales, 8 * sizeof(ggml_fp16_t));
+        p += 8 * sizeof(ggml_fp16_t);
+
+        memcpy(p, quants_repacked, sizeof(quants_repacked));
+        p += sizeof(quants_repacked);
+    }
+}
+
+void repack_iq4_nl_super_block_hvx(const block_iq4_nl * src, void * dst, size_t size) {
+    repack_q4_0_super_block_hvx((const block_q4_0 *) src, dst, size);
+}

@@ -56,6 +56,44 @@ except ImportError:
 
 logger = logging.getLogger("hf-to-gguf")
 
+import struct
+
+QK8_0 = 32
+GGML_HALF_SIZE = 2
+BLOCK_Q8_0_SIZE = GGML_HALF_SIZE + QK8_0
+
+def repack_linear_weight_for_hmx(data: torch.Tensor) -> torch.Tensor:
+    assert data.ndim == 2, f"Input tensor must be 2D, got shape {data.shape}."
+    n, k = data.shape
+    assert n % 32 == 0 and k % 32 == 0, f"Input tensor shape {data.shape} must be divisible by 32 in both dimensions."
+    n_chunks, k_chunks = n // 32, k // 32
+    x = data.view(n_chunks, 32, k_chunks, 32)
+    x = x.permute(0, 2, 1, 3).contiguous()
+    y = x.view(n_chunks, k_chunks, 32, 16, 2).permute(0, 1, 3, 2, 4).contiguous()
+    return y.view(n, k)
+
+def repack_q8_0_super_block_hvx_bytes(src_bytes: bytes) -> bytes:
+    super_block_size = BLOCK_Q8_0_SIZE * 8
+    if len(src_bytes) % super_block_size != 0:
+        raise ValueError(f"input size ({len(src_bytes)}) must be a multiple of super block size ({super_block_size})")
+    num_super_blocks = len(src_bytes) // super_block_size
+    output_chunks = []
+    block_format = f"<e{QK8_0}b"
+    for i in range(num_super_blocks):
+        scales = []
+        quants_repacked = []
+        super_block_offset = i * super_block_size
+        for j in range(8):
+            block_offset = super_block_offset + j * BLOCK_Q8_0_SIZE
+            unpacked_data = struct.unpack_from(block_format, src_bytes, block_offset)
+            scales.append(unpacked_data[0])
+            quants_repacked.extend(unpacked_data[1:])
+        packed_scales = struct.pack(f"<8e", *scales)
+        output_chunks.append(packed_scales)
+        packed_quants = struct.pack(f"<256b", *quants_repacked)
+        output_chunks.append(packed_quants)
+    return b"".join(output_chunks)
+
 
 ###### MODEL DEFINITIONS ######
 
@@ -874,6 +912,11 @@ class ModelBase:
 
                 try:
                     data = gguf.quants.quantize(data, data_qtype)
+                    if os.getenv("REPACK_FOR_HVX") is not None and data_qtype == gguf.GGMLQuantizationType.Q8_0:
+                        shape = data.shape
+                        repacked_bytes = repack_q8_0_super_block_hvx_bytes(data.tobytes())
+                        data = np.frombuffer(repacked_bytes, dtype=np.uint8).reshape(shape)
+                        logger.warning(f"Repacking Q8_0 tensor {new_name} for HVX...")
                 except gguf.QuantError as e:
                     logger.warning("%s, %s", e, "falling back to F16")
                     data_qtype = gguf.GGMLQuantizationType.F16
@@ -4182,6 +4225,21 @@ class Qwen2VLModel(TextModel):
                 name.startswith("talker") or name.startswith("token2wav"):
             # skip multimodal tensors
             return
+        new_name = self.map_tensor_name(name)
+        is_permute_candidate = any(self.match_model_tensor_name(new_name, key, bid) for key in [
+            gguf.MODEL_TENSOR.ATTN_Q,
+            gguf.MODEL_TENSOR.ATTN_K,
+            gguf.MODEL_TENSOR.ATTN_V,
+            gguf.MODEL_TENSOR.ATTN_OUT,
+            gguf.MODEL_TENSOR.FFN_UP,
+            gguf.MODEL_TENSOR.FFN_DOWN,
+            gguf.MODEL_TENSOR.FFN_GATE,
+        ])
+        if os.getenv("REPACK_FOR_HMX") is not None and is_permute_candidate:
+            data_torch = repack_linear_weight_for_hmx(data_torch)
+            logger.warning(f"Repacking tensor {name} for HMX...")
+            yield (new_name, data_torch)
+            return
         yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -4244,6 +4302,11 @@ class Qwen2VLVisionModel(MmprojModel):
                 wq = data_torch[:c]
                 wk = data_torch[c: c * 2]
                 wv = data_torch[c * 2:]
+                if os.getenv("REPACK_FOR_HMX") is not None and data_torch.ndim == 2:
+                    wq = repack_linear_weight_for_hmx(wq)
+                    wk = repack_linear_weight_for_hmx(wk)
+                    wv = repack_linear_weight_for_hmx(wv)
+                    logger.warning(f"Repacking tensor {name} for HMX...")
                 yield from super().modify_tensors(wq, name.replace("qkv", "q"), bid)
                 yield from super().modify_tensors(wk, name.replace("qkv", "k"), bid)
                 yield from super().modify_tensors(wv, name.replace("qkv", "v"), bid)
@@ -4255,6 +4318,35 @@ class Qwen2VLVisionModel(MmprojModel):
                 yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight"  , data_torch[:, :, 0, ...])
                 yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight.1", data_torch[:, :, 1, ...])
             else:
+                if os.getenv("REPACK_FOR_HMX") is not None:
+                    device = data_torch.device
+                    if data_torch.ndim == 2:
+                        n, k = data_torch.shape
+                        n0, k0 = n, k
+                        if k % 32 != 0:
+                            k_new = (k // 32 + 1) * 32
+                            k_pad = k_new - k
+                            pad_data = torch.zeros(n, k_pad, dtype=data_torch.dtype, device=device)
+                            data_torch = torch.cat((data_torch, pad_data), dim=1)
+                            k = k_new
+                        if n % 32 != 0:
+                            n_new = (n // 32 + 1) * 32
+                            n_pad = n_new - n
+                            pad_data = torch.zeros(n_pad, k, dtype=data_torch.dtype, device=device)
+                            data_torch = torch.cat((data_torch, pad_data), dim=0)
+                            n = n_new
+                        if (n0, k0) != (n, k):
+                            logger.warning(f"Padding tensor {name} from ({n0}, {k0}) to ({n}, {k})")
+                        data_torch = repack_linear_weight_for_hmx(data_torch)
+                        logger.warning(f"Repacking tensor {name} for HMX...")
+                    if data_torch.ndim == 1:
+                        n = data_torch.shape[0]
+                        if n % 32 != 0:
+                            n_new = (n // 32 + 1) * 32
+                            n_pad = n_new - n
+                            pad_data = torch.zeros(n_pad, dtype=data_torch.dtype, device=device)
+                            data_torch = torch.cat((data_torch, pad_data), dim=0)
+                            logger.warning(f"Padding tensor {name} from {n} to {n_new}")
                 yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -4732,6 +4824,22 @@ class Qwen3Model(Qwen2Model):
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
 
+        new_name = self.map_tensor_name(name)
+        is_permute_candidate = any(self.match_model_tensor_name(new_name, key, bid) for key in [
+            gguf.MODEL_TENSOR.ATTN_Q,
+            gguf.MODEL_TENSOR.ATTN_K,
+            gguf.MODEL_TENSOR.ATTN_V,
+            gguf.MODEL_TENSOR.ATTN_OUT,
+            gguf.MODEL_TENSOR.FFN_UP,
+            gguf.MODEL_TENSOR.FFN_DOWN,
+            gguf.MODEL_TENSOR.FFN_GATE,
+        ])
+        if os.getenv("REPACK_FOR_HMX") is not None and is_permute_candidate:
+            data_torch = repack_linear_weight_for_hmx(data_torch)
+            logger.warning(f"Repacking tensor {name} for HMX...")
+            yield (new_name, data_torch)
+            return
+
         yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -4906,6 +5014,10 @@ class Qwen3VLVisionModel(MmprojModel):
             else:
                 raise ValueError(f"Unexpected deepstack tensor: {name}")
 
+            if os.getenv("REPACK_FOR_HMX") is not None and data_torch.ndim == 2:
+                data_torch = repack_linear_weight_for_hmx(data_torch)
+                logger.warning(f"Repacking tensor {name} for HMX...")
+
             new_name = self.format_tensor_name(tensor_type, idx, suffix=f".{suffix}")
             yield from super().modify_tensors(data_torch, new_name, bid)
             return
@@ -4928,6 +5040,9 @@ class Qwen3VLVisionModel(MmprojModel):
                 new_name = self.format_tensor_name(gguf.MODEL_TENSOR.V_POST_NORM, suffix=f".{suffix.split('.', 1)[1]}")
             else:
                 raise ValueError(f"Unexpected merger tensor: {name}")
+            if os.getenv("REPACK_FOR_HMX") is not None and data_torch.ndim == 2:
+                data_torch = repack_linear_weight_for_hmx(data_torch)
+                logger.warning(f"Repacking tensor {name} for HMX...")
             yield (new_name, data_torch)
             return
 
@@ -4947,6 +5062,9 @@ class Qwen3VLVisionModel(MmprojModel):
             return
 
         if name.startswith("visual."):
+            if os.getenv("REPACK_FOR_HMX") is not None and data_torch.ndim == 2 and "pos_embed" not in name:
+                data_torch = repack_linear_weight_for_hmx(data_torch)
+                logger.warning(f"Repacking tensor {name} for HMX...")
             yield from MmprojModel.modify_tensors(self, data_torch, name, bid)
         return  # skip other tensors
 
@@ -5118,7 +5236,7 @@ class Qwen3VLTextModel(Qwen3Model):
         # Skip vision tensors - they go in the mmproj file
         if name.startswith("model.visual."):
             return
-
+        name = name.replace("model.language_model.", "model.")
         yield from super().modify_tensors(data_torch, name, bid)
 
 
