@@ -265,6 +265,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F16,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q1_0] = {
+        .from_float               = quantize_row_q1_0,
+        .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -310,6 +316,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_MXFP4] = {
+        .from_float               = quantize_row_mxfp4,
+        .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NVFP4] = {
+        .from_float               = quantize_row_nvfp4,
+        .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -420,7 +438,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
 };
 
-const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
+const struct ggml_type_traits_cpu * htp_get_type_traits_cpu(enum ggml_type type);
+
+const struct ggml_type_traits_cpu * htp_get_type_traits_cpu(enum ggml_type type) {
     return &type_traits_cpu[type];
 }
 
@@ -2561,8 +2581,8 @@ static void ggml_compute_forward_dup_f16(
                         id += ne00 * (ne01 - ir1);
                     }
                 }
-            } else if (ggml_get_type_traits_cpu(dst->type)->from_float) {
-                ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+            } else if (htp_get_type_traits_cpu(dst->type)->from_float) {
+                ggml_from_float_t const quantize_row_q = htp_get_type_traits_cpu(dst->type)->from_float;
                 float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
                 size_t id = 0;
@@ -2842,8 +2862,8 @@ static void ggml_compute_forward_dup_bf16(
                         id += ne00 * (ne01 - ir1);
                     }
                 }
-            } else if (ggml_get_type_traits_cpu(dst->type)->from_float) {
-                ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+            } else if (htp_get_type_traits_cpu(dst->type)->from_float) {
+                ggml_from_float_t const quantize_row_q = htp_get_type_traits_cpu(dst->type)->from_float;
                 float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
                 size_t id = 0;
@@ -3158,8 +3178,8 @@ static void ggml_compute_forward_dup_f32(
                         id += rs * (ne01 - ir1);
                     }
                 }
-            } else if (ggml_get_type_traits_cpu(dst->type)->from_float) {
-                ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
+            } else if (htp_get_type_traits_cpu(dst->type)->from_float) {
+                ggml_from_float_t const quantize_row_q = htp_get_type_traits_cpu(dst->type)->from_float;
 
                 size_t id = 0;
                 size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
@@ -3941,7 +3961,7 @@ static void ggml_compute_forward_add_q_f32(
     const enum ggml_type type = src0->type;
     const enum ggml_type dtype = dst->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
-    ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dtype)->from_float;
+    ggml_from_float_t const quantize_row_q = htp_get_type_traits_cpu(dtype)->from_float;
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -4240,7 +4260,7 @@ static void ggml_compute_forward_add1_q_f32(
 
     const enum ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
-    ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(type)->from_float;
+    ggml_from_float_t const quantize_row_q = htp_get_type_traits_cpu(type)->from_float;
 
     // we don't support permuted src0
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -8649,12 +8669,15 @@ static void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
