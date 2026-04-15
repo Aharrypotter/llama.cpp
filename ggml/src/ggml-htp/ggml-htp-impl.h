@@ -6,6 +6,8 @@
 
 static const char * HTP_OPS_DL_PATH = "libhtp_ops.so";
 
+struct htp_threadpool;
+
 // singleton HTP backend context
 struct ggml_backend_htp_context {
     static constexpr size_t MAX_MSG_SIZE = 4096;
@@ -14,8 +16,8 @@ struct ggml_backend_htp_context {
     size_t    work_size = 0;
     uint8_t * work_data = nullptr;
 
-    int                      n_threads  = 0;
-    struct ggml_threadpool * threadpool = nullptr;
+    int                     n_threads  = 0;
+    struct htp_threadpool * threadpool = nullptr;
 
     // TODO(hzx): add abort_callback & abort_callback_data
 

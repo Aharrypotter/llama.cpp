@@ -22,12 +22,12 @@ auto get_all_rpcmem_mappings(const ggml_tensor * dst) {
     const auto & mapper = ggml_backend_htp_context::instance()->mapper;
 
     std::vector<std::pair<int, ssize_t>> mappings;
-    if (ggml_backend_buft_is_rpcmem(dst->buffer->buft)) {
+    if (dst->buffer && ggml_backend_buft_is_rpcmem(dst->buffer->buft)) {
         mappings.push_back(mapper.get_tensor_mapping(dst));
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         auto * src = dst->src[i];
-        if (src && ggml_backend_buft_is_rpcmem(src->buffer->buft)) {
+        if (src && src->buffer && ggml_backend_buft_is_rpcmem(src->buffer->buft)) {
             mappings.push_back(mapper.get_tensor_mapping(src));
         }
     }
@@ -76,12 +76,23 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 auto * weight     = dst->src[0];
                 auto * activation = dst->src[1];
 
-                size_t k = weight->ne[0];
-                size_t n = weight->ne[1];
+                // ggml_mul_mat: dst[M, N] = weight[K, M]^T @ activation[K, N]
+                // Kernel expects: output[m, n] = activation[m, k] @ weight[n, k]^T
+                //
+                // Mapping (ggml column-major -> kernel row-major):
+                //   kernel m = activation->ne[1] = N (batch size)
+                //   kernel k = weight->ne[0] = K (inner dim, stride matches)
+                //   kernel n = weight->ne[1] = M (output features)
+                //
+                // Kernel constraints from mat_mul.c: k % 32 == 0 && n % 32 == 0
+                // So we need: K % 32 == 0 && M % 32 == 0
+                size_t K = weight->ne[0];      // kernel k
+                size_t M = weight->ne[1];      // kernel n (output features)
+                size_t N = activation->ne[1];  // kernel m (batch size)
 
-                bool shape_ok = k % 32 == 0 && n % 32 == 0 && ggml_nrows(dst) == dst->ne[1] &&
+                bool shape_ok = K % 32 == 0 && M % 32 == 0 &&
+                                ggml_nrows(dst) == dst->ne[1] &&
                                 ggml_nrows(activation) == activation->ne[1];
-                // bool shape_ok = ggml_nrows(dst) == dst->ne[1] && ggml_nrows(activation) == activation->ne[1];
 
                 // FP16 weight
                 if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && activation->type == GGML_TYPE_F32) {
@@ -100,9 +111,6 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                     activation->type == GGML_TYPE_F32) {
                     return shape_ok;
                 }
-                // fprintf(stderr, "unsupported matmul: dst(%s): %s weight(%s): %s act(%s): %s\n", dst->name,
-                //         ggml_type_name(dst->type), weight->name, ggml_type_name(weight->type), activation->name,
-                //         ggml_type_name(activation->type));
                 return false;
             }
         case GGML_OP_FLASH_ATTN_EXT:
@@ -195,9 +203,33 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 auto [weight_fd, weight_offset]         = mappings[1];
                 auto [activation_fd, activation_offset] = mappings[2];
 
-                int m = ggml_nrows(activation);
-                int k = weight->ne[0];
-                int n = weight->ne[1];
+                // ggml_mul_mat: dst[M, N] = weight[K, M]^T @ activation[K, N]
+                //   where: K = weight->ne[0], M = weight->ne[1], N = activation->ne[1]
+                //
+                // ggml tensors are column-major (ne[0] is contiguous dimension):
+                //   - weight: [K, M] with stride = K (nb1/nb0 = K)
+                //   - activation: [K, N] with stride = K (nb1/nb0 = K)
+                //   - dst: [M, N] with stride = M (nb1/nb0 = M)
+                //
+                // Kernel expects row-major layout:
+                //   output[m, n] = activation[m, k] @ permuted_weight[n, k]^T
+                //   - activation: m rows, k cols, stride = k
+                //   - weight: n rows, k cols, stride = k
+                //   - output: m rows, n cols, stride = n
+                //
+                // Column-major [K, N] is equivalent to row-major [N, K] (same stride, just dimension names swapped).
+                // So for correct kernel operation:
+                //   - kernel's m = ggml's N (activation->ne[1], batch size)
+                //   - kernel's k = ggml's K (weight->ne[0], inner dim) ✓ stride matches
+                //   - kernel's n = ggml's M (weight->ne[1], output features)
+                //
+                // CORRECT mapping:
+                int m = activation->ne[1];  // N (batch size) - kernel reads N rows
+                int k = weight->ne[0];      // K (inner dim) - stride matches ggml
+                int n = weight->ne[1];      // M (output features) - kernel outputs M cols
+
+                // NOTE: output stride issue: kernel expects stride=n=M, but ggml dst has stride=M ✓ (matches!)
+                // So after this correction, all strides match correctly!
 
                 ///////////////////////
                 // k &= ~31;
@@ -365,7 +397,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
         sum += 0x00000001 + 0x00000000;  // value of `state`
 
         msg_hdr->checksum = -sum;
-    
+
 #ifdef __aarch64__
         asm volatile("dmb sy" ::: "memory");
 #endif

@@ -1,17 +1,17 @@
 #include "ggml-htp.h"
 
+#include "dsprpc_interface.h"
+#include "ggml-backend-impl.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-htp-impl.h"
+
 #include <dlfcn.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
-
-#include "dsprpc_interface.h"
-#include "ggml-backend-impl.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
-#include "ggml-htp-impl.h"
 
 // real backend initialization work is done here. ggml_backend_htp_init is only a wrapper
 ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 * 1024, true) {
@@ -95,7 +95,8 @@ int ggml_backend_htp_context::init_message_channel() {
         return -1;
     }
 
-    return create_msg_channel(msg_chan_fd, MAX_MSG_SIZE);
+    int result = create_msg_channel(msg_chan_fd, MAX_MSG_SIZE);
+    return result;
 }
 
 // singleton
@@ -127,29 +128,39 @@ static void ggml_backend_htp_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // rpcmem_free(buffer->context);
 }
 
-static void ggml_backend_htp_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
-                                                  uint8_t value, size_t offset, size_t size) {
+static void ggml_backend_htp_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                  struct ggml_tensor *  tensor,
+                                                  uint8_t               value,
+                                                  size_t                offset,
+                                                  size_t                size) {
     memset((char *) tensor->data + offset, value, size);
 
     GGML_UNUSED(buffer);
 }
 
-static void ggml_backend_htp_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
-                                               const void * data, size_t offset, size_t size) {
+static void ggml_backend_htp_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                               struct ggml_tensor *  tensor,
+                                               const void *          data,
+                                               size_t                offset,
+                                               size_t                size) {
     memcpy((char *) tensor->data + offset, data, size);
 
     GGML_UNUSED(buffer);
 }
 
-static void ggml_backend_htp_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
-                                               void * data, size_t offset, size_t size) {
+static void ggml_backend_htp_buffer_get_tensor(ggml_backend_buffer_t      buffer,
+                                               const struct ggml_tensor * tensor,
+                                               void *                     data,
+                                               size_t                     offset,
+                                               size_t                     size) {
     memcpy(data, (const char *) tensor->data + offset, size);
 
     GGML_UNUSED(buffer);
 }
 
-static bool ggml_backend_htp_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src,
-                                               struct ggml_tensor * dst) {
+static bool ggml_backend_htp_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
+                                               const struct ggml_tensor * src,
+                                               struct ggml_tensor *       dst) {
     if (ggml_backend_buffer_is_host(src->buffer)) {
         memcpy(dst->data, src->data, ggml_nbytes(src));
         return true;
@@ -170,6 +181,8 @@ static const struct ggml_backend_buffer_i ggml_backend_htp_buffer_i = {
     /* .memset_tensor   = */ ggml_backend_htp_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_htp_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_htp_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,  // optional, not implemented
+    /* .get_tensor_2d   = */ nullptr,  // optional, not implemented
     /* .cpy_tensor      = */ ggml_backend_htp_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_htp_buffer_clear,
     /* .reset           = */ nullptr,
@@ -265,7 +278,7 @@ static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, s
 
     struct ggml_backend_htp_context * ctx = (struct ggml_backend_htp_context *) backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads, ctx->threadpool);
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads, (struct ggml_threadpool *) ctx->threadpool);
 
     if (ctx->work_size < cplan.work_size) {
         delete[] ctx->work_data;
@@ -288,6 +301,8 @@ static struct ggml_backend_i htp_backend_i = {
     /* .free                    = */ ggml_backend_htp_free,
     /* .set_tensor_async        = */ nullptr,
     /* .get_tensor_async        = */ nullptr,
+    /* .set_tensor_2d_async     = */ nullptr,
+    /* .get_tensor_2d_async     = */ nullptr,
     /* .cpy_tensor_async        = */ nullptr,
     /* .synchronize             = */ nullptr,
     /* .graph_plan_create       = */ nullptr,
@@ -311,10 +326,10 @@ static ggml_backend_t ggml_backend_htp_init(void) {
     auto * ctx = ggml_backend_htp_context::instance();
 
     ggml_backend_t backend = new ggml_backend{
-        /* .guid      = */ ggml_backend_htp_guid(),
-        /* .interface = */ htp_backend_i,
-        /* .device    = */ ggml_backend_reg_dev_get(ggml_backend_htp_reg(), 0),
-        /* .context   = */ ctx,
+        /* .guid    = */ ggml_backend_htp_guid(),
+        /* .iface   = */ htp_backend_i,
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_htp_reg(), 0),
+        /* .context = */ ctx,
     };
     return backend;
 }

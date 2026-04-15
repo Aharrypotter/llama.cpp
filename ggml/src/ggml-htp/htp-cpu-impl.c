@@ -1327,6 +1327,10 @@ struct ggml_compute_state {
     int ith;
 };
 
+// Keep HTP-specific names while reusing the local ggml_* threadpool implementation types.
+#define htp_threadpool ggml_threadpool
+#define htp_compute_state ggml_compute_state
+
 //
 // fundamental operations
 //
@@ -12547,14 +12551,14 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
-void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+static void htp_threadpool_free(struct htp_threadpool * threadpool) {
     if (!threadpool) {
         return;
     }
 
     const int n_threads = threadpool->n_threads_max;
 
-    struct ggml_compute_state* workers = threadpool->workers;
+    struct htp_compute_state * workers = threadpool->workers;
 
     ggml_mutex_lock(&threadpool->mutex);
 
@@ -12573,36 +12577,36 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
 
-    const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
+    const size_t workers_size = sizeof(struct htp_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
-    ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
+    ggml_aligned_free(threadpool, sizeof(struct htp_threadpool));
 }
 
 // pause/resume must be called under mutex
-static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
+static void htp_threadpool_pause_locked(struct htp_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Pausing threadpool\n");
     threadpool->pause = true;
     ggml_cond_broadcast(&threadpool->cond);
 }
 
-static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
+static void htp_threadpool_resume_locked(struct htp_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Resuming threadpool\n");
     threadpool->pause = false;
     ggml_cond_broadcast(&threadpool->cond);
 }
 
-void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
+static void htp_threadpool_pause(struct htp_threadpool * threadpool) {
     ggml_mutex_lock(&threadpool->mutex);
     if (!threadpool->pause) {
-       ggml_threadpool_pause_locked(threadpool);
+       htp_threadpool_pause_locked(threadpool);
     }
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
-void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
+static void htp_threadpool_resume(struct htp_threadpool * threadpool) {
     ggml_mutex_lock(&threadpool->mutex);
     if (threadpool->pause) {
-       ggml_threadpool_resume_locked(threadpool);
+       htp_threadpool_resume_locked(threadpool);
     }
     ggml_mutex_unlock(&threadpool->mutex);
 }
@@ -12610,8 +12614,8 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     bool enable_htp_profile = getenv("HTP_PROFILE") != NULL;
 
-    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
-    struct ggml_threadpool    * tp    = state->threadpool;
+    struct htp_compute_state * state = (struct htp_compute_state *) data;
+    struct htp_threadpool    * tp    = state->threadpool;
 
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
@@ -12683,15 +12687,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 }
 
 // check if thread is active
-static inline bool ggml_graph_compute_thread_active(struct ggml_compute_state * state) {
-    struct ggml_threadpool * threadpool = state->threadpool;
+static inline bool ggml_graph_compute_thread_active(struct htp_compute_state * state) {
+    struct htp_threadpool * threadpool = state->threadpool;
     int n_threads = atomic_load_explicit(&threadpool->n_threads_cur, memory_order_relaxed);
     return (state->ith < n_threads);
 }
 
 // check if thread is ready to proceed (exit from polling or sleeping)
-static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state) {
-    struct ggml_threadpool * threadpool = state->threadpool;
+static inline bool ggml_graph_compute_thread_ready(struct htp_compute_state * state) {
+    struct htp_threadpool * threadpool = state->threadpool;
 
     if (state->pending || threadpool->stop || threadpool->pause) { return true; }
 
@@ -12706,7 +12710,7 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
 }
 
 // sync thread state after polling
-static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
+static inline void ggml_graph_compute_thread_sync(struct htp_compute_state * state) {
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
     #ifdef GGML_TSAN_ENABLED
     atomic_fetch_add_explicit(&state->threadpool->n_graph, 0, memory_order_seq_cst);
@@ -12716,8 +12720,8 @@ static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * st
     UNUSED(state);
 }
 
-static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * state) {
-    struct ggml_threadpool * threadpool = state->threadpool;
+static inline bool ggml_graph_compute_poll_for_work(struct htp_compute_state * state) {
+    struct htp_threadpool * threadpool = state->threadpool;
 
     // Skip polling for unused threads
     if (!ggml_graph_compute_thread_active(state)) {
@@ -12736,8 +12740,8 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     return state->pending;
 }
 
-static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
-    struct ggml_threadpool * threadpool = state->threadpool;
+static inline bool ggml_graph_compute_check_for_work(struct htp_compute_state * state) {
+    struct htp_threadpool * threadpool = state->threadpool;
 
     if (ggml_graph_compute_poll_for_work(state)) {
         ggml_graph_compute_thread_sync(state);
@@ -12756,8 +12760,8 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
 }
 
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
-    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
-    struct ggml_threadpool * threadpool = state->threadpool;
+    struct htp_compute_state * state = (struct htp_compute_state *) data;
+    struct htp_threadpool * threadpool = state->threadpool;
 
     ggml_thread_apply_priority(threadpool->prio);
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
@@ -12796,7 +12800,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 }
 
 // Start processing new graph
-static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
+static void ggml_graph_compute_kickoff(struct htp_threadpool * threadpool, int n_threads)
 {
     // Always take the mutex here because the worker threads are doing hybrid poll/wait
 
@@ -12819,7 +12823,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
        }
 
        // resume does cond broadcast
-       ggml_threadpool_resume_locked(threadpool);
+       htp_threadpool_resume_locked(threadpool);
     } else {
        ggml_cond_broadcast(&threadpool->cond);
     }
@@ -12827,13 +12831,13 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
-static struct ggml_threadpool * ggml_threadpool_new_impl(
+static struct htp_threadpool * htp_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
                 struct ggml_cplan * cplan) {
 
-    struct ggml_threadpool * threadpool =
-        ggml_aligned_malloc(sizeof(struct ggml_threadpool));
+    struct htp_threadpool * threadpool =
+        ggml_aligned_malloc(sizeof(struct htp_threadpool));
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
@@ -12853,8 +12857,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     }
 
     // Allocate and init workers state
-    const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
-    struct ggml_compute_state * workers = ggml_aligned_malloc(workers_size);
+    const size_t workers_size = sizeof(struct htp_compute_state) * tpp->n_threads;
+    struct htp_compute_state * workers = ggml_aligned_malloc(workers_size);
 
     memset(workers, 0, workers_size);
     for (int j = 0; j < tpp->n_threads; j++) {
@@ -12945,7 +12949,7 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads                               = cplan->n_threads;
-    struct ggml_threadpool * threadpool = cplan->threadpool;
+    struct htp_threadpool * threadpool = (struct htp_threadpool *) cplan->threadpool;
 
     bool disposable_threadpool = false;
 
@@ -12962,7 +12966,7 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
         // ttp.cpumask[5] = 1;
         // ttp.strict_cpu = 0;
 
-        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool = htp_threadpool_new_impl(&ttp, cgraph, cplan);
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
@@ -12990,7 +12994,7 @@ enum ggml_status ggml_graph_compute_htp_hybrid(struct ggml_cgraph * cgraph, stru
     enum ggml_status ret = threadpool->ec;
 
     if (disposable_threadpool) {
-        ggml_threadpool_free(threadpool);
+        htp_threadpool_free(threadpool);
     }
 
     return ret;

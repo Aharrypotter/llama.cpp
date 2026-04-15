@@ -90,11 +90,11 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
                void *                     context,
                size_t                     size) {
     ggml_backend_buffer_t buffer = new ggml_backend_buffer {
-        /* .interface = */ iface,
-        /* .buft      = */ buft,
-        /* .context   = */ context,
-        /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .iface    = */ iface,
+        /* .buft     = */ buft,
+        /* .context  = */ context,
+        /* .size     = */ size,
+        /* .usage    = */ GGML_BACKEND_BUFFER_USAGE_ANY
     };
 
     return buffer;

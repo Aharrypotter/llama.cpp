@@ -13,7 +13,7 @@ void RpcMemMapper::validate(const ggml_tensor * dst) {
     std::vector<ggml_backend_buffer *> buffers;
 
     auto add_buffer = [&](ggml_backend_buffer * buf) {
-        if (ggml_backend_buft_is_rpcmem(buf->buft)) {
+        if (buf && ggml_backend_buft_is_rpcmem(buf->buft)) {
             buffers.push_back(buf);
         }
     };
@@ -80,11 +80,6 @@ void RpcMemMapper::validate(const ggml_tensor * dst) {
         auto it = std::find_if(pending_unmap_reqs.begin(), pending_unmap_reqs.end(),
                                [fd](const auto & v) { return std::get<0>(v) == fd; });
         if (it == pending_unmap_reqs.end()) {
-            int retry = 0;
-
-            // TODO(hzx): fix this and remove reference code
-            // fastrpc_munmap does not release DSP's vm mapping immediately
-again:
             int err = fastrpc_mmap(CDSP_DOMAIN_ID, fd, buf_base, 0, buf_size, FASTRPC_MAP_FD);
             if (err) {
                 dump_state();
@@ -95,7 +90,7 @@ again:
                         continue;
                     }
                     fprintf(stderr, "  src index %d name %s", i, src->name);
-                    if (ggml_backend_buft_is_rpcmem(src->buffer->buft)) {
+                    if (src->buffer && ggml_backend_buft_is_rpcmem(src->buffer->buft)) {
                         auto base = ggml_backend_buffer_get_base(src->buffer);
                         fprintf(stderr, " buf %p\n", base);
                     } else {
