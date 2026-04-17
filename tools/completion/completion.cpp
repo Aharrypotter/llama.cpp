@@ -1,17 +1,23 @@
 #include "arg.h"
 #include "common.h"
 #include "console.h"
+#include "ggml.h"
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
 
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -41,6 +47,232 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+struct layer_io_dump_cb_data {
+    std::string out_dir;
+    std::regex  tensor_filter;
+    bool        has_filter = false;
+    bool        block_only = false;
+    size_t      seq = 0;
+    std::mutex  mu;
+    std::vector<uint8_t> scratch;
+    std::ofstream manifest;
+};
+
+static std::string sanitize_name(const char * name) {
+    std::string s = name ? name : "unnamed";
+    for (char & c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '_' || c == '-' || c == '.';
+        if (!ok) {
+            c = '_';
+        }
+    }
+    if (s.empty()) {
+        s = "unnamed";
+    }
+    return s;
+}
+
+static int parse_layer_id_from_node_name(const char * node_name) {
+    if (!node_name) {
+        return -1;
+    }
+
+    const char * dash = ::strrchr(node_name, '-');
+    if (!dash || !dash[1]) {
+        return -1;
+    }
+
+    int layer = 0;
+    if (::sscanf(dash + 1, "%d", &layer) != 1) {
+        return -1;
+    }
+    return layer;
+}
+
+static bool is_node_name_prefix(const char * node_name, const char * prefix) {
+    return node_name && prefix && ::strncmp(node_name, prefix, ::strlen(prefix)) == 0;
+}
+
+static float tensor_get_f32_value(const uint8_t * data, ggml_type type, const size_t * nb, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const size_t i = i3 * nb[3] + i2 * nb[2] + i1 * nb[1] + i0 * nb[0];
+    if (type == GGML_TYPE_F32) {
+        return *(const float *) &data[i];
+    }
+    if (type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(*(const ggml_fp16_t *) &data[i]);
+    }
+    if (type == GGML_TYPE_BF16) {
+        return ggml_bf16_to_fp32(*(const ggml_bf16_t *) &data[i]);
+    }
+    if (type == GGML_TYPE_I32) {
+        return (float) *(const int32_t *) &data[i];
+    }
+    if (type == GGML_TYPE_I16) {
+        return (float) *(const int16_t *) &data[i];
+    }
+    if (type == GGML_TYPE_I8) {
+        return (float) *(const int8_t *) &data[i];
+    }
+    if (type == GGML_TYPE_I64) {
+        return (float) *(const int64_t *) &data[i];
+    }
+    return 0.0f;
+}
+
+static bool tensor_type_stats_supported(ggml_type type) {
+    return type == GGML_TYPE_F32 ||
+           type == GGML_TYPE_F16 ||
+           type == GGML_TYPE_BF16 ||
+           type == GGML_TYPE_I32 ||
+           type == GGML_TYPE_I16 ||
+           type == GGML_TYPE_I8 ||
+           type == GGML_TYPE_I64;
+}
+
+static void dump_one_tensor(layer_io_dump_cb_data & cb, const ggml_tensor * node, const ggml_tensor * t, const char * role, size_t node_idx) {
+    if (!t || !t->data) {
+        return;
+    }
+
+    if (cb.has_filter && !std::regex_search(t->name ? t->name : "", cb.tensor_filter)) {
+        return;
+    }
+
+    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
+    const size_t nbytes = ggml_nbytes(t);
+    const uint8_t * data_ptr = (const uint8_t *) t->data;
+    if (!is_host) {
+        cb.scratch.resize(nbytes);
+        ggml_backend_tensor_get(const_cast<ggml_tensor *>(t), cb.scratch.data(), 0, nbytes);
+        data_ptr = cb.scratch.data();
+    }
+
+    const std::string dst_name = sanitize_name(node && node->name ? node->name : "node");
+    const std::string tensor_name = sanitize_name(t->name);
+    std::ostringstream fn;
+    fn << std::setw(8) << std::setfill('0') << node_idx << "_" << sanitize_name(role)
+       << "_" << dst_name << "__" << tensor_name << ".bin";
+    const std::string file_name = fn.str();
+    const std::filesystem::path file_path = std::filesystem::path(cb.out_dir) / file_name;
+
+    {
+        std::ofstream fout(file_path, std::ios::binary);
+        if (!fout) {
+            LOG_WRN("layer-io dump: failed to open %s\n", file_path.string().c_str());
+            return;
+        }
+        fout.write((const char *) data_ptr, (std::streamsize) nbytes);
+    }
+
+    double min_v = 0.0;
+    double max_v = 0.0;
+    double mean_v = 0.0;
+    int64_t nan_cnt = 0;
+    int64_t inf_cnt = 0;
+    const bool stats_supported = tensor_type_stats_supported(t->type);
+    if (stats_supported) {
+        bool init = false;
+        double sum = 0.0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        const float v = tensor_get_f32_value(data_ptr, t->type, t->nb, i0, i1, i2, i3);
+                        if (std::isnan(v)) {
+                            nan_cnt++;
+                            continue;
+                        }
+                        if (std::isinf(v)) {
+                            inf_cnt++;
+                            continue;
+                        }
+                        if (!init) {
+                            min_v = max_v = v;
+                            init = true;
+                        } else {
+                            min_v = std::min(min_v, (double) v);
+                            max_v = std::max(max_v, (double) v);
+                        }
+                        sum += v;
+                    }
+                }
+            }
+        }
+        const int64_t n_elem = ggml_nelements(t);
+        const int64_t finite_cnt = n_elem - nan_cnt - inf_cnt;
+        mean_v = finite_cnt > 0 ? sum / (double) finite_cnt : 0.0;
+    }
+
+    const std::string node_name = sanitize_name(node && node->name ? node->name : "node");
+
+    cb.manifest
+        << node_idx << '\t'
+        << node_name << '\t'
+        << ggml_op_name(node ? node->op : GGML_OP_NONE) << '\t'
+        << role << '\t'
+        << sanitize_name(t->name) << '\t'
+        << ggml_type_name(t->type) << '\t'
+        << t->ne[0] << '\t' << t->ne[1] << '\t' << t->ne[2] << '\t' << t->ne[3] << '\t'
+        << nbytes << '\t'
+        << file_name << '\t'
+        << std::setprecision(10) << min_v << '\t' << max_v << '\t' << mean_v << '\t'
+        << nan_cnt << '\t' << inf_cnt
+        << '\n';
+}
+
+static bool layer_io_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * cb = (layer_io_dump_cb_data *) user_data;
+    if (!cb) {
+        return true;
+    }
+    if (ask) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(cb->mu);
+    const size_t node_idx = cb->seq++;
+    if (!cb->block_only) {
+        dump_one_tensor(*cb, t, t->src[0], "src0", node_idx);
+        dump_one_tensor(*cb, t, t->src[1], "src1", node_idx);
+        dump_one_tensor(*cb, t, t,         "dst",  node_idx);
+        return true;
+    }
+
+    const char * node_name = t->name ? t->name : "";
+    const int layer = parse_layer_id_from_node_name(node_name);
+    if (layer >= 0) {
+        // attn_norm-N: norm of block input, src[0] is block input
+        if (is_node_name_prefix(node_name, "attn_norm-")) {
+            dump_one_tensor(*cb, t, t->src[0], "blk_in", node_idx);
+        }
+        // ffn_inp-N: norm before FFN, src[0] is attention output (attn_output after add)
+        else if (is_node_name_prefix(node_name, "ffn_inp-")) {
+            dump_one_tensor(*cb, t, t->src[0], "attn_out", node_idx);
+        }
+        // ffn_out-N: FFN output after gate/up/down projection
+        else if (is_node_name_prefix(node_name, "ffn_out-")) {
+            dump_one_tensor(*cb, t, t, "ffn_out", node_idx);
+        }
+        // l_out-N: layer/block output after final add
+        else if (is_node_name_prefix(node_name, "l_out-")) {
+            dump_one_tensor(*cb, t, t, "blk_out", node_idx);
+        }
+    } else {
+        // result_norm: final norm before output projection
+        if (std::strcmp(node_name, "result_norm") == 0) {
+            dump_one_tensor(*cb, t, t->src[0], "final_norm_in", node_idx);
+        }
+        // result_output: final logits (output projection)
+        else if (std::strcmp(node_name, "result_output") == 0) {
+            dump_one_tensor(*cb, t, t, "final_logits", node_idx);
+        }
+    }
+    return true;
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -89,11 +321,54 @@ int main(int argc, char ** argv) {
 
     common_params params;
     g_params = &params;
+    layer_io_dump_cb_data dump_cb_data;
 
     common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMPLETION, print_usage)) {
         return 1;
+    }
+
+    const char * dump_dir_env = std::getenv("LLAMA_DUMP_LAYER_IO_DIR");
+    if (dump_dir_env && dump_dir_env[0] != '\0') {
+        dump_cb_data.out_dir = dump_dir_env;
+        std::error_code ec;
+        std::filesystem::create_directories(dump_cb_data.out_dir, ec);
+        if (ec) {
+            LOG_ERR("%s: failed to create LLAMA_DUMP_LAYER_IO_DIR=%s : %s\n", __func__, dump_cb_data.out_dir.c_str(), ec.message().c_str());
+            return 1;
+        }
+
+        const std::filesystem::path manifest_path = std::filesystem::path(dump_cb_data.out_dir) / "manifest.tsv";
+        dump_cb_data.manifest.open(manifest_path);
+        if (!dump_cb_data.manifest) {
+            LOG_ERR("%s: failed to open manifest file: %s\n", __func__, manifest_path.string().c_str());
+            return 1;
+        }
+
+        dump_cb_data.manifest
+            << "node_idx\tnode_name\top\trole\ttensor_name\ttype\tne0\tne1\tne2\tne3\tnbytes\tfile\tmin\tmax\tmean\tnan_count\tinf_count\n";
+
+        const char * filter_env = std::getenv("LLAMA_DUMP_LAYER_IO_FILTER");
+        if (filter_env && filter_env[0] != '\0') {
+            try {
+                dump_cb_data.tensor_filter = std::regex(filter_env, std::regex::optimize);
+                dump_cb_data.has_filter = true;
+            } catch (const std::regex_error & e) {
+                LOG_ERR("%s: invalid LLAMA_DUMP_LAYER_IO_FILTER regex '%s': %s\n", __func__, filter_env, e.what());
+                return 1;
+            }
+        }
+
+        const char * block_only_env = std::getenv("LLAMA_DUMP_BLOCK_KEYPOINTS_ONLY");
+        if (block_only_env && block_only_env[0] != '\0') {
+            dump_cb_data.block_only = std::strcmp(block_only_env, "0") != 0;
+        }
+
+        params.cb_eval = layer_io_dump_cb_eval;
+        params.cb_eval_user_data = &dump_cb_data;
+        LOG_INF("%s: layer I/O dump enabled, output dir = %s, block-only = %d\n",
+                __func__, dump_cb_data.out_dir.c_str(), dump_cb_data.block_only ? 1 : 0);
     }
 
     auto & sparams = params.sampling;

@@ -17,6 +17,8 @@
 ggml_backend_buffer_type_t ggml_backend_amx_buffer_type(void);
 #endif
 
+void ggml_compute_forward_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -12245,6 +12247,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_unary(params, tensor);
             } break;
+        case GGML_OP_GLU:
+            {
+                ggml_compute_forward_glu(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -12634,8 +12640,36 @@ static void htp_threadpool_resume(struct htp_threadpool * threadpool) {
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
+static bool ggml_debug_tensor_stats(const struct ggml_tensor * t, double * min_v, double * max_v, double * mean_v) {
+    if (!t || !t->data) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(t);
+    if (ne <= 0 || ne > INT_MAX) {
+        return false;
+    }
+
+    double min_val = DBL_MAX;
+    double max_val = -DBL_MAX;
+    double sum_val = 0.0;
+
+    for (int i = 0; i < (int) ne; ++i) {
+        const double v = (double) ggml_get_f32_1d(t, i);
+        min_val = MIN(min_val, v);
+        max_val = MAX(max_val, v);
+        sum_val += v;
+    }
+
+    *min_v  = min_val;
+    *max_v  = max_val;
+    *mean_v = sum_val / (double) ne;
+    return true;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     bool enable_htp_profile = getenv("HTP_PROFILE") != NULL;
+    bool enable_mul_mat_stats = getenv("HTP_DEBUG_MUL_MAT_STATS") != NULL;
 
     struct htp_compute_state * state = (struct htp_compute_state *) data;
     struct htp_threadpool    * tp    = state->threadpool;
@@ -12659,7 +12693,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
-
         // if (state->ith == 0) {
         //     fprintf(stderr, "preparing to compute node %d %s\n", node_n, node->name);
         // }
@@ -12686,10 +12719,28 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // }
 
         int64_t elapsed_time = ggml_time_us() - t1;
+        const bool runs_on_npu = htp_ops_support_op(node);
+
+        if (enable_mul_mat_stats && state->ith == 0 && node->op == GGML_OP_MUL_MAT) {
+            double min_val = 0.0;
+            double max_val = 0.0;
+            double mean_val = 0.0;
+            if (ggml_debug_tensor_stats(node, &min_val, &max_val, &mean_val)) {
+                fprintf(stderr,
+                        "HTP MUL_MAT STATS: node=%s path=%s dst_type=%s ne=[%ld,%ld,%ld,%ld] min=%g max=%g mean=%g\n",
+                        node->name, runs_on_npu ? "NPU" : "CPU", ggml_type_name(node->type),
+                        node->ne[0], node->ne[1], node->ne[2], node->ne[3], min_val, max_val, mean_val);
+            } else {
+                fprintf(stderr,
+                        "HTP MUL_MAT STATS: node=%s path=%s dst_type=%s (stats unavailable)\n",
+                        node->name, runs_on_npu ? "NPU" : "CPU", ggml_type_name(node->type));
+            }
+        }
+
         if (enable_htp_profile && state->ith == 0) {
             fprintf(stderr, "node %s, op %s, shape (%ld, %ld, %ld, %ld), %ld us",
                     node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], elapsed_time);
-            if (htp_ops_support_op(node)) {
+            if (runs_on_npu) {
                 fprintf(stderr, " on NPU\n");
                 npu_us += elapsed_time;
             } else {

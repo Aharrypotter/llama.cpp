@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 
 // ggml_compute_forward_dup
 
@@ -3176,11 +3177,13 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        float * dst_p = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+
+        ggml_vec_swiglu_f32(nc, dst_p, src0_p, src1_p);
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
-            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            const float x = dst_p[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
             assert(!isinf(x));

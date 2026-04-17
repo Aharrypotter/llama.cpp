@@ -8,6 +8,7 @@
 
 #include <dlfcn.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -260,6 +261,19 @@ static void ggml_backend_htp_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_htp_synchronize(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_htp_context *) backend->context;
+    GGML_ASSERT(ctx != nullptr);
+
+    // Current HTP execution path is synchronous, but split boundaries can call synchronize()
+    // before copying tensors. Flush deferred unmaps to keep mappings coherent.
+    if (!ctx->mapper.get_pending_unmap_reqs().empty()) {
+        ctx->mapper.unmap_all_pending_buffers();
+    }
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 static enum ggml_status ggml_backend_htp_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     constexpr bool use_mock_cpu_backend = false;
 
@@ -304,7 +318,7 @@ static struct ggml_backend_i htp_backend_i = {
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
     /* .cpy_tensor_async        = */ nullptr,
-    /* .synchronize             = */ nullptr,
+    /* .synchronize             = */ ggml_backend_htp_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
     /* .graph_plan_update       = */ nullptr,

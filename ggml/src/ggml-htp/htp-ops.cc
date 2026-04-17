@@ -5,6 +5,9 @@
 
 #include <atomic>
 #include <cstring>
+#include <string.h>
+#include <stdlib.h>
+#include <utility>
 #include <vector>
 
 #include "ggml-backend-impl.h"
@@ -76,21 +79,12 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 auto * weight     = dst->src[0];
                 auto * activation = dst->src[1];
 
-                // ggml_mul_mat: dst[M, N] = weight[K, M]^T @ activation[K, N]
-                // Kernel expects: output[m, n] = activation[m, k] @ weight[n, k]^T
-                //
-                // Mapping (ggml column-major -> kernel row-major):
-                //   kernel m = activation->ne[1] = N (batch size)
-                //   kernel k = weight->ne[0] = K (inner dim, stride matches)
-                //   kernel n = weight->ne[1] = M (output features)
-                //
-                // Kernel constraints from mat_mul.c: k % 32 == 0 && n % 32 == 0
-                // So we need: K % 32 == 0 && M % 32 == 0
-                size_t K = weight->ne[0];      // kernel k
-                size_t M = weight->ne[1];      // kernel n (output features)
-                size_t N = activation->ne[1];  // kernel m (batch size)
+                // Keep matmul gate conservative:
+                // kernel constraints from mat_mul.c: k % 32 == 0 && n % 32 == 0
+                size_t k = weight->ne[0];
+                size_t n = weight->ne[1];
 
-                bool shape_ok = K % 32 == 0 && M % 32 == 0 &&
+                bool shape_ok = k % 32 == 0 && n % 32 == 0 &&
                                 ggml_nrows(dst) == dst->ne[1] &&
                                 ggml_nrows(activation) == activation->ne[1];
 
@@ -123,16 +117,6 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 auto * k    = dst->src[1];
                 auto * v    = dst->src[2];
                 auto * mask = dst->src[3];
-
-                auto print_tensor_info = [](const ggml_tensor * t) {
-                    printf("%s: shape [%ld,%ld,%ld,%ld] type %s\n", t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-                           ggml_type_name(t->type));
-                };
-                // print_tensor_info(dst);
-                // print_tensor_info(q);
-                // print_tensor_info(k);
-                // print_tensor_info(v);
-                // print_tensor_info(mask);
 
                 bool mask_type_ok = !mask || mask->type == GGML_TYPE_F16;
 
@@ -218,15 +202,14 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 //   - output: m rows, n cols, stride = n
                 //
                 // Column-major [K, N] is equivalent to row-major [N, K] (same stride, just dimension names swapped).
-                // So for correct kernel operation:
-                //   - kernel's m = ggml's N (activation->ne[1], batch size)
+                // So for kernel operation:
+                //   - kernel's m = ggml's activation rows
                 //   - kernel's k = ggml's K (weight->ne[0], inner dim) ✓ stride matches
                 //   - kernel's n = ggml's M (weight->ne[1], output features)
-                //
-                // CORRECT mapping:
-                int m = activation->ne[1];  // N (batch size) - kernel reads N rows
-                int k = weight->ne[0];      // K (inner dim) - stride matches ggml
-                int n = weight->ne[1];      // M (output features) - kernel outputs M cols
+
+                int m = ggml_nrows(activation);  // N * ne[2] * ne[3]... - handles multi-dimensional activations
+                int k = weight->ne[0];           // K (inner dim) - stride matches ggml
+                int n = weight->ne[1];           // M (output features) - kernel outputs M cols
 
                 // NOTE: output stride issue: kernel expects stride=n=M, but ggml dst has stride=M ✓ (matches!)
                 // So after this correction, all strides match correctly!
@@ -273,6 +256,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 } else {
                     GGML_ASSERT(false && "not implemented");
                 }
+
             }
             break;
 
@@ -422,6 +406,7 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
     }
 
     std::atomic_thread_fence(std::memory_order_acquire);
+
     return message_header_get_request_ptr(msg_hdr, 0)->state;
 }
 }
