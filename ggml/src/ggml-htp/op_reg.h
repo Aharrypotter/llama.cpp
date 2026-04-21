@@ -9,6 +9,7 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_PERMUTED_W8D16A32,
   HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL,
   HTP_OPS_FLASH_ATTN_QO_F32_KV_F16,
+  HTP_OPS_SSM_CONV_F32,
   HTP_OPS_COUNT,
 };
 
@@ -44,4 +45,14 @@ struct FlashAttnParams {
   int32_t n_heads;
   int32_t n_kv_heads;
   int32_t head_dim;
+} __attribute__((packed));
+
+struct SsmConvParams {
+  struct RpcmemBufAddr dst;
+  struct RpcmemBufAddr src0;
+  struct RpcmemBufAddr src1;
+  int32_t d_conv;
+  int32_t d_inner;
+  int32_t n_t;
+  int32_t n_s;
 } __attribute__((packed));

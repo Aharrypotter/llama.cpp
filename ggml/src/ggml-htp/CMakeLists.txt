@@ -6,6 +6,11 @@ set(GGML_SOURCES_HTP
     dsprpc_interface.cc
     ggml-htp-impl.h
     htp-cpu-impl.c
+    htp-cpu-vec.h
+    htp-cpu-vec.cpp
+    htp-cpu-ops.cpp
+    htp-cpu-ops.h
+    htp-cpu-threadpool.c
     htp-ops.cc
     htp-ops.h
     rpcmem_mapper.cc
