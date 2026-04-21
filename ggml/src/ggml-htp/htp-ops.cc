@@ -123,6 +123,26 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
                 return dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
                        v->type == GGML_TYPE_F16 && mask_type_ok && max_bias == 0 && logit_softcap == 0;
             }
+        case GGML_OP_SSM_CONV:
+            {
+                auto * src0 = dst->src[0];
+                auto * src1 = dst->src[1];
+
+                if (!src0 || !src1) {
+                    return false;
+                }
+
+                const bool type_ok = dst->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                                     src1->type == GGML_TYPE_F32;
+                const bool shape_ok = dst->ne[0] == src0->ne[1] && dst->ne[0] == src1->ne[1] &&
+                                      src0->ne[0] == src1->ne[0] - 1 + dst->ne[1] &&
+                                      dst->ne[2] == src0->ne[2] &&
+                                      src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                                      dst->ne[3] == 1 && src0->ne[3] == 1;
+                const bool layout_ok = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+
+                return type_ok && shape_ok && layout_ok;
+            }
         default:
             return false;
     }
@@ -303,6 +323,34 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
 
                 op_index  = HTP_OPS_FLASH_ATTN_QO_F32_KV_F16;
                 args_size = sizeof(FlashAttnParams);
+            }
+            break;
+
+        case GGML_OP_SSM_CONV:
+            {
+                auto mappings = get_all_rpcmem_mappings(dst);
+                GGML_ASSERT(mappings.size() == 3);
+
+                auto [dst_fd,  dst_offset]  = mappings[0];
+                auto [src0_fd, src0_offset] = mappings[1];
+                auto [src1_fd, src1_offset] = mappings[2];
+
+                auto * src0 = dst->src[0];
+                auto * src1 = dst->src[1];
+
+                SsmConvParams params{
+                    .dst     = { dst_fd,  (int32_t) dst_offset  },
+                    .src0    = { src0_fd, (int32_t) src0_offset },
+                    .src1    = { src1_fd, (int32_t) src1_offset },
+                    .d_conv  = (int32_t) src1->ne[0],
+                    .d_inner = (int32_t) dst->ne[0],
+                    .n_t     = (int32_t) dst->ne[1],
+                    .n_s     = (int32_t) dst->ne[2],
+                };
+                *reinterpret_cast<SsmConvParams *>(param_buf) = params;
+
+                op_index  = HTP_OPS_SSM_CONV_F32;
+                args_size = sizeof(SsmConvParams);
             }
             break;
 
