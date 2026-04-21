@@ -3672,6 +3672,59 @@ static void ggml_compute_forward_gelu(
     }
 }
 
+// ggml_compute_forward_gelu_erf
+
+static void ggml_compute_forward_gelu_erf_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    const float inv_sqrt_2 = 0.70710678118f;
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        const float * x = (float *) ((char *) src0->data + i1*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i1*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            const float v = x[j];
+            y[j] = 0.5f * v * (1.0f + erff(v * inv_sqrt_2));
+        }
+    }
+}
+
+static void ggml_compute_forward_gelu_erf(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gelu_erf_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_gelu_quick
 
 static void ggml_compute_forward_gelu_quick_f32(
@@ -4069,6 +4122,299 @@ static void ggml_compute_forward_softplus(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_softplus_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_expm1
+
+static void ggml_compute_forward_expm1_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            y[j] = expm1f(x[j]);
+        }
+    }
+}
+
+static void ggml_compute_forward_expm1(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_expm1_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_floor
+
+static void ggml_compute_forward_floor_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            y[j] = floorf(x[j]);
+        }
+    }
+}
+
+static void ggml_compute_forward_floor(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_floor_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_ceil
+
+static void ggml_compute_forward_ceil_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            y[j] = ceilf(x[j]);
+        }
+    }
+}
+
+static void ggml_compute_forward_ceil(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ceil_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_round
+
+static void ggml_compute_forward_round_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            y[j] = roundf(x[j]);
+        }
+    }
+}
+
+static void ggml_compute_forward_round(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_round_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_trunc
+
+static void ggml_compute_forward_trunc_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            y[j] = truncf(x[j]);
+        }
+    }
+}
+
+static void ggml_compute_forward_trunc(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_trunc_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_xielu
+
+static void ggml_compute_forward_xielu_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    assert(ggml_is_contiguous_1(src0));
+    assert(ggml_is_contiguous_1(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    const float alpha_n = ggml_get_op_params_f32(dst, 1);
+    const float alpha_p = ggml_get_op_params_f32(dst, 2);
+    const float beta    = ggml_get_op_params_f32(dst, 3);
+    const float eps     = ggml_get_op_params_f32(dst, 4);
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    for (int i = 0; i < n; i++) {
+        const float * x = (float *) ((char *) src0->data + i*(src0->nb[1]));
+        float * y = (float *) ((char *) dst->data  + i*( dst->nb[1]));
+
+        for (int j = 0; j < nc; j++) {
+            const float v = x[j];
+            if (v > 0.0f) {
+                y[j] = alpha_p * v * v + beta * v;
+            } else {
+                const float min_v_eps = fminf(v, eps);
+                y[j] = (expm1f(min_v_eps) - v) * alpha_n + beta * v;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_xielu(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_xielu_f32(params, dst);
             } break;
         default:
             {
@@ -8912,6 +9258,10 @@ void ggml_compute_forward_unary(
             {
                 ggml_compute_forward_gelu(params, dst);
             } break;
+        case GGML_UNARY_OP_GELU_ERF:
+            {
+                ggml_compute_forward_gelu_erf(params, dst);
+            } break;
         case GGML_UNARY_OP_GELU_QUICK:
             {
                 ggml_compute_forward_gelu_quick(params, dst);
@@ -8935,6 +9285,30 @@ void ggml_compute_forward_unary(
         case GGML_UNARY_OP_SOFTPLUS:
             {
                 ggml_compute_forward_softplus(params, dst);
+            } break;
+        case GGML_UNARY_OP_FLOOR:
+            {
+                ggml_compute_forward_floor(params, dst);
+            } break;
+        case GGML_UNARY_OP_CEIL:
+            {
+                ggml_compute_forward_ceil(params, dst);
+            } break;
+        case GGML_UNARY_OP_ROUND:
+            {
+                ggml_compute_forward_round(params, dst);
+            } break;
+        case GGML_UNARY_OP_TRUNC:
+            {
+                ggml_compute_forward_trunc(params, dst);
+            } break;
+        case GGML_UNARY_OP_XIELU:
+            {
+                ggml_compute_forward_xielu(params, dst);
+            } break;
+        case GGML_UNARY_OP_EXPM1:
+            {
+                ggml_compute_forward_expm1(params, dst);
             } break;
         default:
             {
@@ -10160,7 +10534,6 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
             }
     }
 }
-
 
 
 
