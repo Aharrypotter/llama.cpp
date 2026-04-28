@@ -135,10 +135,18 @@ def compare_rows(row_a, row_b):
 
 def parse_block_point(row):
     role = row["role"]
-    if role not in ("blk_in", "attn_out", "ffn_out", "blk_out", "head_norm", "head_out"):
+    BLOCK_ROLES = {
+        # Transformer keypoints
+        "blk_in", "attn_out", "ffn_out", "blk_out",
+        # Head keypoints
+        "head_norm", "head_out", "final_norm_in", "final_logits",
+        # SSM / recurrent keypoints
+        "conv_out", "conv_silu", "ssm_out", "attn_core_out",
+    }
+    if role not in BLOCK_ROLES:
         return None, None
 
-    if role.startswith("head_"):
+    if role in ("head_norm", "head_out", "final_norm_in", "final_logits"):
         return -1, role
 
     m = re.match(r".*-(\d+)$", row["node_name"])
@@ -162,10 +170,17 @@ def print_block_summary(results, threshold):
     order = {
         "blk_in": 0,
         "attn_out": 1,
-        "ffn_out": 2,
-        "blk_out": 3,
-        "head_norm": 4,
-        "head_out": 5,
+        # SSM / recurrent points (between attn_out and ffn_out)
+        "conv_out": 2,
+        "conv_silu": 3,
+        "attn_core_out": 4,
+        "ssm_out": 5,
+        "ffn_out": 6,
+        "blk_out": 7,
+        "head_norm": 8,
+        "head_out": 9,
+        "final_norm_in": 10,
+        "final_logits": 11,
     }
 
     summary = []

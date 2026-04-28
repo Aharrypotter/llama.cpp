@@ -51,8 +51,14 @@ static bool need_insert_eot = false;
 struct layer_io_dump_cb_data {
     std::string out_dir;
     std::regex  tensor_filter;
-    bool        has_filter = false;
-    bool        block_only = false;
+    bool        has_filter    = false;
+    bool        block_only    = false;
+    bool        stats_only    = false;   // manifest only, skip binary dump
+    int         layer_min     = -1;      // -1 = no filter
+    int         layer_max     = -1;
+    int         eval_step_min = -1;      // -1 = no filter
+    int         eval_step_max = -1;
+    int         eval_step_cur = 0;       // incremented per cb_eval invocation
     size_t      seq = 0;
     std::mutex  mu;
     std::vector<uint8_t> scratch;
@@ -159,7 +165,7 @@ static void dump_one_tensor(layer_io_dump_cb_data & cb, const ggml_tensor * node
     const std::string file_name = fn.str();
     const std::filesystem::path file_path = std::filesystem::path(cb.out_dir) / file_name;
 
-    {
+    if (!cb.stats_only) {
         std::ofstream fout(file_path, std::ios::binary);
         if (!fout) {
             LOG_WRN("layer-io dump: failed to open %s\n", file_path.string().c_str());
@@ -234,7 +240,36 @@ static bool layer_io_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_
     }
 
     std::lock_guard<std::mutex> lock(cb->mu);
+
+    // eval step filtering: only dump within [eval_step_min, eval_step_max]
+    const int step = cb->eval_step_cur;
+    const bool step_in_range =
+        (cb->eval_step_min < 0 || step >= cb->eval_step_min) &&
+        (cb->eval_step_max < 0 || step <= cb->eval_step_max);
+
+    // detect end of a graph eval by seeing result_output, then bump eval_step_cur
+    const char * node_name_raw = t->name ? t->name : "";
+    if (std::strcmp(node_name_raw, "result_output") == 0) {
+        cb->eval_step_cur++;
+    }
+
+    if (!step_in_range) {
+        cb->seq++;
+        return true;
+    }
+
     const size_t node_idx = cb->seq++;
+
+    // layer range filtering
+    const char * node_name = t->name ? t->name : "";
+    const int layer = parse_layer_id_from_node_name(node_name);
+    if (cb->layer_min >= 0 && layer >= 0 && layer < cb->layer_min) {
+        return true;
+    }
+    if (cb->layer_max >= 0 && layer >= 0 && layer > cb->layer_max) {
+        return true;
+    }
+
     if (!cb->block_only) {
         dump_one_tensor(*cb, t, t->src[0], "src0", node_idx);
         dump_one_tensor(*cb, t, t->src[1], "src1", node_idx);
@@ -242,16 +277,19 @@ static bool layer_io_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_
         return true;
     }
 
-    const char * node_name = t->name ? t->name : "";
-    const int layer = parse_layer_id_from_node_name(node_name);
     if (layer >= 0) {
+        // === Transformer keypoints ===
         // attn_norm-N: norm of block input, src[0] is block input
         if (is_node_name_prefix(node_name, "attn_norm-")) {
             dump_one_tensor(*cb, t, t->src[0], "blk_in", node_idx);
         }
-        // ffn_inp-N: norm before FFN, src[0] is attention output (attn_output after add)
+        // ffn_inp-N: norm before FFN, src[0] is attention output (most models)
         else if (is_node_name_prefix(node_name, "ffn_inp-")) {
             dump_one_tensor(*cb, t, t->src[0], "attn_out", node_idx);
+        }
+        // attn_residual-N: attention output after residual add (Qwen3.5, PLaMo, etc.)
+        else if (is_node_name_prefix(node_name, "attn_residual-")) {
+            dump_one_tensor(*cb, t, t, "attn_out", node_idx);
         }
         // ffn_out-N: FFN output after gate/up/down projection
         else if (is_node_name_prefix(node_name, "ffn_out-")) {
@@ -260,6 +298,28 @@ static bool layer_io_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_
         // l_out-N: layer/block output after final add
         else if (is_node_name_prefix(node_name, "l_out-")) {
             dump_one_tensor(*cb, t, t, "blk_out", node_idx);
+        }
+        // === SSM / recurrent layer keypoints (Qwen3.5, Mamba, Falcon-H1, etc.) ===
+        // conv_output_raw-N: raw SSM convolution output (before SiLU)
+        else if (is_node_name_prefix(node_name, "conv_output_raw-")) {
+            dump_one_tensor(*cb, t, t, "conv_out", node_idx);
+        }
+        // conv_output_silu-N: SSM convolution output after SiLU activation
+        else if (is_node_name_prefix(node_name, "conv_output_silu-")) {
+            dump_one_tensor(*cb, t, t, "conv_silu", node_idx);
+        }
+        // linear_attn_out-N: final output of recurrent/linear attention block
+        else if (is_node_name_prefix(node_name, "linear_attn_out-")) {
+            dump_one_tensor(*cb, t, t, "ssm_out", node_idx);
+        }
+        // attn_output-N: delta net / linear attention output (before z-gate norm)
+        else if (is_node_name_prefix(node_name, "attn_output-")) {
+            dump_one_tensor(*cb, t, t, "attn_core_out", node_idx);
+        }
+        // mamba_out-N / ssm_out-N: Mamba / Falcon-H1 SSM output
+        else if (is_node_name_prefix(node_name, "mamba_out-") ||
+                 is_node_name_prefix(node_name, "ssm_out-")) {
+            dump_one_tensor(*cb, t, t, "ssm_out", node_idx);
         }
     } else {
         // result_norm: final norm before output projection
@@ -365,10 +425,52 @@ int main(int argc, char ** argv) {
             dump_cb_data.block_only = std::strcmp(block_only_env, "0") != 0;
         }
 
+        // LLAMA_DUMP_STATS_ONLY=1  — only write manifest stats, skip binary tensor files
+        const char * stats_only_env = std::getenv("LLAMA_DUMP_STATS_ONLY");
+        if (stats_only_env && stats_only_env[0] != '\0') {
+            dump_cb_data.stats_only = std::strcmp(stats_only_env, "0") != 0;
+        }
+
+        // LLAMA_DUMP_LAYERS=min-max  — only dump layers in [min, max] range (e.g. "0-2", "5-5")
+        const char * layers_env = std::getenv("LLAMA_DUMP_LAYERS");
+        if (layers_env && layers_env[0] != '\0') {
+            int lmin = 0, lmax = 0;
+            if (std::sscanf(layers_env, "%d-%d", &lmin, &lmax) == 2) {
+                dump_cb_data.layer_min = lmin;
+                dump_cb_data.layer_max = lmax;
+            } else if (std::sscanf(layers_env, "%d", &lmin) == 1) {
+                dump_cb_data.layer_min = lmin;
+                dump_cb_data.layer_max = lmin;
+            } else {
+                LOG_ERR("%s: invalid LLAMA_DUMP_LAYERS format '%s', expected 'min-max' or 'N'\n", __func__, layers_env);
+                return 1;
+            }
+        }
+
+        // LLAMA_DUMP_EVAL_STEPS=min-max  — only dump eval steps in [min, max] (e.g. "0-0" for first eval only)
+        const char * eval_steps_env = std::getenv("LLAMA_DUMP_EVAL_STEPS");
+        if (eval_steps_env && eval_steps_env[0] != '\0') {
+            int smin = 0, smax = 0;
+            if (std::sscanf(eval_steps_env, "%d-%d", &smin, &smax) == 2) {
+                dump_cb_data.eval_step_min = smin;
+                dump_cb_data.eval_step_max = smax;
+            } else if (std::sscanf(eval_steps_env, "%d", &smin) == 1) {
+                dump_cb_data.eval_step_min = smin;
+                dump_cb_data.eval_step_max = smin;
+            } else {
+                LOG_ERR("%s: invalid LLAMA_DUMP_EVAL_STEPS format '%s', expected 'min-max' or 'N'\n", __func__, eval_steps_env);
+                return 1;
+            }
+        }
+
         params.cb_eval = layer_io_dump_cb_eval;
         params.cb_eval_user_data = &dump_cb_data;
-        LOG_INF("%s: layer I/O dump enabled, output dir = %s, block-only = %d\n",
-                __func__, dump_cb_data.out_dir.c_str(), dump_cb_data.block_only ? 1 : 0);
+        LOG_INF("%s: layer I/O dump enabled, dir=%s, block-only=%d, stats-only=%d, layers=[%d,%d], eval-steps=[%d,%d]\n",
+                __func__, dump_cb_data.out_dir.c_str(),
+                dump_cb_data.block_only ? 1 : 0,
+                dump_cb_data.stats_only ? 1 : 0,
+                dump_cb_data.layer_min, dump_cb_data.layer_max,
+                dump_cb_data.eval_step_min, dump_cb_data.eval_step_max);
     }
 
     auto & sparams = params.sampling;
