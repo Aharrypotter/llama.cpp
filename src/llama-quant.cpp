@@ -115,6 +115,17 @@ static bool tensor_name_match_output_weight(const char * tensor_name) {
     return std::strcmp(tensor_name, "output.weight") == 0;
 }
 
+// Plan C: all linear attention weights in recurrent layers keep standard layout
+// (no HVX repack), so that the entire Delta Net path runs on CPU.
+static bool tensor_name_match_recurrent_cpu_fallback(const char * tensor_name) {
+    return std::strstr(tensor_name, ".attn_qkv.weight")  != nullptr ||
+           std::strstr(tensor_name, ".attn_gate.weight") != nullptr ||
+           std::strstr(tensor_name, ".ssm_alpha.weight") != nullptr ||
+           std::strstr(tensor_name, ".ssm_beta.weight")  != nullptr ||
+           std::strstr(tensor_name, ".ssm_ba.weight")    != nullptr ||
+           std::strstr(tensor_name, ".ssm_out.weight")   != nullptr;
+}
+
 //
 // tensor categorization for quantization
 //
@@ -888,6 +899,7 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     llama_ftype ftype = params->ftype;
     const bool repack_for_hvx = getenv("REPACK_FOR_HVX") != nullptr;
+    const bool debug_repack_for_hvx = getenv("DEBUG_HVX_REPACK") != nullptr;
 
     int nthread = params->nthread;
 
@@ -1276,17 +1288,39 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
 
                 if (repack_for_hvx) {
-                    if ((ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_F16 || ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_Q8_0) && new_type == GGML_TYPE_Q4_0) {
-                        repack_q4_0_super_block_hvx((const block_q4_0 *) new_data, new_data, new_size);
+                    int blk_id = -1;
+                    bool skip_hvx = false;
+                    if (sscanf(tensor->name, "blk.%d.", &blk_id) == 1 && blk_id >= 0
+                            && (uint32_t)blk_id < model.hparams.n_layer
+                            && model.hparams.is_recurrent(blk_id)
+                            && tensor_name_match_recurrent_cpu_fallback(tensor->name)) {
+                        skip_hvx = true;
                     }
-                    if ((ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_Q8_0 || ftype == LLAMA_FTYPE_MOSTLY_MIXED_IQ4_NL_Q8_0) &&
-                        new_type == GGML_TYPE_Q8_0 &&
-                        !tensor_name_match_token_embd(tensor->name) &&
-                        !tensor_name_match_output_weight(tensor->name)) {
-                        repack_q8_0_super_block_hvx((const block_q8_0 *) new_data, new_data, new_size);
-                    }
-                    if (ftype == LLAMA_FTYPE_MOSTLY_MIXED_IQ4_NL_Q8_0 && new_type == GGML_TYPE_IQ4_NL) {
-                        repack_iq4_nl_super_block_hvx((const block_iq4_nl *) new_data, new_data, new_size);
+
+                    if (!skip_hvx) {
+                        if ((ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_F16 || ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_Q8_0) && new_type == GGML_TYPE_Q4_0) {
+                            if (debug_repack_for_hvx) {
+                                LLAMA_LOG_INFO("%s: HVX repack Q4_0 tensor %s (blk_id=%d)\n", __func__, tensor->name, blk_id);
+                            }
+                            repack_q4_0_super_block_hvx((const block_q4_0 *) new_data, new_data, new_size);
+                        }
+                        if ((ftype == LLAMA_FTYPE_MOSTLY_MIXED_Q4_0_Q8_0 || ftype == LLAMA_FTYPE_MOSTLY_MIXED_IQ4_NL_Q8_0) &&
+                            new_type == GGML_TYPE_Q8_0 &&
+                            !tensor_name_match_token_embd(tensor->name) &&
+                            !tensor_name_match_output_weight(tensor->name)) {
+                            if (debug_repack_for_hvx) {
+                                LLAMA_LOG_INFO("%s: HVX repack Q8_0 tensor %s (blk_id=%d)\n", __func__, tensor->name, blk_id);
+                            }
+                            repack_q8_0_super_block_hvx((const block_q8_0 *) new_data, new_data, new_size);
+                        }
+                        if (ftype == LLAMA_FTYPE_MOSTLY_MIXED_IQ4_NL_Q8_0 && new_type == GGML_TYPE_IQ4_NL) {
+                            if (debug_repack_for_hvx) {
+                                LLAMA_LOG_INFO("%s: HVX repack IQ4_NL tensor %s (blk_id=%d)\n", __func__, tensor->name, blk_id);
+                            }
+                            repack_iq4_nl_super_block_hvx((const block_iq4_nl *) new_data, new_data, new_size);
+                        }
+                    } else if (debug_repack_for_hvx) {
+                        LLAMA_LOG_INFO("%s: skip HVX repack for recurrent tensor %s (blk_id=%d)\n", __func__, tensor->name, blk_id);
                     }
                 }
             }

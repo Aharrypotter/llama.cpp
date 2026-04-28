@@ -118,6 +118,10 @@ def is_hmx_repack_enabled() -> bool:
     return os.getenv("REPACK_FOR_HMX") is not None
 
 
+def is_hmx_repack_debug_enabled() -> bool:
+    return os.getenv("DEBUG_HMX_REPACK") is not None
+
+
 def is_hmx_permute_candidate(
     model: "ModelBase",
     new_name: str,
@@ -148,18 +152,29 @@ def maybe_repack_tensor_for_hmx(
     new_name: str | None = None,
     extra_tensor_types: Sequence[gguf.MODEL_TENSOR] = (),
 ) -> tuple[Tensor, str | None, bool]:
-    if not is_hmx_repack_enabled() or data_torch.ndim != 2:
+    if not is_hmx_repack_enabled():
+        return data_torch, new_name, False
+
+    if data_torch.ndim != 2:
+        if is_hmx_repack_debug_enabled():
+            logger.warning(f"HMX DEBUG: skip {name} - ndim={data_torch.ndim}, only 2D tensors are repacked")
         return data_torch, new_name, False
 
     if new_name is None:
         try:
             new_name = model.map_tensor_name(name)
-        except ValueError:
+        except ValueError as exc:
+            if is_hmx_repack_debug_enabled():
+                logger.warning(f"HMX DEBUG: skip {name} - map_tensor_name failed: {exc}")
             return data_torch, None, False
 
     if not is_hmx_permute_candidate(model, new_name, bid, extra_tensor_types):
+        if is_hmx_repack_debug_enabled():
+            logger.warning(f"HMX DEBUG: skip {name} - mapped={new_name}, bid={bid}, not an HMX candidate")
         return data_torch, new_name, False
 
+    if is_hmx_repack_debug_enabled():
+        logger.warning(f"HMX DEBUG: repack candidate {name} -> {new_name} (bid={bid})")
     return repack_linear_tensor_for_hmx(data_torch, name), new_name, True
 
 
@@ -4915,6 +4930,35 @@ class Qwen3MoeModel(Qwen2MoeModel):
 class Qwen3NextModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
 
+    def _is_recurrent_layer(self, bid: int | None) -> bool:
+        """Check if a layer is recurrent (linear attention / SSM) based on full_attention_interval."""
+        if bid is None:
+            return False
+        interval = self.hparams.get("full_attention_interval", 4)
+        return (bid + 1) % interval != 0
+
+    def _normalize_name_for_qwen_text_repack(self, name: str) -> str:
+        return name.replace("language_model.", "")
+
+    def _should_skip_hmx_repack_for_recurrent_tensor(self, new_name: str, bid: int | None) -> bool:
+        if bid is None or not self._is_recurrent_layer(bid):
+            return False
+
+        # Plan C: skip HMX repack for ALL linear attention weights in recurrent layers,
+        # so that the entire Delta Net path can run on CPU with standard layout weights.
+        # Only FFN and full-attention layers keep HMX repack for HTP acceleration.
+        return any(
+            self.match_model_tensor_name(new_name, tensor_type, bid)
+            for tensor_type in (
+                gguf.MODEL_TENSOR.ATTN_QKV,
+                gguf.MODEL_TENSOR.ATTN_GATE,
+                gguf.MODEL_TENSOR.SSM_ALPHA,
+                gguf.MODEL_TENSOR.SSM_BETA,
+                gguf.MODEL_TENSOR.SSM_BETA_ALPHA,
+                gguf.MODEL_TENSOR.SSM_OUT,
+            )
+        )
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
@@ -4968,22 +5012,29 @@ class Qwen3NextModel(Qwen2MoeModel):
             z = z.permute(1, 0).contiguous()
             qkv_name = self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV,  bid, ".weight")
             z_name = self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid, ".weight")
-            qkv, _, _ = maybe_repack_tensor_for_hmx(
-                self,
-                qkv,
-                qkv_name,
-                bid,
-                new_name=qkv_name,
-                extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
-            )
-            z, _, _ = maybe_repack_tensor_for_hmx(
-                self,
-                z,
-                z_name,
-                bid,
-                new_name=z_name,
-                extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
-            )
+            if not self._should_skip_hmx_repack_for_recurrent_tensor(qkv_name, bid):
+                qkv, _, _ = maybe_repack_tensor_for_hmx(
+                    self,
+                    qkv,
+                    qkv_name,
+                    bid,
+                    new_name=qkv_name,
+                    extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
+                )
+            elif is_hmx_repack_debug_enabled():
+                logger.warning(f"HMX DEBUG: skip {qkv_name} - recurrent CPU-fallback tensor, keep standard layout")
+
+            if not self._should_skip_hmx_repack_for_recurrent_tensor(z_name, bid):
+                z, _, _ = maybe_repack_tensor_for_hmx(
+                    self,
+                    z,
+                    z_name,
+                    bid,
+                    new_name=z_name,
+                    extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
+                )
+            elif is_hmx_repack_debug_enabled():
+                logger.warning(f"HMX DEBUG: skip {z_name} - recurrent CPU-fallback tensor, keep standard layout")
             yield (qkv_name, qkv)
             yield (z_name, z)
         else:
@@ -5589,13 +5640,25 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 # Out projection weight: reorder columns (input dimension)
                 data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
-        data_torch, _, _ = maybe_repack_tensor_for_hmx(
-            self,
-            data_torch,
-            name,
-            bid,
-            extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
-        )
+        repack_name = self._normalize_name_for_qwen_text_repack(name)
+        mapped_repack_name: str | None = None
+        try:
+            mapped_repack_name = self.map_tensor_name(repack_name)
+        except ValueError:
+            pass
+
+        skip_check_name = mapped_repack_name or repack_name
+        if not self._should_skip_hmx_repack_for_recurrent_tensor(skip_check_name, bid):
+            data_torch, _, _ = maybe_repack_tensor_for_hmx(
+                self,
+                data_torch,
+                repack_name,
+                bid,
+                new_name=mapped_repack_name,
+                extra_tensor_types=QWEN3NEXT_HMX_EXTRA_TENSOR_TYPES,
+            )
+        elif is_hmx_repack_debug_enabled() and data_torch.ndim == 2:
+            logger.warning(f"HMX DEBUG: skip {skip_check_name} - recurrent CPU-fallback tensor, keep standard layout")
         yield from super().modify_tensors(data_torch, name, bid)
 
 
