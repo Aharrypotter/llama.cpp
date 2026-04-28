@@ -14,4 +14,8 @@ int  htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor 
 
 #ifdef __cplusplus
 }
+
+struct RpcMemMapper;
+// Flush pending unmaps via DSP message channel. Used as RpcMemMapper::DspFlushFn callback.
+void dsp_flush_pending_unmaps(RpcMemMapper & mapper);
 #endif

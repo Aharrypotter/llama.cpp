@@ -51,6 +51,76 @@ uint8_t param_buf[4096];  // TODO(hzx): better implementation
 
 }  // namespace
 
+// Send a standalone RPCMEM_MAP unmap-only message to DSP, wait for ack,
+// then do host-side fastrpc_munmap. This is used as RpcMemMapper::DspFlushFn
+// callback when deferred LRU eviction needs to free device mappings before new fastrpc_mmap.
+void dsp_flush_pending_unmaps(RpcMemMapper & mapper) {
+    auto * ctx = ggml_backend_htp_context::instance();
+
+    int n_unmap_fds = mapper.get_pending_unmap_reqs().size();
+    if (n_unmap_fds == 0) {
+        return;
+    }
+
+    auto * msg_hdr = reinterpret_cast<MessageHeader *>(ctx->ops_msg_chan);
+    auto * d_ptr   = reinterpret_cast<volatile std::atomic<uint64_t> *>(&(msg_hdr->state.d));
+    std::atomic_store(d_ptr, 0);
+
+    msg_hdr->n_reqs         = 1;
+    msg_hdr->req_offsets[0] = message_header_size(msg_hdr);
+
+    size_t map_req_size     = sizeof(RequestHeader) + sizeof(RpcmemMapRequest) + n_unmap_fds * sizeof(int32_t);
+    msg_hdr->req_offsets[1] = msg_hdr->req_offsets[0] + map_req_size;
+
+    {
+        RequestHeader req_hdr{
+            .state = 0,
+            .type  = REQUEST_TYPE_RPCMEM_MAP,
+        };
+        RpcmemMapRequest map_req{
+            .n_puts = n_unmap_fds,
+            .n_gets = 0,
+        };
+
+        auto * p = reinterpret_cast<uint8_t *>(message_header_get_request_ptr(msg_hdr, 0));
+        write_buf(p, req_hdr);
+        write_buf(p, map_req);
+        for (const auto & [fd, _base, _len] : mapper.get_pending_unmap_reqs()) {
+            write_buf(p, fd);
+        }
+    }
+
+    // checksum
+    {
+        uint32_t   sum   = 0;
+        uint32_t * begin = ((uint32_t *) msg_hdr) + 3;
+        uint32_t * end   = ((uint32_t *) msg_hdr) + ggml_backend_htp_context::MAX_MSG_SIZE / 4;
+        for (auto * p = begin; p < end; ++p) {
+            sum += *p;
+        }
+        sum += 0x00000001 + 0x00000000;
+        msg_hdr->checksum = -sum;
+
+#ifdef __aarch64__
+        asm volatile("dmb sy" ::: "memory");
+#endif
+    }
+
+    // issue request & poll
+    auto * v0_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[0]));
+    auto * v1_ptr = reinterpret_cast<volatile std::atomic<uint8_t> *>(&(msg_hdr->state.v[1]));
+    std::atomic_store_explicit(v0_ptr, 1, std::memory_order_release);
+
+    while (std::atomic_load_explicit(v1_ptr, std::memory_order_acquire) == 0) {
+        usleep(1);
+    }
+    d_ptr->store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    // DSP has released references, now safe to do host-side fastrpc_munmap
+    mapper.unmap_all_pending_buffers();
+}
+
 extern "C" {
 
 bool htp_ops_support_op(const struct ggml_tensor * dst) {
@@ -67,9 +137,9 @@ bool htp_ops_support_op(const struct ggml_tensor * dst) {
 
     switch (dst->op) {
         case GGML_OP_RMS_NORM:
-            return false;
-
-            if (dst->type == GGML_TYPE_F32 && dst->src[0]->type == GGML_TYPE_F32) {
+            if (dst->src[0] != nullptr &&
+                dst->type == GGML_TYPE_F32 &&
+                dst->src[0]->type == GGML_TYPE_F32) {
                 // NOTE: RPC version is mainly for testing
                 return dlsym(ops_dl_handle, "htp_ops_rpc_rms_norm_f32") != nullptr;
             }

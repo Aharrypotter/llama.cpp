@@ -64,6 +64,15 @@ void RpcMemMapper::validate(const ggml_tensor * dst) {
         active_map_size -= buf_size;
     }
 
+    // When defer_unmap is true, LRU eviction above only does logical removal
+    // (decrements active_map_size) — the DSP kernel still holds those physical mappings.
+    // Before mapping new buffers, we must flush pending unmaps through the DSP message
+    // channel so the device releases its references first, then do host-side fastrpc_munmap.
+    if (!pending_unmap_reqs.empty() && required_size > 0) {
+        GGML_ASSERT(dsp_flush_fn && "defer_unmap requires a DSP flush callback to release device mappings");
+        dsp_flush_fn(*this);
+    }
+
     for (auto * buf : buffers) {
         void * buf_base = ggml_backend_buffer_get_base(buf);
         size_t buf_size = buf->size;

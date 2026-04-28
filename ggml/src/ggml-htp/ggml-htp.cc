@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-htp-impl.h"
+#include "htp-ops.h"
 
 #include <dlfcn.h>
 
@@ -36,6 +37,7 @@ ggml_backend_htp_context::ggml_backend_htp_context() : mapper(3 * 1024UL * 1024 
 
             if (init_message_channel() == 0) {
                 ops_backend_initialized = true;
+                mapper.set_dsp_flush_callback(dsp_flush_pending_unmaps);
             }
         } else {
             fprintf(stderr, "Failed to open remote session on Hexagon NPU (0x%x)\n", err);
