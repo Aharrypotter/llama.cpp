@@ -11,6 +11,8 @@ set(GGML_SOURCES_HTP
     htp-cpu-ops.cpp
     htp-cpu-ops.h
     htp-cpu-threadpool.c
+    htp-debug.cc
+    htp-debug.h
     htp-ops.cc
     htp-ops.h
     rpcmem_mapper.cc
