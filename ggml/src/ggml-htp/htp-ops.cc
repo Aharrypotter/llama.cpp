@@ -7,13 +7,14 @@
 #include <cstring>
 #include <string.h>
 #include <stdlib.h>
-#include <utility>
 #include <vector>
 
 #include "ggml-backend-impl.h"
 #include "ggml-htp-impl.h"
 #include "ggml-htp.h"
 #include "ggml.h"
+#include "ggml-impl.h"  // for GGML_LOG_* macros
+#include "htp-debug.h"
 
 ////// Special headers intended for CPU-NPU communication. Keep them in sync with ops backend.
 #include "message.h"
@@ -48,6 +49,30 @@ void write_buf(uint8_t *& p, void * src, size_t size) {
 }
 
 uint8_t param_buf[4096];  // TODO(hzx): better implementation
+
+bool is_recurrent_weight_name(const char * wname) {
+    if (!wname || wname[0] == '\0') {
+        return false;
+    }
+
+    return std::strstr(wname, ".attn_qkv.weight")  != nullptr ||
+           std::strstr(wname, ".attn_gate.weight") != nullptr ||
+           std::strstr(wname, ".ssm_alpha.weight") != nullptr ||
+           std::strstr(wname, ".ssm_beta.weight")  != nullptr ||
+           std::strstr(wname, ".ssm_ba.weight")    != nullptr ||
+           std::strstr(wname, ".ssm_out.weight")   != nullptr;
+}
+
+bool is_recurrent_common_layout_weight(const ggml_tensor * weight) {
+    if (!weight || weight->name[0] == '\0') {
+        return false;
+    }
+
+    const char * wname = weight->name;
+    return std::strstr(wname, ".attn_qkv.weight")  != nullptr ||
+           std::strstr(wname, ".attn_gate.weight") != nullptr ||
+           std::strstr(wname, ".ssm_out.weight")   != nullptr;
+}
 
 }  // namespace
 
@@ -300,6 +325,61 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                 int m = ggml_nrows(activation);  // N * ne[2] * ne[3]... - handles multi-dimensional activations
                 int k = weight->ne[0];           // K (inner dim) - stride matches ggml
                 int n = weight->ne[1];           // M (output features) - kernel outputs M cols
+                const bool use_common_layout = is_recurrent_common_layout_weight(weight);
+
+                debug_ffn_up   = should_debug_ffn_up_once(dst);
+                debug_ffn_gate = should_debug_ffn_gate_once(dst);
+                debug_ffn_out  = should_debug_ffn_out_once(dst);
+                debug_mul_mat_target = should_debug_mul_mat_target_once(dst);
+                const bool debug_ffn = debug_ffn_up || debug_ffn_gate || debug_ffn_out;
+                const bool debug_mul_mat = debug_ffn || debug_mul_mat_target;
+
+                if (debug_mul_mat) {
+                    const char * debug_prefix = debug_ffn_up ? "HTP FFN_UP DEBUG" :
+                                                debug_ffn_gate ? "HTP FFN_GATE DEBUG" :
+                                                debug_ffn_out ? "HTP FFN_OUT DEBUG" :
+                                                "HTP MUL_MAT TARGET DEBUG";
+                    print_tensor_shape_and_layout("weight", weight);
+                    print_tensor_shape_and_layout("activation", activation);
+                    print_tensor_shape_and_layout("dst", dst);
+                    print_tensor_memory_detail("weight", weight);
+                    print_tensor_memory_detail("activation", activation);
+                    print_tensor_memory_detail("dst", dst);
+                    fprintf(stderr,
+                            "%s: activation nrows=%lld vs ne[1]=%lld, kernel m=%d k=%d n=%d\n",
+                            debug_prefix,
+                            (long long) ggml_nrows(activation), (long long) activation->ne[1], m, k, n);
+                    fprintf(stderr,
+                            "%s: fd+offset dst=(%d,%lld) weight=(%d,%lld) activation=(%d,%lld)\n",
+                            debug_prefix,
+                            output_fd, (long long) output_offset,
+                            weight_fd, (long long) weight_offset,
+                            activation_fd, (long long) activation_offset);
+                    fprintf(stderr,
+                            "%s: weight_name=%s activation_name=%s dst_name=%s recurrent_weight=%d\n",
+                            debug_prefix,
+                            weight->name[0] != '\0' ? weight->name : "(unnamed)",
+                            activation->name[0] != '\0' ? activation->name : "(unnamed)",
+                            dst->name[0] != '\0' ? dst->name : "(unnamed)",
+                            weight->name[0] != '\0' && is_recurrent_weight_name(weight->name));
+                    if (debug_ffn_up || debug_mul_mat_target) {
+                        print_tensor_f32_stats("mul_mat.activation BEFORE HTP", activation);
+                    }
+                    if (debug_ffn_up) {
+                        print_tensor_f32_stats("ffn_up.activation BEFORE HTP", activation);
+                    } else if (debug_ffn_gate) {
+                        print_tensor_f32_stats("ffn_gate.activation BEFORE HTP", activation);
+                    } else if (debug_ffn_out) {
+                        print_tensor_f32_stats("ffn_out.activation BEFORE HTP", activation);
+                    }
+                }
+
+                // 启用 RPCMEM 详细映射调试（用于对比内存布局差异）
+                if (htp_debug_rpcmem_enabled() || debug_mul_mat_target) {
+                    print_rpcmem_mapping_detail("output", output_fd, output_offset, dst);
+                    print_rpcmem_mapping_detail("weight", weight_fd, weight_offset, weight);
+                    print_rpcmem_mapping_detail("activation", activation_fd, activation_offset, activation);
+                }
 
                 // NOTE: output stride issue: kernel expects stride=n=M, but ggml dst has stride=M ✓ (matches!)
                 // So after this correction, all strides match correctly!
@@ -339,10 +419,12 @@ int htp_ops_compute_op(struct ggml_compute_params * params, struct ggml_tensor *
                     op_index = HTP_OPS_MAT_MUL_PERMUTED_W4D16A32;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_Q8_0 &&
                            activation->type == GGML_TYPE_F32) {
-                    op_index = HTP_OPS_MAT_MUL_PERMUTED_W8D16A32;
+                    op_index = use_common_layout ? HTP_OPS_MAT_MUL_COMMON_W8D16A32
+                                                 : HTP_OPS_MAT_MUL_PERMUTED_W8D16A32;
                 } else if (dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_IQ4_NL &&
                            activation->type == GGML_TYPE_F32) {
-                    op_index = HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL;
+                    op_index = use_common_layout ? HTP_OPS_MAT_MUL_COMMON_W4D16A32_IQ4_NL
+                                                 : HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL;
                 } else {
                     GGML_ASSERT(false && "not implemented");
                 }
