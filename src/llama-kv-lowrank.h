@@ -64,9 +64,12 @@ struct llama_kv_lowrank_layer_state {
     int32_t n_chunks      = 0;
     int32_t rank          = 0;
     int32_t d_kv          = 0;
+    int32_t n_pending_tokens = 0;
 
     std::vector<float> a_k;
     std::vector<float> a_v;
+    std::vector<float> pending_k;
+    std::vector<float> pending_v;
 };
 
 struct llama_kv_lowrank_context {
@@ -81,6 +84,11 @@ struct llama_kv_lowrank_context {
 
 struct llama_kv_lowrank_error_stats {
     size_t n_values = 0;
+
+    int32_t n_observed_tokens  = 0;
+    int32_t n_projected_tokens = 0;
+    int32_t n_pending_tokens   = 0;
+    int32_t n_chunks_projected = 0;
 
     float k_max_abs  = 0.0f;
     float k_mean_abs = 0.0f;
@@ -133,6 +141,15 @@ bool llama_kv_lowrank_context_project_and_append(
         std::string * err = nullptr);
 
 bool llama_kv_lowrank_context_project_append_reconstruct_error(
+        llama_kv_lowrank_context & ctx,
+        int32_t layer,
+        const float * k_dense,
+        const float * v_dense,
+        int32_t n_tokens,
+        llama_kv_lowrank_error_stats & out_stats,
+        std::string * err = nullptr);
+
+bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
         llama_kv_lowrank_context & ctx,
         int32_t layer,
         const float * k_dense,

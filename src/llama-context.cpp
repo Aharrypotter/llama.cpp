@@ -1320,6 +1320,10 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
     synchronize();
 
     int32_t projected_layers = 0;
+    int32_t observed_layers = 0;
+    int32_t n_projected_tokens = 0;
+    int32_t n_chunks_projected = 0;
+    int32_t n_pending_tokens = 0;
     double k_sum_abs = 0.0;
     double v_sum_abs = 0.0;
     size_t n_error_values = 0;
@@ -1343,7 +1347,7 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
 
         std::string project_error;
         llama_kv_lowrank_error_stats stats;
-        if (!llama_kv_lowrank_context_project_append_reconstruct_error(
+        if (!llama_kv_lowrank_context_append_policy_project_reconstruct_error(
                     kv_lowrank_ctx, il, k_dense.data(), v_dense.data(), ubatch.n_tokens, stats, &project_error)) {
             if (!kv_lowrank_shadow_warned) {
                 LLAMA_LOG_WARN("%s: WHLR-KV shadow projection skipped: %s\n", __func__, project_error.c_str());
@@ -1352,23 +1356,37 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
             return;
         }
 
-        k_sum_abs += static_cast<double>(stats.k_mean_abs) * static_cast<double>(stats.n_values);
-        v_sum_abs += static_cast<double>(stats.v_mean_abs) * static_cast<double>(stats.n_values);
-        n_error_values += stats.n_values;
-        k_max_abs = std::max(k_max_abs, stats.k_max_abs);
-        v_max_abs = std::max(v_max_abs, stats.v_max_abs);
+        observed_layers++;
+        n_projected_tokens = std::max(n_projected_tokens, stats.n_projected_tokens);
+        n_chunks_projected = std::max(n_chunks_projected, stats.n_chunks_projected);
+        n_pending_tokens = std::max(n_pending_tokens, stats.n_pending_tokens);
 
-        projected_layers++;
+        if (stats.n_projected_tokens > 0) {
+            k_sum_abs += static_cast<double>(stats.k_mean_abs) * static_cast<double>(stats.n_values);
+            v_sum_abs += static_cast<double>(stats.v_mean_abs) * static_cast<double>(stats.n_values);
+            n_error_values += stats.n_values;
+            k_max_abs = std::max(k_max_abs, stats.k_max_abs);
+            v_max_abs = std::max(v_max_abs, stats.v_max_abs);
+
+            projected_layers++;
+        }
     }
 
     const double k_mean_abs = n_error_values > 0 ? k_sum_abs / static_cast<double>(n_error_values) : 0.0;
     const double v_mean_abs = n_error_values > 0 ? v_sum_abs / static_cast<double>(n_error_values) : 0.0;
 
-    LLAMA_LOG_INFO("%s: projected n_tokens=%u layers=%d history_bytes=%zu "
+    LLAMA_LOG_INFO("%s: observed n_tokens=%u layers=%d projected_tokens=%d projected_chunks=%d "
+            "projected_layers=%d pending_tokens=%d window=%d chunk=%d history_bytes=%zu "
             "recon_err_k_max=%.6g recon_err_k_mean=%.6g recon_err_v_max=%.6g recon_err_v_mean=%.6g\n",
             __func__,
             ubatch.n_tokens,
+            observed_layers,
+            n_projected_tokens,
+            n_chunks_projected,
             projected_layers,
+            n_pending_tokens,
+            kv_lowrank_ctx.params.window,
+            kv_lowrank_ctx.params.chunk,
             llama_kv_lowrank_context_history_memory_bytes(kv_lowrank_ctx),
             (double) k_max_abs,
             k_mean_abs,

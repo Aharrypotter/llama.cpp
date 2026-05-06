@@ -148,7 +148,69 @@ int main() {
         return 1;
     }
 
-    std::printf("PASS: WHLR-KV projection, append/state/memory, and reconstruction checks passed\n");
+    common_kv_lowrank_context ctx;
+    ctx.params.enabled = true;
+    ctx.params.rank = manifest.rank;
+    ctx.params.window = 2;
+    ctx.params.chunk = 2;
+    ctx.basis.manifest = manifest;
+    ctx.basis.layers.push_back(basis);
+
+    common_kv_lowrank_layer_state policy_state;
+    policy_state.layer = 0;
+    policy_state.rank = manifest.rank;
+    policy_state.d_kv = manifest.head_dim * manifest.n_head_kv;
+    ctx.layers.push_back(policy_state);
+
+    llama_kv_lowrank_error_stats stats;
+    if (!expect_true(common_kv_lowrank_context_append_policy_project_reconstruct_error(
+                ctx, 0, k_dense.data(), v_dense.data(), 2, stats, &err), err.c_str())) {
+        return 1;
+    }
+    if (!expect_true(stats.n_projected_tokens == 0, "policy should keep first window dense")) {
+        return 1;
+    }
+    if (!expect_true(stats.n_pending_tokens == 2, "policy pending tokens should equal window")) {
+        return 1;
+    }
+    if (!expect_true(ctx.layers[0].n_hist_tokens == 0, "policy history should be empty inside window")) {
+        return 1;
+    }
+
+    const std::vector<float> k_dense_next = {
+        50.0f, 51.0f, 52.0f, 53.0f,
+        60.0f, 61.0f, 62.0f, 63.0f,
+    };
+    const std::vector<float> v_dense_next = {
+        70.0f, 71.0f, 72.0f, 73.0f,
+        80.0f, 81.0f, 82.0f, 83.0f,
+    };
+    if (!expect_true(common_kv_lowrank_context_append_policy_project_reconstruct_error(
+                ctx, 0, k_dense_next.data(), v_dense_next.data(), 2, stats, &err), err.c_str())) {
+        return 1;
+    }
+    if (!expect_true(stats.n_projected_tokens == 2, "policy should project one full historical chunk")) {
+        return 1;
+    }
+    if (!expect_true(stats.n_chunks_projected == 1, "policy should project one chunk")) {
+        return 1;
+    }
+    if (!expect_true(stats.n_pending_tokens == 2, "policy should leave recent window pending")) {
+        return 1;
+    }
+    if (!expect_true(ctx.layers[0].n_hist_tokens == 2, "policy history should contain projected chunk")) {
+        return 1;
+    }
+    if (!expect_true(ctx.layers[0].n_chunks == 1, "policy history should count one chunk")) {
+        return 1;
+    }
+    if (!expect_near_vec(ctx.layers[0].a_k, { 10.0f, 11.0f, 20.0f, 21.0f }, "policy_a_k")) {
+        return 1;
+    }
+    if (!expect_near_vec(ctx.layers[0].pending_k, k_dense_next, "policy_pending_k")) {
+        return 1;
+    }
+
+    std::printf("PASS: WHLR-KV projection, append/state/memory, reconstruction, and policy checks passed\n");
     return 0;
 }
-

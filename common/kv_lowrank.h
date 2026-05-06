@@ -63,6 +63,15 @@ bool common_kv_lowrank_context_project_and_append(
         int32_t n_tokens,
         std::string * err = nullptr);
 
+bool common_kv_lowrank_context_append_policy_project_reconstruct_error(
+        common_kv_lowrank_context & ctx,
+        int32_t layer,
+        const float * k_dense,
+        const float * v_dense,
+        int32_t n_tokens,
+        llama_kv_lowrank_error_stats & out_stats,
+        std::string * err = nullptr);
+
 bool common_kv_lowrank_reconstruct_chunk(
         const common_kv_lowrank_basis_manifest & manifest,
         const common_kv_lowrank_basis_layer_data & basis,

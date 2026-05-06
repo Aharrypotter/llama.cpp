@@ -146,6 +146,24 @@ static llama_kv_lowrank_error_stats llama_kv_lowrank_compute_error_stats(
     return stats;
 }
 
+static void llama_kv_lowrank_accumulate_error_stats(
+        llama_kv_lowrank_error_stats & dst,
+        const llama_kv_lowrank_error_stats & src) {
+    const double k_sum = static_cast<double>(dst.k_mean_abs) * static_cast<double>(dst.n_values)
+                       + static_cast<double>(src.k_mean_abs) * static_cast<double>(src.n_values);
+    const double v_sum = static_cast<double>(dst.v_mean_abs) * static_cast<double>(dst.n_values)
+                       + static_cast<double>(src.v_mean_abs) * static_cast<double>(src.n_values);
+
+    dst.n_values += src.n_values;
+    dst.k_max_abs = std::max(dst.k_max_abs, src.k_max_abs);
+    dst.v_max_abs = std::max(dst.v_max_abs, src.v_max_abs);
+
+    if (dst.n_values > 0) {
+        dst.k_mean_abs = static_cast<float>(k_sum / static_cast<double>(dst.n_values));
+        dst.v_mean_abs = static_cast<float>(v_sum / static_cast<double>(dst.n_values));
+    }
+}
+
 bool llama_kv_lowrank_validate(const llama_kv_lowrank_params & params, std::string * err) {
     auto fail = [err](std::string msg) {
         if (err) {
@@ -582,11 +600,115 @@ bool llama_kv_lowrank_context_project_append_reconstruct_error(
     }
 
     out_stats = llama_kv_lowrank_compute_error_stats(k_dense, v_dense, k_recon, v_recon);
+    out_stats.n_observed_tokens  = n_tokens;
+    out_stats.n_projected_tokens = n_tokens;
+    out_stats.n_chunks_projected = 1;
 
     std::string append_error;
     if (!llama_kv_lowrank_layer_append_projected_chunk(*state, a_k.data(), a_v.data(), n_tokens, &append_error)) {
         return fail(append_error);
     }
+
+    return true;
+}
+
+bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
+        llama_kv_lowrank_context & ctx,
+        int32_t layer,
+        const float * k_dense,
+        const float * v_dense,
+        int32_t n_tokens,
+        llama_kv_lowrank_error_stats & out_stats,
+        std::string * err) {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    out_stats = {};
+    out_stats.n_observed_tokens = n_tokens;
+
+    if (!ctx.enabled()) {
+        return fail("low-rank KV context is not enabled");
+    }
+    if (n_tokens <= 0) {
+        return fail("low-rank KV policy append requires at least one token");
+    }
+    if (k_dense == nullptr || v_dense == nullptr) {
+        return fail("low-rank KV policy append dense input pointers must not be null");
+    }
+    if (ctx.params.window <= 0 || ctx.params.chunk <= 0) {
+        return fail("low-rank KV policy requires positive window and chunk");
+    }
+
+    llama_kv_lowrank_basis_layer_data * basis = llama_kv_lowrank_find_basis_layer(ctx, layer);
+    if (basis == nullptr) {
+        return fail("low-rank KV basis not found for layer: " + std::to_string(layer));
+    }
+
+    llama_kv_lowrank_layer_state * state = llama_kv_lowrank_find_layer_state(ctx, layer);
+    if (state == nullptr) {
+        return fail("low-rank KV layer state not found for layer: " + std::to_string(layer));
+    }
+    if (state->d_kv <= 0) {
+        return fail("low-rank KV policy requires positive d_kv");
+    }
+
+    const size_t n_dense_values = static_cast<size_t>(n_tokens) * static_cast<size_t>(state->d_kv);
+    state->pending_k.insert(state->pending_k.end(), k_dense, k_dense + n_dense_values);
+    state->pending_v.insert(state->pending_v.end(), v_dense, v_dense + n_dense_values);
+    state->n_pending_tokens += n_tokens;
+
+    const int32_t n_eligible = state->n_pending_tokens - ctx.params.window;
+    if (n_eligible < ctx.params.chunk) {
+        out_stats.n_pending_tokens = state->n_pending_tokens;
+        return true;
+    }
+
+    const int32_t n_project = (n_eligible / ctx.params.chunk) * ctx.params.chunk;
+    for (int32_t offset = 0; offset < n_project; offset += ctx.params.chunk) {
+        const size_t dense_offset = static_cast<size_t>(offset) * static_cast<size_t>(state->d_kv);
+        const float * k_chunk = state->pending_k.data() + dense_offset;
+        const float * v_chunk = state->pending_v.data() + dense_offset;
+
+        std::vector<float> a_k;
+        std::vector<float> a_v;
+        std::string project_error;
+        if (!llama_kv_lowrank_project_chunk(
+                    ctx.basis.manifest, *basis, k_chunk, v_chunk, ctx.params.chunk, a_k, a_v, &project_error)) {
+            return fail(project_error);
+        }
+
+        std::vector<float> k_recon;
+        std::vector<float> v_recon;
+        std::string reconstruct_error;
+        if (!llama_kv_lowrank_reconstruct_chunk(
+                    ctx.basis.manifest, *basis, a_k.data(), a_v.data(), ctx.params.chunk,
+                    k_recon, v_recon, &reconstruct_error)) {
+            return fail(reconstruct_error);
+        }
+
+        const llama_kv_lowrank_error_stats chunk_stats =
+            llama_kv_lowrank_compute_error_stats(k_chunk, v_chunk, k_recon, v_recon);
+        llama_kv_lowrank_accumulate_error_stats(out_stats, chunk_stats);
+
+        std::string append_error;
+        if (!llama_kv_lowrank_layer_append_projected_chunk(
+                    *state, a_k.data(), a_v.data(), ctx.params.chunk, &append_error)) {
+            return fail(append_error);
+        }
+
+        out_stats.n_projected_tokens += ctx.params.chunk;
+        out_stats.n_chunks_projected += 1;
+    }
+
+    const size_t n_erase_values = static_cast<size_t>(n_project) * static_cast<size_t>(state->d_kv);
+    state->pending_k.erase(state->pending_k.begin(), state->pending_k.begin() + n_erase_values);
+    state->pending_v.erase(state->pending_v.begin(), state->pending_v.begin() + n_erase_values);
+    state->n_pending_tokens -= n_project;
+    out_stats.n_pending_tokens = state->n_pending_tokens;
 
     return true;
 }
@@ -660,8 +782,11 @@ bool llama_kv_lowrank_reconstruct_chunk(
 void llama_kv_lowrank_layer_clear(llama_kv_lowrank_layer_state & layer) {
     layer.n_hist_tokens = 0;
     layer.n_chunks = 0;
+    layer.n_pending_tokens = 0;
     layer.a_k.clear();
     layer.a_v.clear();
+    layer.pending_k.clear();
+    layer.pending_v.clear();
 }
 
 size_t llama_kv_lowrank_layer_memory_bytes(const llama_kv_lowrank_layer_state & layer) {
