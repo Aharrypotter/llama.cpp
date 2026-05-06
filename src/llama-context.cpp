@@ -5,12 +5,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -164,6 +166,45 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_lowrank = params.kv_lowrank;
+    cparams.kv_lowrank_reconstruct = params.kv_lowrank_reconstruct;
+    cparams.kv_lowrank_rank = params.kv_lowrank_rank;
+    cparams.kv_lowrank_window = params.kv_lowrank_window;
+    cparams.kv_lowrank_chunk = params.kv_lowrank_chunk;
+    cparams.kv_lowrank_basis_path = params.kv_lowrank_basis_path ? params.kv_lowrank_basis_path : "";
+
+    {
+        llama_kv_lowrank_params kv_lowrank_params;
+        kv_lowrank_params.enabled     = cparams.kv_lowrank;
+        kv_lowrank_params.rank        = cparams.kv_lowrank_rank;
+        kv_lowrank_params.window      = cparams.kv_lowrank_window;
+        kv_lowrank_params.chunk       = cparams.kv_lowrank_chunk;
+        kv_lowrank_params.reconstruct = cparams.kv_lowrank_reconstruct;
+        kv_lowrank_params.basis_path  = cparams.kv_lowrank_basis_path;
+
+        std::string kv_lowrank_error;
+        if (!llama_kv_lowrank_context_init(kv_lowrank_params, kv_lowrank_ctx, &kv_lowrank_error)) {
+            throw std::runtime_error("failed to initialize WHLR-KV context: " + kv_lowrank_error);
+        }
+
+        if (kv_lowrank_ctx.enabled()) {
+            const auto & manifest = kv_lowrank_ctx.basis.manifest;
+            const int32_t d_kv = manifest.head_dim * manifest.n_head_kv;
+            if (manifest.n_layer != (int32_t) hparams.n_layer_kv()) {
+                throw std::runtime_error("WHLR-KV basis layer count does not match model KV layer count");
+            }
+            if (manifest.head_dim != (int32_t) hparams.n_embd_head_k() ||
+                manifest.head_dim != (int32_t) hparams.n_embd_head_v() ||
+                manifest.n_head_kv != (int32_t) hparams.n_head_kv() ||
+                d_kv != (int32_t) hparams.n_embd_k_gqa() ||
+                d_kv != (int32_t) hparams.n_embd_v_gqa()) {
+                throw std::runtime_error("WHLR-KV basis dimensions do not match model KV dimensions");
+            }
+
+            LLAMA_LOG_INFO("%s: WHLR-KV shadow context loaded layers=%zu rank=%d d_kv=%d\n",
+                    __func__, kv_lowrank_ctx.layers.size(), manifest.rank, d_kv);
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1240,6 +1281,101 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context_i * mctx) {
+    if (!kv_lowrank_ctx.enabled()) {
+        return;
+    }
+
+    const auto * kv_mctx = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    if (kv_mctx == nullptr) {
+        if (!kv_lowrank_shadow_warned) {
+            LLAMA_LOG_WARN("%s: WHLR-KV shadow projection currently supports only llama_kv_cache_context\n", __func__);
+            kv_lowrank_shadow_warned = true;
+        }
+        return;
+    }
+
+    const llama_ubatch & ubatch = kv_mctx->get_ubatch();
+    if (ubatch.n_tokens == 0) {
+        return;
+    }
+
+    if (kv_mctx->type_k() != GGML_TYPE_F16 && kv_mctx->type_k() != GGML_TYPE_F32) {
+        if (!kv_lowrank_shadow_warned) {
+            LLAMA_LOG_WARN("%s: WHLR-KV shadow projection supports f16/f32 K cache only, got %s\n",
+                    __func__, ggml_type_name(kv_mctx->type_k()));
+            kv_lowrank_shadow_warned = true;
+        }
+        return;
+    }
+    if (kv_mctx->type_v() != GGML_TYPE_F16 && kv_mctx->type_v() != GGML_TYPE_F32) {
+        if (!kv_lowrank_shadow_warned) {
+            LLAMA_LOG_WARN("%s: WHLR-KV shadow projection supports f16/f32 V cache only, got %s\n",
+                    __func__, ggml_type_name(kv_mctx->type_v()));
+            kv_lowrank_shadow_warned = true;
+        }
+        return;
+    }
+
+    synchronize();
+
+    int32_t projected_layers = 0;
+    double k_sum_abs = 0.0;
+    double v_sum_abs = 0.0;
+    size_t n_error_values = 0;
+    float k_max_abs = 0.0f;
+    float v_max_abs = 0.0f;
+    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+        if (!model.hparams.has_kv(il)) {
+            continue;
+        }
+
+        std::vector<float> k_dense;
+        std::vector<float> v_dense;
+        std::string extract_error;
+        if (!kv_mctx->copy_current_kv_chunk_f32(il, k_dense, v_dense, &extract_error)) {
+            if (!kv_lowrank_shadow_warned) {
+                LLAMA_LOG_WARN("%s: WHLR-KV shadow extraction skipped: %s\n", __func__, extract_error.c_str());
+                kv_lowrank_shadow_warned = true;
+            }
+            return;
+        }
+
+        std::string project_error;
+        llama_kv_lowrank_error_stats stats;
+        if (!llama_kv_lowrank_context_project_append_reconstruct_error(
+                    kv_lowrank_ctx, il, k_dense.data(), v_dense.data(), ubatch.n_tokens, stats, &project_error)) {
+            if (!kv_lowrank_shadow_warned) {
+                LLAMA_LOG_WARN("%s: WHLR-KV shadow projection skipped: %s\n", __func__, project_error.c_str());
+                kv_lowrank_shadow_warned = true;
+            }
+            return;
+        }
+
+        k_sum_abs += static_cast<double>(stats.k_mean_abs) * static_cast<double>(stats.n_values);
+        v_sum_abs += static_cast<double>(stats.v_mean_abs) * static_cast<double>(stats.n_values);
+        n_error_values += stats.n_values;
+        k_max_abs = std::max(k_max_abs, stats.k_max_abs);
+        v_max_abs = std::max(v_max_abs, stats.v_max_abs);
+
+        projected_layers++;
+    }
+
+    const double k_mean_abs = n_error_values > 0 ? k_sum_abs / static_cast<double>(n_error_values) : 0.0;
+    const double v_mean_abs = n_error_values > 0 ? v_sum_abs / static_cast<double>(n_error_values) : 0.0;
+
+    LLAMA_LOG_INFO("%s: projected n_tokens=%u layers=%d history_bytes=%zu "
+            "recon_err_k_max=%.6g recon_err_k_mean=%.6g recon_err_v_max=%.6g recon_err_v_mean=%.6g\n",
+            __func__,
+            ubatch.n_tokens,
+            projected_layers,
+            llama_kv_lowrank_context_history_memory_bytes(kv_lowrank_ctx),
+            (double) k_max_abs,
+            k_mean_abs,
+            (double) v_max_abs,
+            v_mean_abs);
+}
+
 int llama_context::encode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
@@ -1726,6 +1862,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        kv_lowrank_shadow_project_current(mctx.get());
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
@@ -3153,6 +3291,10 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.kv_lowrank_rank             =*/ 32,
+        /*.kv_lowrank_window           =*/ 256,
+        /*.kv_lowrank_chunk            =*/ 64,
+        /*.kv_lowrank_basis_path       =*/ nullptr,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -3165,6 +3307,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_lowrank                  =*/ false,
+        /*.kv_lowrank_reconstruct      =*/ true,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

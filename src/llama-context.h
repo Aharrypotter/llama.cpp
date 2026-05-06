@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-kv-lowrank.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -249,6 +250,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    void kv_lowrank_shadow_project_current(const llama_memory_context_i * mctx);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -270,6 +273,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    llama_kv_lowrank_context kv_lowrank_ctx;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -348,6 +353,7 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+    bool kv_lowrank_shadow_warned = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

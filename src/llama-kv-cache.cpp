@@ -12,9 +12,40 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static size_t llama_kv_cache_type_size(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F16: return sizeof(ggml_fp16_t);
+        case GGML_TYPE_F32: return sizeof(float);
+        default:            return 0;
+    }
+}
+
+static float llama_kv_cache_decode_scalar(const std::vector<uint8_t> & data, const ggml_type type, const size_t offset) {
+    if (type == GGML_TYPE_F16) {
+        ggml_fp16_t value;
+        memcpy(&value, data.data() + offset, sizeof(value));
+        return ggml_fp16_to_fp32(value);
+    }
+
+    float value;
+    memcpy(&value, data.data() + offset, sizeof(value));
+    return value;
+}
+
+static void llama_kv_cache_decode_row(
+        const std::vector<uint8_t> & data,
+        const ggml_type type,
+        const int64_t n,
+        float * dst) {
+    for (int64_t i = 0; i < n; ++i) {
+        dst[i] = llama_kv_cache_decode_scalar(data, type, i*llama_kv_cache_type_size(type));
+    }
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -1285,6 +1316,86 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
+bool llama_kv_cache::copy_current_kv_chunk_f32(
+        int32_t il,
+        const slot_info & sinfo,
+        std::vector<float> & out_k,
+        std::vector<float> & out_v,
+        std::string * err) const {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    if (sinfo.empty()) {
+        return fail("WHLR-KV shadow extraction requires a non-empty KV slot");
+    }
+    if (sinfo.n_stream() != 1) {
+        return fail("WHLR-KV shadow extraction currently supports one KV stream only");
+    }
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * v = layers[ikv].v;
+    if (k == nullptr || v == nullptr) {
+        return fail("WHLR-KV shadow extraction requires both K and V cache tensors");
+    }
+
+    const size_t type_size_k = llama_kv_cache_type_size(k->type);
+    const size_t type_size_v = llama_kv_cache_type_size(v->type);
+    if (type_size_k == 0 || type_size_v == 0) {
+        return fail("WHLR-KV shadow extraction currently supports f16/f32 KV cache types only");
+    }
+
+    const uint32_t n_tokens = sinfo.size();
+    const int64_t  d_k      = hparams.n_embd_k_gqa(il);
+    const int64_t  d_v      = hparams.n_embd_v_gqa(il);
+    if (d_k != d_v) {
+        return fail("WHLR-KV shadow extraction currently requires K and V d_kv to match");
+    }
+
+    out_k.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(d_k), 0.0f);
+    out_v.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(d_v), 0.0f);
+
+    const uint32_t stream = sinfo.strm[0];
+    const uint64_t kv_size = get_size();
+
+    const size_t row_bytes_k = ggml_row_size(k->type, d_k);
+    std::vector<uint8_t> row_k(row_bytes_k);
+
+    const size_t row_bytes_v = ggml_row_size(v->type, d_v);
+    std::vector<uint8_t> row_v(v_trans ? type_size_v : row_bytes_v);
+
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const uint32_t idx = sinfo.idxs[0][t];
+
+        const size_t k_offset = static_cast<size_t>(stream)*static_cast<size_t>(k->nb[2])
+                              + static_cast<size_t>(idx)*static_cast<size_t>(k->nb[1]);
+        ggml_backend_tensor_get(k, row_k.data(), k_offset, row_k.size());
+        llama_kv_cache_decode_row(row_k, k->type, d_k, out_k.data() + static_cast<size_t>(t)*static_cast<size_t>(d_k));
+
+        float * dst_v = out_v.data() + static_cast<size_t>(t)*static_cast<size_t>(d_v);
+        if (!v_trans) {
+            const size_t v_offset = static_cast<size_t>(stream)*static_cast<size_t>(v->nb[2])
+                                  + static_cast<size_t>(idx)*static_cast<size_t>(v->nb[1]);
+            ggml_backend_tensor_get(v, row_v.data(), v_offset, row_bytes_v);
+            llama_kv_cache_decode_row(row_v, v->type, d_v, dst_v);
+        } else {
+            const size_t stream_offset = static_cast<size_t>(stream)*static_cast<size_t>(kv_size)*static_cast<size_t>(v->ne[0])*type_size_v;
+            for (int64_t j = 0; j < d_v; ++j) {
+                const size_t v_offset = stream_offset
+                                      + (static_cast<size_t>(j)*static_cast<size_t>(kv_size) + static_cast<size_t>(idx))*type_size_v;
+                ggml_backend_tensor_get(v, row_v.data(), v_offset, type_size_v);
+                dst_v[j] = llama_kv_cache_decode_scalar(row_v, v->type, 0);
+            }
+        }
+    }
+
+    return true;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -2455,6 +2566,14 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+bool llama_kv_cache_context::copy_current_kv_chunk_f32(
+        int32_t il,
+        std::vector<float> & out_k,
+        std::vector<float> & out_v,
+        std::string * err) const {
+    return kv->copy_current_kv_chunk_f32(il, sinfos[i_cur], out_k, out_v, err);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

@@ -55,6 +55,73 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static void llama_kv_lowrank_observe_attn_shapes(
+        const llama_cparams & cparams,
+        const llama_hparams & hparams,
+        const llama_kv_cache_context * mctx,
+        const ggml_tensor * q_cur,
+        const ggml_tensor * k_cur,
+        const ggml_tensor * v_cur,
+        const ggml_tensor * k_cache,
+        const ggml_tensor * v_cache,
+        int il,
+        int64_t n_tokens) {
+    if (!cparams.kv_lowrank) {
+        return;
+    }
+
+    static std::unordered_set<std::string> seen;
+
+    const int64_t n_kv = mctx ? mctx->get_n_kv() : -1;
+    const int64_t n_head_kv = hparams.n_head_kv();
+    const int64_t head_dim_k = hparams.n_embd_head_k();
+    const int64_t head_dim_v = hparams.n_embd_head_v();
+
+    std::ostringstream key;
+    key << il << '|'
+        << n_tokens << '|'
+        << n_kv << '|'
+        << n_head_kv << '|'
+        << head_dim_k << '|'
+        << head_dim_v << '|'
+        << llama_format_tensor_shape(q_cur) << '|'
+        << llama_format_tensor_shape(k_cur) << '|'
+        << llama_format_tensor_shape(v_cur) << '|'
+        << llama_format_tensor_shape(k_cache) << '|'
+        << llama_format_tensor_shape(v_cache) << '|'
+        << cparams.kv_lowrank_rank << '|'
+        << cparams.kv_lowrank_window << '|'
+        << cparams.kv_lowrank_chunk << '|'
+        << cparams.kv_lowrank_reconstruct;
+
+    if (!seen.insert(key.str()).second) {
+        return;
+    }
+
+    LLAMA_LOG_INFO(
+            "%s: layer=%d n_tokens=%lld n_kv=%lld n_head_kv=%lld head_dim_k=%lld head_dim_v=%lld "
+            "d_kv_k=%lld d_kv_v=%lld q_cur=%s k_cur=%s v_cur=%s k_cache=%s v_cache=%s "
+            "rank=%d window=%d chunk=%d mode=%s\n",
+            __func__,
+            il,
+            (long long) n_tokens,
+            (long long) n_kv,
+            (long long) n_head_kv,
+            (long long) head_dim_k,
+            (long long) head_dim_v,
+            (long long) (n_head_kv * head_dim_k),
+            (long long) (n_head_kv * head_dim_v),
+            llama_format_tensor_shape(q_cur).c_str(),
+            llama_format_tensor_shape(k_cur).c_str(),
+            llama_format_tensor_shape(v_cur).c_str(),
+            llama_format_tensor_shape(k_cache).c_str(),
+            llama_format_tensor_shape(v_cache).c_str(),
+            cparams.kv_lowrank_rank,
+            cparams.kv_lowrank_window,
+            cparams.kv_lowrank_chunk,
+            cparams.kv_lowrank_reconstruct ? "reconstruct" : "direct");
+}
+
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -2223,6 +2290,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    llama_kv_lowrank_observe_attn_shapes(cparams, hparams, mctx_cur, q_cur, k_cur, v_cur, k, v, il, n_tokens);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
