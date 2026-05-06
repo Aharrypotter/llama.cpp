@@ -4,7 +4,7 @@ import argparse
 import json
 import struct
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 def load_hf_config(path: Optional[Path]) -> Dict[str, Any]:
@@ -65,9 +65,58 @@ def write_dummy_basis(path: Path, rank: int, d_kv: int, dtype: str) -> None:
                 f.write(one if c == hot_col else zero)
 
 
+def write_array_basis(path: Path, basis: Any, dtype: str) -> None:
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    np_dtype = np.dtype("<f2" if dtype == "f16" else "<f4")
+    np.asarray(basis, dtype=np_dtype).tofile(path)
+
+
+def sample_key(layer: int, kind: str) -> Tuple[str, ...]:
+    return (
+        f"layer_{layer:03d}.{kind}",
+        f"layer_{layer:03d}_{kind}",
+        f"layer_{layer}.{kind}",
+        f"layer_{layer}_{kind}",
+        f"{kind}_{layer:03d}",
+        f"{kind}_{layer}",
+    )
+
+
+def load_sample_array(samples: Any, layer: int, kind: str) -> Any:
+    for key in sample_key(layer, kind):
+        if key in samples:
+            return samples[key]
+
+    candidates = ", ".join(sample_key(layer, kind))
+    raise KeyError(f"missing {kind.upper()} samples for layer {layer}; tried: {candidates}")
+
+
+def compute_uncentered_svd_basis(samples: Any, rank: int, d_kv: int) -> Any:
+    import numpy as np
+
+    x = np.asarray(samples, dtype=np.float32)
+    if x.size == 0:
+        raise ValueError("sample array is empty")
+    if x.shape[-1] != d_kv:
+        raise ValueError(f"sample d_kv mismatch: got {x.shape[-1]}, expected {d_kv}")
+
+    x = x.reshape(-1, d_kv)
+    if x.shape[0] == 0:
+        raise ValueError("sample array has zero rows after reshape")
+
+    _, _, vt = np.linalg.svd(x, full_matrices=False)
+    basis = np.zeros((rank, d_kv), dtype=np.float32)
+    n_copy = min(rank, vt.shape[0])
+    basis[:n_copy, :] = vt[:n_copy, :]
+    return basis
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export a WHLR-KV sidecar manifest and dummy low-rank KV basis files.",
+        description="Export a WHLR-KV sidecar manifest and low-rank KV basis files.",
     )
     parser.add_argument("--hf-config", type=Path, help="optional Hugging Face config.json path")
     parser.add_argument("--out-dir", type=Path, required=True, help="output directory")
@@ -77,6 +126,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-head-kv", type=int, help="number of K/V heads")
     parser.add_argument("--dtype", choices=["f16", "f32"], default="f16", help="basis dtype")
     parser.add_argument("--manifest-name", default="whlr_kv_basis.json", help="manifest filename")
+    parser.add_argument(
+        "--samples-npz",
+        type=Path,
+        help=(
+            "optional calibration samples in npz format; keys may be "
+            "layer_000.k/layer_000.v, layer_000_k/layer_000_v, k_0/v_0, etc."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -102,13 +159,32 @@ def main() -> None:
 
     d_kv = head_dim * n_head_kv
     expected_size = args.rank * d_kv * dtype_size(args.dtype)
+    samples = None
+    if args.samples_npz is not None:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise SystemExit("error: --samples-npz requires numpy") from exc
+
+        samples = np.load(args.samples_npz)
 
     layers = []
     for layer in range(n_layer):
         k_name = f"layer_{layer:03d}.bk.{args.dtype}.bin"
         v_name = f"layer_{layer:03d}.bv.{args.dtype}.bin"
-        write_dummy_basis(out_dir / k_name, args.rank, d_kv, args.dtype)
-        write_dummy_basis(out_dir / v_name, args.rank, d_kv, args.dtype)
+        if samples is None:
+            write_dummy_basis(out_dir / k_name, args.rank, d_kv, args.dtype)
+            write_dummy_basis(out_dir / v_name, args.rank, d_kv, args.dtype)
+        else:
+            try:
+                k_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "k"), args.rank, d_kv)
+                v_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "v"), args.rank, d_kv)
+            except (KeyError, ValueError) as exc:
+                raise SystemExit(f"error: layer {layer}: {exc}") from exc
+
+            write_array_basis(out_dir / k_name, k_basis, args.dtype)
+            write_array_basis(out_dir / v_name, v_basis, args.dtype)
+
         layers.append({"layer": layer, "k": k_name, "v": v_name})
 
     manifest = {
@@ -128,10 +204,11 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
         f.write("\n")
 
+    mode = "uncentered-svd" if samples is not None else "dummy-identity"
     print(f"wrote manifest: {manifest_path}")
+    print(f"mode: {mode}")
     print(f"layers: {n_layer}, rank: {args.rank}, d_kv: {d_kv}, basis bytes/file: {expected_size}")
 
 
 if __name__ == "__main__":
     main()
-
