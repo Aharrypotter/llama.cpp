@@ -6,6 +6,7 @@
 #include "download.h"
 #include "hf-cache.h"
 #include "json-schema-to-grammar.h"
+#include "kv_lowrank.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -924,6 +925,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+
+        std::string kv_lowrank_error;
+        const common_kv_lowrank_params kv_lowrank_params = common_kv_lowrank_params_from_common(params);
+        if (!common_kv_lowrank_validate(kv_lowrank_params, &kv_lowrank_error)) {
+            throw std::invalid_argument("error: " + kv_lowrank_error);
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -2051,6 +2058,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-lowrank"},
+        "enable experimental windowed historical low-rank KV cache prototype",
+        [](common_params & params) {
+            params.kv_lowrank = true;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK"));
+    add_opt(common_arg(
+        {"--kv-lowrank-rank"}, "N",
+        string_format("rank for historical low-rank KV factors (default: %d)", params.kv_lowrank_rank),
+        [](common_params & params, int value) {
+            params.kv_lowrank_rank = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_RANK"));
+    add_opt(common_arg(
+        {"--kv-lowrank-window"}, "N",
+        string_format("number of recent dense KV tokens to keep before low-rank eviction (default: %d)", params.kv_lowrank_window),
+        [](common_params & params, int value) {
+            params.kv_lowrank_window = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_WINDOW"));
+    add_opt(common_arg(
+        {"--kv-lowrank-chunk"}, "N",
+        string_format("token chunk size for historical low-rank KV compression (default: %d)", params.kv_lowrank_chunk),
+        [](common_params & params, int value) {
+            params.kv_lowrank_chunk = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_CHUNK"));
+    add_opt(common_arg(
+        {"--kv-lowrank-basis-path"}, "PATH",
+        "path to sidecar low-rank KV basis manifest",
+        [](common_params & params, const std::string & value) {
+            params.kv_lowrank_basis_path = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_BASIS_PATH"));
+    add_opt(common_arg(
+        {"--kv-lowrank-direct"},
+        "use direct low-rank attention path instead of reconstructing historical KV first",
+        [](common_params & params) {
+            params.kv_lowrank_reconstruct = false;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_DIRECT"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

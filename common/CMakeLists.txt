@@ -81,6 +81,8 @@ add_library(${TARGET}
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
+    kv_lowrank.cpp
+    kv_lowrank.h
     llguidance.cpp
     log.cpp
     log.h
@@ -124,7 +126,7 @@ set_target_properties(${TARGET} PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PUBLIC . ../vendor ../src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

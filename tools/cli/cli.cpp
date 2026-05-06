@@ -3,6 +3,7 @@
 #include "arg.h"
 #include "console.h"
 #include "fit.h"
+#include "kv_lowrank.h"
 // #include "log.h"
 
 #include "server-common.h"
@@ -352,6 +353,16 @@ int main(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
     }
+
+    common_kv_lowrank_context kv_lowrank_ctx;
+    const common_kv_lowrank_params kv_lowrank_params = common_kv_lowrank_params_from_common(params);
+    std::string kv_lowrank_error;
+    if (!common_kv_lowrank_context_init(kv_lowrank_params, kv_lowrank_ctx, &kv_lowrank_error)) {
+        fprintf(stderr, "error: %s\n", kv_lowrank_error.c_str());
+        return 1;
+    }
+    common_kv_lowrank_log_config(kv_lowrank_params);
+    common_kv_lowrank_log_context(kv_lowrank_ctx);
 
     // TODO: maybe support it later?
     if (params.conversation_mode == COMMON_CONVERSATION_MODE_DISABLED) {

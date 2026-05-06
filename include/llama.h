@@ -351,6 +351,13 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // [EXPERIMENTAL] Windowed historical low-rank KV cache observer.
+        // This currently only enables shape/state logging in the llama core; it does not alter inference.
+        int32_t kv_lowrank_rank;
+        int32_t kv_lowrank_window;
+        int32_t kv_lowrank_chunk;
+        const char * kv_lowrank_basis_path;
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -374,6 +381,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_lowrank;  // [EXPERIMENTAL] enable WHLR-KV observer state
+        bool kv_lowrank_reconstruct; // [EXPERIMENTAL] prefer reconstruct mode over direct low-rank attention
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

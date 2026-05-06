@@ -558,6 +558,14 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Experimental low-rank KV cache path for mobile-oriented research prototypes.
+    bool        kv_lowrank            = false;
+    int32_t     kv_lowrank_rank       = 32;
+    int32_t     kv_lowrank_window     = 256;
+    int32_t     kv_lowrank_chunk      = 64;
+    bool        kv_lowrank_reconstruct = true;
+    std::string kv_lowrank_basis_path = ""; // sidecar basis manifest path                  // NOLINT
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
