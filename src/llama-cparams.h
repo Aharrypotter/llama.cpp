@@ -45,7 +45,9 @@ struct llama_cparams {
     int32_t kv_lowrank_rank;
     int32_t kv_lowrank_window;
     int32_t kv_lowrank_chunk;
+    int32_t kv_lowrank_sample_max_tokens;
     std::string kv_lowrank_basis_path;
+    std::string kv_lowrank_samples_path;
 
     enum llama_pooling_type pooling_type;
 

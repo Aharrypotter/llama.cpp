@@ -563,8 +563,10 @@ struct common_params {
     int32_t     kv_lowrank_rank       = 32;
     int32_t     kv_lowrank_window     = 256;
     int32_t     kv_lowrank_chunk      = 64;
+    int32_t     kv_lowrank_sample_max_tokens = 4096;
     bool        kv_lowrank_reconstruct = true;
     std::string kv_lowrank_basis_path = ""; // sidecar basis manifest path                  // NOLINT
+    std::string kv_lowrank_samples_path = ""; // optional dense KV sample .npz path          // NOLINT
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -8,8 +8,10 @@ common_kv_lowrank_params common_kv_lowrank_params_from_common(const common_param
     out.rank        = params.kv_lowrank_rank;
     out.window      = params.kv_lowrank_window;
     out.chunk       = params.kv_lowrank_chunk;
+    out.sample_max_tokens = params.kv_lowrank_sample_max_tokens;
     out.reconstruct = params.kv_lowrank_reconstruct;
     out.basis_path  = params.kv_lowrank_basis_path;
+    out.samples_path = params.kv_lowrank_samples_path;
     return out;
 }
 
@@ -147,6 +149,13 @@ void common_kv_lowrank_log_config(const common_kv_lowrank_params & params) {
         LOG_CNT(" (%zu bytes)\n", info.size);
     } else {
         LOG_CNT(" (missing)\n");
+    }
+
+    if (!params.samples_path.empty()) {
+        LOG_INF("%s: dense KV samples will be written to %s max_tokens/layer=%d\n",
+                __func__,
+                params.samples_path.c_str(),
+                params.sample_max_tokens);
     }
 
     common_kv_lowrank_basis_manifest manifest;

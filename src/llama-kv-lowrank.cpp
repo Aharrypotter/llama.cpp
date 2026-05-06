@@ -10,9 +10,17 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <utility>
 
 using json = nlohmann::ordered_json;
+
+struct llama_kv_lowrank_npz_entry {
+    std::string name;
+    std::vector<uint8_t> data;
+    uint32_t crc = 0;
+    uint32_t offset = 0;
+};
 
 static std::string llama_kv_lowrank_resolve_path(const std::string & manifest_path, const std::string & value) {
     if (value.empty()) {
@@ -84,6 +92,87 @@ static bool llama_kv_lowrank_read_binary_file(const std::string & path, std::vec
     }
 
     return true;
+}
+
+static void llama_kv_lowrank_push_u16(std::vector<uint8_t> & out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xffu));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xffu));
+}
+
+static void llama_kv_lowrank_push_u32(std::vector<uint8_t> & out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xffu));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xffu));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xffu));
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xffu));
+}
+
+static uint32_t llama_kv_lowrank_crc32(const uint8_t * data, size_t size) {
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) {
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+        }
+    }
+    return crc ^ 0xffffffffu;
+}
+
+static std::vector<uint8_t> llama_kv_lowrank_make_npy_f32(
+        const std::vector<float> & values,
+        int32_t n_tokens,
+        int32_t d_kv) {
+    std::vector<uint8_t> out;
+    out.insert(out.end(), { 0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00 });
+
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': ("
+        + std::to_string(n_tokens) + ", " + std::to_string(d_kv) + "), }";
+    const size_t prefix = 10;
+    const size_t padded_len = ((prefix + header.size() + 1 + 15) / 16) * 16 - prefix;
+    header.resize(padded_len - 1, ' ');
+    header.push_back('\n');
+
+    llama_kv_lowrank_push_u16(out, static_cast<uint16_t>(header.size()));
+    out.insert(out.end(), header.begin(), header.end());
+
+    const uint8_t * data = reinterpret_cast<const uint8_t *>(values.data());
+    out.insert(out.end(), data, data + values.size() * sizeof(float));
+    return out;
+}
+
+static void llama_kv_lowrank_zip_local_header(std::vector<uint8_t> & out, const llama_kv_lowrank_npz_entry & entry) {
+    llama_kv_lowrank_push_u32(out, 0x04034b50u);
+    llama_kv_lowrank_push_u16(out, 20);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u32(out, entry.crc);
+    llama_kv_lowrank_push_u32(out, static_cast<uint32_t>(entry.data.size()));
+    llama_kv_lowrank_push_u32(out, static_cast<uint32_t>(entry.data.size()));
+    llama_kv_lowrank_push_u16(out, static_cast<uint16_t>(entry.name.size()));
+    llama_kv_lowrank_push_u16(out, 0);
+    out.insert(out.end(), entry.name.begin(), entry.name.end());
+}
+
+static void llama_kv_lowrank_zip_central_header(std::vector<uint8_t> & out, const llama_kv_lowrank_npz_entry & entry) {
+    llama_kv_lowrank_push_u32(out, 0x02014b50u);
+    llama_kv_lowrank_push_u16(out, 20);
+    llama_kv_lowrank_push_u16(out, 20);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u32(out, entry.crc);
+    llama_kv_lowrank_push_u32(out, static_cast<uint32_t>(entry.data.size()));
+    llama_kv_lowrank_push_u32(out, static_cast<uint32_t>(entry.data.size()));
+    llama_kv_lowrank_push_u16(out, static_cast<uint16_t>(entry.name.size()));
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u16(out, 0);
+    llama_kv_lowrank_push_u32(out, 0);
+    llama_kv_lowrank_push_u32(out, entry.offset);
+    out.insert(out.end(), entry.name.begin(), entry.name.end());
 }
 
 static float llama_kv_lowrank_basis_value(const std::vector<uint8_t> & basis, const std::string & dtype, size_t index) {
@@ -184,6 +273,9 @@ bool llama_kv_lowrank_validate(const llama_kv_lowrank_params & params, std::stri
     }
     if (params.chunk <= 0) {
         return fail("low-rank KV chunk size must be positive");
+    }
+    if (params.sample_max_tokens <= 0) {
+        return fail("low-rank KV sample max tokens must be positive");
     }
     if (params.window < params.chunk) {
         return fail("low-rank KV recent window must be greater than or equal to chunk size");
@@ -783,10 +875,13 @@ void llama_kv_lowrank_layer_clear(llama_kv_lowrank_layer_state & layer) {
     layer.n_hist_tokens = 0;
     layer.n_chunks = 0;
     layer.n_pending_tokens = 0;
+    layer.n_sample_tokens = 0;
     layer.a_k.clear();
     layer.a_v.clear();
     layer.pending_k.clear();
     layer.pending_v.clear();
+    layer.sample_k.clear();
+    layer.sample_v.clear();
 }
 
 size_t llama_kv_lowrank_layer_memory_bytes(const llama_kv_lowrank_layer_state & layer) {
@@ -799,4 +894,136 @@ size_t llama_kv_lowrank_context_history_memory_bytes(const llama_kv_lowrank_cont
         total += llama_kv_lowrank_layer_memory_bytes(layer);
     }
     return total;
+}
+
+bool llama_kv_lowrank_context_collect_samples(
+        llama_kv_lowrank_context & ctx,
+        int32_t layer,
+        const float * k_dense,
+        const float * v_dense,
+        int32_t n_tokens,
+        std::string * err) {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    if (!ctx.enabled()) {
+        return fail("low-rank KV context is not enabled");
+    }
+    if (ctx.params.samples_path.empty()) {
+        return true;
+    }
+    if (n_tokens <= 0) {
+        return fail("low-rank KV sample collection requires at least one token");
+    }
+    if (k_dense == nullptr || v_dense == nullptr) {
+        return fail("low-rank KV sample collection dense input pointers must not be null");
+    }
+
+    llama_kv_lowrank_layer_state * state = llama_kv_lowrank_find_layer_state(ctx, layer);
+    if (state == nullptr) {
+        return fail("low-rank KV layer state not found for layer: " + std::to_string(layer));
+    }
+    if (state->d_kv <= 0) {
+        return fail("low-rank KV sample collection requires positive d_kv");
+    }
+    if (state->n_sample_tokens >= ctx.params.sample_max_tokens) {
+        return true;
+    }
+
+    const int32_t n_take = std::min(n_tokens, ctx.params.sample_max_tokens - state->n_sample_tokens);
+    const size_t n_values = static_cast<size_t>(n_take) * static_cast<size_t>(state->d_kv);
+    state->sample_k.insert(state->sample_k.end(), k_dense, k_dense + n_values);
+    state->sample_v.insert(state->sample_v.end(), v_dense, v_dense + n_values);
+    state->n_sample_tokens += n_take;
+    return true;
+}
+
+bool llama_kv_lowrank_context_write_samples_npz(
+        const llama_kv_lowrank_context & ctx,
+        const std::string & path,
+        std::string * err) {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    if (path.empty()) {
+        return true;
+    }
+
+    std::vector<llama_kv_lowrank_npz_entry> entries;
+    for (const llama_kv_lowrank_layer_state & layer : ctx.layers) {
+        if (layer.n_sample_tokens <= 0) {
+            continue;
+        }
+        if (layer.d_kv <= 0) {
+            return fail("low-rank KV sample export requires positive d_kv");
+        }
+
+        const std::string prefix = "layer_" + (layer.layer < 10 ? std::string("00") :
+                (layer.layer < 100 ? std::string("0") : std::string())) + std::to_string(layer.layer);
+
+        llama_kv_lowrank_npz_entry k_entry;
+        k_entry.name = prefix + ".k.npy";
+        k_entry.data = llama_kv_lowrank_make_npy_f32(layer.sample_k, layer.n_sample_tokens, layer.d_kv);
+        k_entry.crc = llama_kv_lowrank_crc32(k_entry.data.data(), k_entry.data.size());
+        entries.push_back(std::move(k_entry));
+
+        llama_kv_lowrank_npz_entry v_entry;
+        v_entry.name = prefix + ".v.npy";
+        v_entry.data = llama_kv_lowrank_make_npy_f32(layer.sample_v, layer.n_sample_tokens, layer.d_kv);
+        v_entry.crc = llama_kv_lowrank_crc32(v_entry.data.data(), v_entry.data.size());
+        entries.push_back(std::move(v_entry));
+    }
+
+    if (entries.empty()) {
+        return true;
+    }
+
+    std::vector<uint8_t> zip;
+    for (llama_kv_lowrank_npz_entry & entry : entries) {
+        if (zip.size() > std::numeric_limits<uint32_t>::max()) {
+            return fail("low-rank KV sample npz is too large");
+        }
+        entry.offset = static_cast<uint32_t>(zip.size());
+        llama_kv_lowrank_zip_local_header(zip, entry);
+        zip.insert(zip.end(), entry.data.begin(), entry.data.end());
+    }
+
+    const uint32_t central_offset = static_cast<uint32_t>(zip.size());
+    for (const llama_kv_lowrank_npz_entry & entry : entries) {
+        llama_kv_lowrank_zip_central_header(zip, entry);
+    }
+    const uint32_t central_size = static_cast<uint32_t>(zip.size() - central_offset);
+
+    llama_kv_lowrank_push_u32(zip, 0x06054b50u);
+    llama_kv_lowrank_push_u16(zip, 0);
+    llama_kv_lowrank_push_u16(zip, 0);
+    llama_kv_lowrank_push_u16(zip, static_cast<uint16_t>(entries.size()));
+    llama_kv_lowrank_push_u16(zip, static_cast<uint16_t>(entries.size()));
+    llama_kv_lowrank_push_u32(zip, central_size);
+    llama_kv_lowrank_push_u32(zip, central_offset);
+    llama_kv_lowrank_push_u16(zip, 0);
+
+    const std::filesystem::path out_path(path);
+    if (!out_path.parent_path().empty()) {
+        std::filesystem::create_directories(out_path.parent_path());
+    }
+
+    std::ofstream file(path, std::ios::binary);
+    if (!file) {
+        return fail("failed to open low-rank KV sample npz for writing: " + path);
+    }
+    file.write(reinterpret_cast<const char *>(zip.data()), static_cast<std::streamsize>(zip.size()));
+    if (!file) {
+        return fail("failed to write low-rank KV sample npz: " + path);
+    }
+
+    return true;
 }

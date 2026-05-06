@@ -1518,7 +1518,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_lowrank_rank   = params.kv_lowrank_rank;
     cparams.kv_lowrank_window = params.kv_lowrank_window;
     cparams.kv_lowrank_chunk  = params.kv_lowrank_chunk;
+    cparams.kv_lowrank_sample_max_tokens = params.kv_lowrank_sample_max_tokens;
     cparams.kv_lowrank_basis_path = params.kv_lowrank_basis_path.c_str();
+    cparams.kv_lowrank_samples_path = params.kv_lowrank_samples_path.c_str();
     cparams.kv_lowrank_reconstruct = params.kv_lowrank_reconstruct;
 
     cparams.type_k = params.cache_type_k;

@@ -171,7 +171,9 @@ llama_context::llama_context(
     cparams.kv_lowrank_rank = params.kv_lowrank_rank;
     cparams.kv_lowrank_window = params.kv_lowrank_window;
     cparams.kv_lowrank_chunk = params.kv_lowrank_chunk;
+    cparams.kv_lowrank_sample_max_tokens = params.kv_lowrank_sample_max_tokens;
     cparams.kv_lowrank_basis_path = params.kv_lowrank_basis_path ? params.kv_lowrank_basis_path : "";
+    cparams.kv_lowrank_samples_path = params.kv_lowrank_samples_path ? params.kv_lowrank_samples_path : "";
 
     {
         llama_kv_lowrank_params kv_lowrank_params;
@@ -179,8 +181,10 @@ llama_context::llama_context(
         kv_lowrank_params.rank        = cparams.kv_lowrank_rank;
         kv_lowrank_params.window      = cparams.kv_lowrank_window;
         kv_lowrank_params.chunk       = cparams.kv_lowrank_chunk;
+        kv_lowrank_params.sample_max_tokens = cparams.kv_lowrank_sample_max_tokens;
         kv_lowrank_params.reconstruct = cparams.kv_lowrank_reconstruct;
         kv_lowrank_params.basis_path  = cparams.kv_lowrank_basis_path;
+        kv_lowrank_params.samples_path = cparams.kv_lowrank_samples_path;
 
         std::string kv_lowrank_error;
         if (!llama_kv_lowrank_context_init(kv_lowrank_params, kv_lowrank_ctx, &kv_lowrank_error)) {
@@ -408,6 +412,18 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (kv_lowrank_ctx.enabled() && !kv_lowrank_ctx.params.samples_path.empty()) {
+        std::string sample_error;
+        if (llama_kv_lowrank_context_write_samples_npz(
+                    kv_lowrank_ctx, kv_lowrank_ctx.params.samples_path, &sample_error)) {
+            LLAMA_LOG_INFO("%s: WHLR-KV dense samples written to %s\n",
+                    __func__, kv_lowrank_ctx.params.samples_path.c_str());
+        } else {
+            LLAMA_LOG_WARN("%s: failed to write WHLR-KV dense samples: %s\n",
+                    __func__, sample_error.c_str());
+        }
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1340,6 +1356,16 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
         if (!kv_mctx->copy_current_kv_chunk_f32(il, k_dense, v_dense, &extract_error)) {
             if (!kv_lowrank_shadow_warned) {
                 LLAMA_LOG_WARN("%s: WHLR-KV shadow extraction skipped: %s\n", __func__, extract_error.c_str());
+                kv_lowrank_shadow_warned = true;
+            }
+            return;
+        }
+
+        std::string sample_error;
+        if (!llama_kv_lowrank_context_collect_samples(
+                    kv_lowrank_ctx, il, k_dense.data(), v_dense.data(), ubatch.n_tokens, &sample_error)) {
+            if (!kv_lowrank_shadow_warned) {
+                LLAMA_LOG_WARN("%s: WHLR-KV sample collection skipped: %s\n", __func__, sample_error.c_str());
                 kv_lowrank_shadow_warned = true;
             }
             return;
@@ -3312,7 +3338,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_lowrank_rank             =*/ 32,
         /*.kv_lowrank_window           =*/ 256,
         /*.kv_lowrank_chunk            =*/ 64,
+        /*.kv_lowrank_sample_max_tokens=*/ 4096,
         /*.kv_lowrank_basis_path       =*/ nullptr,
+        /*.kv_lowrank_samples_path     =*/ nullptr,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

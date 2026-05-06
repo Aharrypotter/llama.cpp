@@ -2094,6 +2094,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_LOWRANK_BASIS_PATH"));
     add_opt(common_arg(
+        {"--kv-lowrank-samples-out"}, "PATH",
+        "write collected dense K/V calibration samples to a NumPy .npz file",
+        [](common_params & params, const std::string & value) {
+            params.kv_lowrank_samples_path = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_SAMPLES_OUT"));
+    add_opt(common_arg(
+        {"--kv-lowrank-sample-max-tokens"}, "N",
+        string_format("maximum dense K/V sample tokens to collect per layer (default: %d)", params.kv_lowrank_sample_max_tokens),
+        [](common_params & params, int value) {
+            params.kv_lowrank_sample_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_SAMPLE_MAX_TOKENS"));
+    add_opt(common_arg(
         {"--kv-lowrank-direct"},
         "use direct low-rank attention path instead of reconstructing historical KV first",
         [](common_params & params) {

@@ -14,8 +14,10 @@ struct llama_kv_lowrank_params {
     int32_t     rank        = 32;
     int32_t     window      = 256;
     int32_t     chunk       = 64;
+    int32_t     sample_max_tokens = 4096;
     bool        reconstruct = true;
     std::string basis_path;
+    std::string samples_path;
 };
 
 struct llama_kv_lowrank_basis_info {
@@ -65,11 +67,14 @@ struct llama_kv_lowrank_layer_state {
     int32_t rank          = 0;
     int32_t d_kv          = 0;
     int32_t n_pending_tokens = 0;
+    int32_t n_sample_tokens  = 0;
 
     std::vector<float> a_k;
     std::vector<float> a_v;
     std::vector<float> pending_k;
     std::vector<float> pending_v;
+    std::vector<float> sample_k;
+    std::vector<float> sample_v;
 };
 
 struct llama_kv_lowrank_context {
@@ -173,3 +178,16 @@ void llama_kv_lowrank_layer_clear(llama_kv_lowrank_layer_state & layer);
 size_t llama_kv_lowrank_layer_memory_bytes(const llama_kv_lowrank_layer_state & layer);
 
 size_t llama_kv_lowrank_context_history_memory_bytes(const llama_kv_lowrank_context & ctx);
+
+bool llama_kv_lowrank_context_collect_samples(
+        llama_kv_lowrank_context & ctx,
+        int32_t layer,
+        const float * k_dense,
+        const float * v_dense,
+        int32_t n_tokens,
+        std::string * err = nullptr);
+
+bool llama_kv_lowrank_context_write_samples_npz(
+        const llama_kv_lowrank_context & ctx,
+        const std::string & path,
+        std::string * err = nullptr);

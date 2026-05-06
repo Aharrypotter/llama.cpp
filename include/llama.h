@@ -356,7 +356,9 @@ extern "C" {
         int32_t kv_lowrank_rank;
         int32_t kv_lowrank_window;
         int32_t kv_lowrank_chunk;
+        int32_t kv_lowrank_sample_max_tokens;
         const char * kv_lowrank_basis_path;
+        const char * kv_lowrank_samples_path;
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
