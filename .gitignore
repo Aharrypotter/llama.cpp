@@ -146,6 +146,10 @@ poetry.toml
 /run-spec.sh
 /.ccache/
 
+# Local research notes
+
+/memory/
+
 # IDE
 
 /*.code-workspace
