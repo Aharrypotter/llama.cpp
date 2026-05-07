@@ -6,6 +6,8 @@ common_kv_lowrank_params common_kv_lowrank_params_from_common(const common_param
     common_kv_lowrank_params out;
     out.enabled     = params.kv_lowrank;
     out.rank        = params.kv_lowrank_rank;
+    out.rank_k      = params.kv_lowrank_rank_k;
+    out.rank_v      = params.kv_lowrank_rank_v;
     out.window      = params.kv_lowrank_window;
     out.chunk       = params.kv_lowrank_chunk;
     out.sample_max_tokens = params.kv_lowrank_sample_max_tokens;
@@ -138,9 +140,13 @@ void common_kv_lowrank_log_config(const common_kv_lowrank_params & params) {
     }
 
     const common_kv_lowrank_basis_info info = common_kv_lowrank_basis_probe(params.basis_path);
-    LOG_INF("%s: enabled rank=%d window=%d chunk=%d mode=%s basis=%s",
+    const int32_t rank_k = params.rank_k > 0 ? params.rank_k : params.rank;
+    const int32_t rank_v = params.rank_v > 0 ? params.rank_v : params.rank;
+    LOG_INF("%s: enabled rank=%d rank_k=%d rank_v=%d window=%d chunk=%d mode=%s basis=%s",
             __func__,
             params.rank,
+            rank_k,
+            rank_v,
             params.window,
             params.chunk,
             params.reconstruct ? "reconstruct" : "direct",
@@ -165,10 +171,12 @@ void common_kv_lowrank_log_config(const common_kv_lowrank_params & params) {
         return;
     }
 
-    LOG_INF("%s: manifest version=%d rank=%d layers=%zu dtype=%s layout=%s head_dim=%d n_head_kv=%d\n",
+    LOG_INF("%s: manifest version=%d rank=%d rank_k=%d rank_v=%d layers=%zu dtype=%s layout=%s head_dim=%d n_head_kv=%d\n",
             __func__,
             manifest.version,
             manifest.rank,
+            manifest.rank_k,
+            manifest.rank_v,
             manifest.layers.size(),
             manifest.dtype.c_str(),
             manifest.layout.c_str(),

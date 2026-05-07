@@ -12,6 +12,8 @@
 struct llama_kv_lowrank_params {
     bool        enabled     = false;
     int32_t     rank        = 32;
+    int32_t     rank_k      = 0;
+    int32_t     rank_v      = 0;
     int32_t     window      = 256;
     int32_t     chunk       = 64;
     int32_t     sample_max_tokens = 4096;
@@ -48,6 +50,8 @@ struct llama_kv_lowrank_basis_manifest {
 
     int32_t version   = 1;
     int32_t rank      = 0;
+    int32_t rank_k    = 0;
+    int32_t rank_v    = 0;
     int32_t n_layer   = 0;
     int32_t head_dim  = 0;
     int32_t n_head_kv = 0;
@@ -65,6 +69,8 @@ struct llama_kv_lowrank_layer_state {
     int32_t n_hist_tokens = 0;
     int32_t n_chunks      = 0;
     int32_t rank          = 0;
+    int32_t rank_k        = 0;
+    int32_t rank_v        = 0;
     int32_t d_kv          = 0;
     int32_t n_pending_tokens = 0;
     int32_t n_sample_tokens  = 0;

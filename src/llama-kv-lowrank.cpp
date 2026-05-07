@@ -67,6 +67,14 @@ static size_t llama_kv_lowrank_dtype_size(const std::string & dtype) {
     return 0;
 }
 
+static int32_t llama_kv_lowrank_effective_rank_k(const llama_kv_lowrank_params & params) {
+    return params.rank_k > 0 ? params.rank_k : params.rank;
+}
+
+static int32_t llama_kv_lowrank_effective_rank_v(const llama_kv_lowrank_params & params) {
+    return params.rank_v > 0 ? params.rank_v : params.rank;
+}
+
 static bool llama_kv_lowrank_read_binary_file(const std::string & path, std::vector<uint8_t> & out, std::string * err) {
     auto fail = [err](std::string msg) {
         if (err) {
@@ -265,8 +273,10 @@ bool llama_kv_lowrank_validate(const llama_kv_lowrank_params & params, std::stri
         return true;
     }
 
-    if (params.rank <= 0) {
-        return fail("low-rank KV rank must be positive");
+    const int32_t rank_k = llama_kv_lowrank_effective_rank_k(params);
+    const int32_t rank_v = llama_kv_lowrank_effective_rank_v(params);
+    if (rank_k <= 0 || rank_v <= 0) {
+        return fail("low-rank KV K/V ranks must be positive");
     }
     if (params.window <= 0) {
         return fail("low-rank KV recent window must be positive");
@@ -294,8 +304,8 @@ bool llama_kv_lowrank_validate(const llama_kv_lowrank_params & params, std::stri
     if (!llama_kv_lowrank_basis_manifest_load(params.basis_path, manifest, &manifest_error)) {
         return fail(manifest_error);
     }
-    if (manifest.rank != params.rank) {
-        return fail("low-rank KV basis manifest rank does not match --kv-lowrank-rank");
+    if (manifest.rank_k != rank_k || manifest.rank_v != rank_v) {
+        return fail("low-rank KV basis manifest ranks do not match requested K/V ranks");
     }
 
     return true;
@@ -349,6 +359,8 @@ bool llama_kv_lowrank_basis_manifest_load(
     next.layout    = llama_kv_lowrank_json_string(manifest, "layout", next.layout);
     next.version   = llama_kv_lowrank_json_i32(manifest, "version", next.version);
     next.rank      = llama_kv_lowrank_json_i32(manifest, "rank", next.rank);
+    next.rank_k    = llama_kv_lowrank_json_i32(manifest, "rank_k", next.rank);
+    next.rank_v    = llama_kv_lowrank_json_i32(manifest, "rank_v", next.rank);
     next.n_layer   = llama_kv_lowrank_json_i32(manifest, "n_layer", next.n_layer);
     next.head_dim  = llama_kv_lowrank_json_i32(manifest, "head_dim", next.head_dim);
     next.n_head_kv = llama_kv_lowrank_json_i32(manifest, "n_head_kv", next.n_head_kv);
@@ -359,8 +371,20 @@ bool llama_kv_lowrank_basis_manifest_load(
     if (next.version != 1) {
         return fail("unsupported low-rank KV basis manifest version: " + std::to_string(next.version));
     }
+    if (next.rank <= 0 && (next.rank_k <= 0 || next.rank_v <= 0)) {
+        return fail("low-rank KV basis manifest rank or rank_k/rank_v must be positive");
+    }
     if (next.rank <= 0) {
-        return fail("low-rank KV basis manifest rank must be positive");
+        next.rank = std::max(next.rank_k, next.rank_v);
+    }
+    if (next.rank_k <= 0) {
+        next.rank_k = next.rank;
+    }
+    if (next.rank_v <= 0) {
+        next.rank_v = next.rank;
+    }
+    if (next.rank_k <= 0 || next.rank_v <= 0) {
+        return fail("low-rank KV basis manifest K/V ranks must be positive");
     }
     if (next.layout != "row-major") {
         return fail("unsupported low-rank KV basis layout: " + next.layout);
@@ -374,8 +398,11 @@ bool llama_kv_lowrank_basis_manifest_load(
     }
 
     const bool check_basis_size = next.head_dim > 0 && next.n_head_kv > 0;
-    const size_t expected_basis_size = check_basis_size
-        ? static_cast<size_t>(next.rank) * static_cast<size_t>(next.n_head_kv) * static_cast<size_t>(next.head_dim) * dtype_size
+    const size_t expected_k_basis_size = check_basis_size
+        ? static_cast<size_t>(next.rank_k) * static_cast<size_t>(next.n_head_kv) * static_cast<size_t>(next.head_dim) * dtype_size
+        : 0;
+    const size_t expected_v_basis_size = check_basis_size
+        ? static_cast<size_t>(next.rank_v) * static_cast<size_t>(next.n_head_kv) * static_cast<size_t>(next.head_dim) * dtype_size
         : 0;
 
     for (const json & layer_json : manifest.at("layers")) {
@@ -399,10 +426,10 @@ bool llama_kv_lowrank_basis_manifest_load(
         if (!layer.v.exists) {
             return fail("low-rank KV V basis file does not exist: " + v_path);
         }
-        if (check_basis_size && layer.k.size != expected_basis_size) {
+        if (check_basis_size && layer.k.size != expected_k_basis_size) {
             return fail("low-rank KV K basis file has unexpected size: " + k_path);
         }
-        if (check_basis_size && layer.v.size != expected_basis_size) {
+        if (check_basis_size && layer.v.size != expected_v_basis_size) {
             return fail("low-rank KV V basis file has unexpected size: " + v_path);
         }
 
@@ -498,6 +525,8 @@ bool llama_kv_lowrank_context_init(
         llama_kv_lowrank_layer_state layer;
         layer.layer = layer_data.layer;
         layer.rank  = next.basis.manifest.rank;
+        layer.rank_k = next.basis.manifest.rank_k;
+        layer.rank_v = next.basis.manifest.rank_v;
         layer.d_kv  = d_kv;
         next.layers.push_back(std::move(layer));
     }
@@ -519,8 +548,10 @@ bool llama_kv_lowrank_layer_append_projected_chunk(
         return false;
     };
 
-    if (layer.rank <= 0) {
-        return fail("low-rank KV layer rank must be positive before appending a chunk");
+    const int32_t rank_k = layer.rank_k > 0 ? layer.rank_k : layer.rank;
+    const int32_t rank_v = layer.rank_v > 0 ? layer.rank_v : layer.rank;
+    if (rank_k <= 0 || rank_v <= 0) {
+        return fail("low-rank KV layer K/V ranks must be positive before appending a chunk");
     }
     if (n_tokens <= 0) {
         return fail("low-rank KV projected chunk must contain at least one token");
@@ -529,9 +560,10 @@ bool llama_kv_lowrank_layer_append_projected_chunk(
         return fail("low-rank KV projected chunk input pointers must not be null");
     }
 
-    const size_t n_values = static_cast<size_t>(n_tokens) * static_cast<size_t>(layer.rank);
-    layer.a_k.insert(layer.a_k.end(), a_k, a_k + n_values);
-    layer.a_v.insert(layer.a_v.end(), a_v, a_v + n_values);
+    const size_t n_values_k = static_cast<size_t>(n_tokens) * static_cast<size_t>(rank_k);
+    const size_t n_values_v = static_cast<size_t>(n_tokens) * static_cast<size_t>(rank_v);
+    layer.a_k.insert(layer.a_k.end(), a_k, a_k + n_values_k);
+    layer.a_v.insert(layer.a_v.end(), a_v, a_v + n_values_v);
     layer.n_hist_tokens += n_tokens;
     layer.n_chunks += 1;
 
@@ -554,12 +586,13 @@ bool llama_kv_lowrank_project_chunk(
         return false;
     };
 
-    const int32_t rank = manifest.rank;
+    const int32_t rank_k = manifest.rank_k > 0 ? manifest.rank_k : manifest.rank;
+    const int32_t rank_v = manifest.rank_v > 0 ? manifest.rank_v : manifest.rank;
     const int32_t d_kv = manifest.head_dim * manifest.n_head_kv;
     const size_t dtype_size = llama_kv_lowrank_dtype_size(manifest.dtype);
 
-    if (rank <= 0 || d_kv <= 0) {
-        return fail("low-rank KV projection requires positive rank and d_kv");
+    if (rank_k <= 0 || rank_v <= 0 || d_kv <= 0) {
+        return fail("low-rank KV projection requires positive K/V ranks and d_kv");
     }
     if (dtype_size == 0) {
         return fail("low-rank KV projection has unsupported basis dtype: " + manifest.dtype);
@@ -571,32 +604,44 @@ bool llama_kv_lowrank_project_chunk(
         return fail("low-rank KV projection dense input pointers must not be null");
     }
 
-    const size_t expected_basis_size = static_cast<size_t>(rank) * static_cast<size_t>(d_kv) * dtype_size;
-    if (basis.k.size() != expected_basis_size) {
+    const size_t expected_k_basis_size = static_cast<size_t>(rank_k) * static_cast<size_t>(d_kv) * dtype_size;
+    const size_t expected_v_basis_size = static_cast<size_t>(rank_v) * static_cast<size_t>(d_kv) * dtype_size;
+    if (basis.k.size() != expected_k_basis_size) {
         return fail("low-rank KV K basis size does not match projection shape");
     }
-    if (basis.v.size() != expected_basis_size) {
+    if (basis.v.size() != expected_v_basis_size) {
         return fail("low-rank KV V basis size does not match projection shape");
     }
 
-    out_a_k.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(rank), 0.0f);
-    out_a_v.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(rank), 0.0f);
+    out_a_k.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(rank_k), 0.0f);
+    out_a_v.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(rank_v), 0.0f);
 
     for (int32_t t = 0; t < n_tokens; ++t) {
-        for (int32_t r = 0; r < rank; ++r) {
+        for (int32_t r = 0; r < rank_k; ++r) {
             float sum_k = 0.0f;
-            float sum_v = 0.0f;
 
             for (int32_t c = 0; c < d_kv; ++c) {
                 const size_t basis_index = static_cast<size_t>(r) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
                 const size_t dense_index = static_cast<size_t>(t) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
 
                 sum_k += k_dense[dense_index] * llama_kv_lowrank_basis_value(basis.k, manifest.dtype, basis_index);
+            }
+
+            const size_t out_index = static_cast<size_t>(t) * static_cast<size_t>(rank_k) + static_cast<size_t>(r);
+            out_a_k[out_index] = sum_k;
+        }
+
+        for (int32_t r = 0; r < rank_v; ++r) {
+            float sum_v = 0.0f;
+
+            for (int32_t c = 0; c < d_kv; ++c) {
+                const size_t basis_index = static_cast<size_t>(r) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
+                const size_t dense_index = static_cast<size_t>(t) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
+
                 sum_v += v_dense[dense_index] * llama_kv_lowrank_basis_value(basis.v, manifest.dtype, basis_index);
             }
 
-            const size_t out_index = static_cast<size_t>(t) * static_cast<size_t>(rank) + static_cast<size_t>(r);
-            out_a_k[out_index] = sum_k;
+            const size_t out_index = static_cast<size_t>(t) * static_cast<size_t>(rank_v) + static_cast<size_t>(r);
             out_a_v[out_index] = sum_v;
         }
     }
@@ -821,12 +866,13 @@ bool llama_kv_lowrank_reconstruct_chunk(
         return false;
     };
 
-    const int32_t rank = manifest.rank;
+    const int32_t rank_k = manifest.rank_k > 0 ? manifest.rank_k : manifest.rank;
+    const int32_t rank_v = manifest.rank_v > 0 ? manifest.rank_v : manifest.rank;
     const int32_t d_kv = manifest.head_dim * manifest.n_head_kv;
     const size_t dtype_size = llama_kv_lowrank_dtype_size(manifest.dtype);
 
-    if (rank <= 0 || d_kv <= 0) {
-        return fail("low-rank KV reconstruction requires positive rank and d_kv");
+    if (rank_k <= 0 || rank_v <= 0 || d_kv <= 0) {
+        return fail("low-rank KV reconstruction requires positive K/V ranks and d_kv");
     }
     if (dtype_size == 0) {
         return fail("low-rank KV reconstruction has unsupported basis dtype: " + manifest.dtype);
@@ -838,11 +884,12 @@ bool llama_kv_lowrank_reconstruct_chunk(
         return fail("low-rank KV reconstruction input pointers must not be null");
     }
 
-    const size_t expected_basis_size = static_cast<size_t>(rank) * static_cast<size_t>(d_kv) * dtype_size;
-    if (basis.k.size() != expected_basis_size) {
+    const size_t expected_k_basis_size = static_cast<size_t>(rank_k) * static_cast<size_t>(d_kv) * dtype_size;
+    const size_t expected_v_basis_size = static_cast<size_t>(rank_v) * static_cast<size_t>(d_kv) * dtype_size;
+    if (basis.k.size() != expected_k_basis_size) {
         return fail("low-rank KV K basis size does not match reconstruction shape");
     }
-    if (basis.v.size() != expected_basis_size) {
+    if (basis.v.size() != expected_v_basis_size) {
         return fail("low-rank KV V basis size does not match reconstruction shape");
     }
 
@@ -854,11 +901,17 @@ bool llama_kv_lowrank_reconstruct_chunk(
             float sum_k = 0.0f;
             float sum_v = 0.0f;
 
-            for (int32_t r = 0; r < rank; ++r) {
+            for (int32_t r = 0; r < rank_k; ++r) {
                 const size_t basis_index = static_cast<size_t>(r) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
-                const size_t a_index = static_cast<size_t>(t) * static_cast<size_t>(rank) + static_cast<size_t>(r);
+                const size_t a_index = static_cast<size_t>(t) * static_cast<size_t>(rank_k) + static_cast<size_t>(r);
 
                 sum_k += a_k[a_index] * llama_kv_lowrank_basis_value(basis.k, manifest.dtype, basis_index);
+            }
+
+            for (int32_t r = 0; r < rank_v; ++r) {
+                const size_t basis_index = static_cast<size_t>(r) * static_cast<size_t>(d_kv) + static_cast<size_t>(c);
+                const size_t a_index = static_cast<size_t>(t) * static_cast<size_t>(rank_v) + static_cast<size_t>(r);
+
                 sum_v += a_v[a_index] * llama_kv_lowrank_basis_value(basis.v, manifest.dtype, basis_index);
             }
 

@@ -561,6 +561,8 @@ struct common_params {
     // Experimental low-rank KV cache path for mobile-oriented research prototypes.
     bool        kv_lowrank            = false;
     int32_t     kv_lowrank_rank       = 32;
+    int32_t     kv_lowrank_rank_k     = 0;
+    int32_t     kv_lowrank_rank_v     = 0;
     int32_t     kv_lowrank_window     = 256;
     int32_t     kv_lowrank_chunk      = 64;
     int32_t     kv_lowrank_sample_max_tokens = 4096;

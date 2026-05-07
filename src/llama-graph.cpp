@@ -90,6 +90,8 @@ static void llama_kv_lowrank_observe_attn_shapes(
         << llama_format_tensor_shape(k_cache) << '|'
         << llama_format_tensor_shape(v_cache) << '|'
         << cparams.kv_lowrank_rank << '|'
+        << cparams.kv_lowrank_rank_k << '|'
+        << cparams.kv_lowrank_rank_v << '|'
         << cparams.kv_lowrank_window << '|'
         << cparams.kv_lowrank_chunk << '|'
         << cparams.kv_lowrank_reconstruct;
@@ -101,7 +103,7 @@ static void llama_kv_lowrank_observe_attn_shapes(
     LLAMA_LOG_INFO(
             "%s: layer=%d n_tokens=%lld n_kv=%lld n_head_kv=%lld head_dim_k=%lld head_dim_v=%lld "
             "d_kv_k=%lld d_kv_v=%lld q_cur=%s k_cur=%s v_cur=%s k_cache=%s v_cache=%s "
-            "rank=%d window=%d chunk=%d mode=%s\n",
+            "rank=%d rank_k=%d rank_v=%d window=%d chunk=%d mode=%s\n",
             __func__,
             il,
             (long long) n_tokens,
@@ -117,6 +119,8 @@ static void llama_kv_lowrank_observe_attn_shapes(
             llama_format_tensor_shape(k_cache).c_str(),
             llama_format_tensor_shape(v_cache).c_str(),
             cparams.kv_lowrank_rank,
+            cparams.kv_lowrank_rank_k,
+            cparams.kv_lowrank_rank_v,
             cparams.kv_lowrank_window,
             cparams.kv_lowrank_chunk,
             cparams.kv_lowrank_reconstruct ? "reconstruct" : "direct");

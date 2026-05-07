@@ -120,7 +120,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hf-config", type=Path, help="optional Hugging Face config.json path")
     parser.add_argument("--out-dir", type=Path, required=True, help="output directory")
-    parser.add_argument("--rank", type=int, default=32, help="low-rank basis rank")
+    parser.add_argument("--rank", type=int, default=32, help="default low-rank basis rank")
+    parser.add_argument("--rank-k", type=int, help="low-rank basis rank for K (default: --rank)")
+    parser.add_argument("--rank-v", type=int, help="low-rank basis rank for V (default: --rank)")
     parser.add_argument("--n-layer", type=int, help="number of transformer layers")
     parser.add_argument("--head-dim", type=int, help="per-head K/V dimension")
     parser.add_argument("--n-head-kv", type=int, help="number of K/V heads")
@@ -151,14 +153,17 @@ def main() -> None:
         raise SystemExit("error: unable to infer head_dim; pass --head-dim or --hf-config")
     if n_head_kv is None or n_head_kv <= 0:
         raise SystemExit("error: unable to infer n_head_kv; pass --n-head-kv or --hf-config")
-    if args.rank <= 0:
-        raise SystemExit("error: --rank must be positive")
+    rank_k = args.rank_k if args.rank_k is not None else args.rank
+    rank_v = args.rank_v if args.rank_v is not None else args.rank
+    if args.rank <= 0 or rank_k <= 0 or rank_v <= 0:
+        raise SystemExit("error: --rank and optional --rank-k/--rank-v must be positive")
 
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     d_kv = head_dim * n_head_kv
-    expected_size = args.rank * d_kv * dtype_size(args.dtype)
+    expected_k_size = rank_k * d_kv * dtype_size(args.dtype)
+    expected_v_size = rank_v * d_kv * dtype_size(args.dtype)
     samples = None
     if args.samples_npz is not None:
         try:
@@ -173,12 +178,12 @@ def main() -> None:
         k_name = f"layer_{layer:03d}.bk.{args.dtype}.bin"
         v_name = f"layer_{layer:03d}.bv.{args.dtype}.bin"
         if samples is None:
-            write_dummy_basis(out_dir / k_name, args.rank, d_kv, args.dtype)
-            write_dummy_basis(out_dir / v_name, args.rank, d_kv, args.dtype)
+            write_dummy_basis(out_dir / k_name, rank_k, d_kv, args.dtype)
+            write_dummy_basis(out_dir / v_name, rank_v, d_kv, args.dtype)
         else:
             try:
-                k_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "k"), args.rank, d_kv)
-                v_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "v"), args.rank, d_kv)
+                k_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "k"), rank_k, d_kv)
+                v_basis = compute_uncentered_svd_basis(load_sample_array(samples, layer, "v"), rank_v, d_kv)
             except (KeyError, ValueError) as exc:
                 raise SystemExit(f"error: layer {layer}: {exc}") from exc
 
@@ -192,7 +197,9 @@ def main() -> None:
         "version": 1,
         "dtype": args.dtype,
         "layout": "row-major",
-        "rank": args.rank,
+        "rank": max(rank_k, rank_v),
+        "rank_k": rank_k,
+        "rank_v": rank_v,
         "n_layer": n_layer,
         "head_dim": head_dim,
         "n_head_kv": n_head_kv,
@@ -207,7 +214,10 @@ def main() -> None:
     mode = "uncentered-svd" if samples is not None else "dummy-identity"
     print(f"wrote manifest: {manifest_path}")
     print(f"mode: {mode}")
-    print(f"layers: {n_layer}, rank: {args.rank}, d_kv: {d_kv}, basis bytes/file: {expected_size}")
+    print(
+        f"layers: {n_layer}, rank_k: {rank_k}, rank_v: {rank_v}, d_kv: {d_kv}, "
+        f"K basis bytes/file: {expected_k_size}, V basis bytes/file: {expected_v_size}"
+    )
 
 
 if __name__ == "__main__":

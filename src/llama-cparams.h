@@ -43,6 +43,8 @@ struct llama_cparams {
     bool kv_lowrank;
     bool kv_lowrank_reconstruct;
     int32_t kv_lowrank_rank;
+    int32_t kv_lowrank_rank_k;
+    int32_t kv_lowrank_rank_v;
     int32_t kv_lowrank_window;
     int32_t kv_lowrank_chunk;
     int32_t kv_lowrank_sample_max_tokens;

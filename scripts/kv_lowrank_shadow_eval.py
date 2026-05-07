@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 
 RECON_RE = re.compile(
@@ -36,6 +36,21 @@ def parse_ranks(value: str) -> List[int]:
     if not ranks or any(rank <= 0 for rank in ranks):
         raise argparse.ArgumentTypeError("ranks must be a comma-separated list of positive integers")
     return ranks
+
+
+def parse_rank_pairs(value: str) -> List[Tuple[int, int]]:
+    pairs = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise argparse.ArgumentTypeError("rank pairs must use K:V entries, for example 32:64,32:128")
+        k_rank, v_rank = (int(part) for part in item.split(":", 1))
+        pairs.append((k_rank, v_rank))
+    if not pairs or any(k_rank <= 0 or v_rank <= 0 for k_rank, v_rank in pairs):
+        raise argparse.ArgumentTypeError("rank pairs must contain positive integers")
+    return pairs
 
 
 def parse_recon_log(text: str) -> Dict[str, Any]:
@@ -77,7 +92,7 @@ def parse_recon_log(text: str) -> Dict[str, Any]:
     }
 
 
-def llama_cmd(args: argparse.Namespace, basis_path: Path, extra: List[str]) -> List[str]:
+def llama_cmd(args: argparse.Namespace, basis_path: Path, rank_k: int, rank_v: int, extra: List[str]) -> List[str]:
     return [
         str(args.llama_cli),
         "-m", str(args.model),
@@ -91,19 +106,24 @@ def llama_cmd(args: argparse.Namespace, basis_path: Path, extra: List[str]) -> L
         "--verbose",
         "--kv-lowrank",
         "--kv-lowrank-basis-path", str(basis_path),
-        "--kv-lowrank-rank", str(args.rank_for_cli),
+        "--kv-lowrank-rank", str(max(rank_k, rank_v)),
+        "--kv-lowrank-rank-k", str(rank_k),
+        "--kv-lowrank-rank-v", str(rank_v),
         "--kv-lowrank-window", str(args.window),
         "--kv-lowrank-chunk", str(args.chunk),
+        *args.llama_arg,
         *extra,
     ]
 
 
-def export_basis_cmd(args: argparse.Namespace, out_dir: Path, rank: int, samples_npz: Path | None) -> List[str]:
+def export_basis_cmd(args: argparse.Namespace, out_dir: Path, rank_k: int, rank_v: int, samples_npz: Path | None) -> List[str]:
     cmd = [
         "python3",
         str(args.exporter),
         "--out-dir", str(out_dir),
-        "--rank", str(rank),
+        "--rank", str(max(rank_k, rank_v)),
+        "--rank-k", str(rank_k),
+        "--rank-v", str(rank_v),
         "--n-layer", str(args.n_layer),
         "--head-dim", str(args.head_dim),
         "--n-head-kv", str(args.n_head_kv),
@@ -123,6 +143,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--exporter", type=Path, default=Path("scripts/kv_lowrank_export_basis.py"))
     parser.add_argument("--ranks", type=parse_ranks, default=[4])
+    parser.add_argument("--rank-pairs", type=parse_rank_pairs, help="comma-separated asymmetric K:V ranks, e.g. 32:64,32:128")
     parser.add_argument("--n-layer", type=int, required=True)
     parser.add_argument("--head-dim", type=int, required=True)
     parser.add_argument("--n-head-kv", type=int, required=True)
@@ -133,21 +154,29 @@ def main() -> None:
     parser.add_argument("--prompt", default="hi")
     parser.add_argument("--n-predict", type=int, default=16)
     parser.add_argument("--ctx-size", type=int, default=256)
+    parser.add_argument(
+        "--llama-arg",
+        action="append",
+        default=[],
+        help="extra argument passed through to llama-cli; repeat for multi-token options",
+    )
     args = parser.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
+    rank_pairs = args.rank_pairs if args.rank_pairs is not None else [(rank, rank) for rank in args.ranks]
 
     dummy_dir = args.work_dir / "dummy_basis"
-    run_cmd(export_basis_cmd(args, dummy_dir, args.ranks[0], None), args.work_dir / "collect_basis.log")
+    run_cmd(export_basis_cmd(args, dummy_dir, rank_pairs[0][0], rank_pairs[0][1], None), args.work_dir / "collect_basis.log")
     dummy_manifest = dummy_dir / "whlr_kv_basis.json"
 
-    args.rank_for_cli = args.ranks[0]
     samples_npz = args.work_dir / "kv_samples.npz"
     collect_log = args.work_dir / "collect_samples.log"
     run_cmd(
         llama_cmd(
             args,
             dummy_manifest,
+            rank_pairs[0][0],
+            rank_pairs[0][1],
             [
                 "--kv-lowrank-samples-out", str(samples_npz),
                 "--kv-lowrank-sample-max-tokens", str(args.sample_max_tokens),
@@ -158,21 +187,22 @@ def main() -> None:
 
     results = {
         "samples_npz": str(samples_npz),
-        "ranks": [],
+        "rank_pairs": [],
     }
 
-    for rank in args.ranks:
-        rank_dir = args.work_dir / f"basis_r{rank}"
-        run_cmd(export_basis_cmd(args, rank_dir, rank, samples_npz), args.work_dir / f"export_r{rank}.log")
+    for rank_k, rank_v in rank_pairs:
+        rank_dir = args.work_dir / f"basis_k{rank_k}_v{rank_v}"
+        run_cmd(export_basis_cmd(args, rank_dir, rank_k, rank_v, samples_npz), args.work_dir / f"export_k{rank_k}_v{rank_v}.log")
 
-        args.rank_for_cli = rank
-        eval_log = args.work_dir / f"eval_r{rank}.log"
-        text = run_cmd(llama_cmd(args, rank_dir / "whlr_kv_basis.json", []), eval_log)
+        eval_log = args.work_dir / f"eval_k{rank_k}_v{rank_v}.log"
+        text = run_cmd(llama_cmd(args, rank_dir / "whlr_kv_basis.json", rank_k, rank_v, []), eval_log)
         metrics = parse_recon_log(text)
-        metrics["rank"] = rank
+        metrics["rank"] = max(rank_k, rank_v)
+        metrics["rank_k"] = rank_k
+        metrics["rank_v"] = rank_v
         metrics["basis_manifest"] = str(rank_dir / "whlr_kv_basis.json")
         metrics["eval_log"] = str(eval_log)
-        results["ranks"].append(metrics)
+        results["rank_pairs"].append(metrics)
 
     summary_path = args.work_dir / "summary.json"
     summary_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")

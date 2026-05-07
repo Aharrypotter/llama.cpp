@@ -169,6 +169,8 @@ llama_context::llama_context(
     cparams.kv_lowrank = params.kv_lowrank;
     cparams.kv_lowrank_reconstruct = params.kv_lowrank_reconstruct;
     cparams.kv_lowrank_rank = params.kv_lowrank_rank;
+    cparams.kv_lowrank_rank_k = params.kv_lowrank_rank_k;
+    cparams.kv_lowrank_rank_v = params.kv_lowrank_rank_v;
     cparams.kv_lowrank_window = params.kv_lowrank_window;
     cparams.kv_lowrank_chunk = params.kv_lowrank_chunk;
     cparams.kv_lowrank_sample_max_tokens = params.kv_lowrank_sample_max_tokens;
@@ -179,6 +181,8 @@ llama_context::llama_context(
         llama_kv_lowrank_params kv_lowrank_params;
         kv_lowrank_params.enabled     = cparams.kv_lowrank;
         kv_lowrank_params.rank        = cparams.kv_lowrank_rank;
+        kv_lowrank_params.rank_k      = cparams.kv_lowrank_rank_k;
+        kv_lowrank_params.rank_v      = cparams.kv_lowrank_rank_v;
         kv_lowrank_params.window      = cparams.kv_lowrank_window;
         kv_lowrank_params.chunk       = cparams.kv_lowrank_chunk;
         kv_lowrank_params.sample_max_tokens = cparams.kv_lowrank_sample_max_tokens;
@@ -205,8 +209,8 @@ llama_context::llama_context(
                 throw std::runtime_error("WHLR-KV basis dimensions do not match model KV dimensions");
             }
 
-            LLAMA_LOG_INFO("%s: WHLR-KV shadow context loaded layers=%zu rank=%d d_kv=%d\n",
-                    __func__, kv_lowrank_ctx.layers.size(), manifest.rank, d_kv);
+            LLAMA_LOG_INFO("%s: WHLR-KV shadow context loaded layers=%zu rank_k=%d rank_v=%d d_kv=%d\n",
+                    __func__, kv_lowrank_ctx.layers.size(), manifest.rank_k, manifest.rank_v, d_kv);
         }
     }
 
@@ -3336,6 +3340,8 @@ llama_context_params llama_context_default_params() {
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.kv_lowrank_rank             =*/ 32,
+        /*.kv_lowrank_rank_k           =*/ 0,
+        /*.kv_lowrank_rank_v           =*/ 0,
         /*.kv_lowrank_window           =*/ 256,
         /*.kv_lowrank_chunk            =*/ 64,
         /*.kv_lowrank_sample_max_tokens=*/ 4096,

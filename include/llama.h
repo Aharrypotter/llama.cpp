@@ -351,9 +351,11 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
-        // [EXPERIMENTAL] Windowed historical low-rank KV cache observer.
-        // This currently only enables shape/state logging in the llama core; it does not alter inference.
+        // [EXPERIMENTAL] Windowed historical low-rank KV cache shadow prototype.
+        // This observes/projects real K/V state but does not alter inference.
         int32_t kv_lowrank_rank;
+        int32_t kv_lowrank_rank_k;
+        int32_t kv_lowrank_rank_v;
         int32_t kv_lowrank_window;
         int32_t kv_lowrank_chunk;
         int32_t kv_lowrank_sample_max_tokens;

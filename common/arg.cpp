@@ -2067,11 +2067,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_LOWRANK"));
     add_opt(common_arg(
         {"--kv-lowrank-rank"}, "N",
-        string_format("rank for historical low-rank KV factors (default: %d)", params.kv_lowrank_rank),
+        string_format("default rank for historical low-rank K/V factors (default: %d)", params.kv_lowrank_rank),
         [](common_params & params, int value) {
             params.kv_lowrank_rank = value;
         }
     ).set_env("LLAMA_ARG_KV_LOWRANK_RANK"));
+    add_opt(common_arg(
+        {"--kv-lowrank-rank-k"}, "N",
+        "rank for historical low-rank K factors (default: --kv-lowrank-rank)",
+        [](common_params & params, int value) {
+            params.kv_lowrank_rank_k = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_RANK_K"));
+    add_opt(common_arg(
+        {"--kv-lowrank-rank-v"}, "N",
+        "rank for historical low-rank V factors (default: --kv-lowrank-rank)",
+        [](common_params & params, int value) {
+            params.kv_lowrank_rank_v = value;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_RANK_V"));
     add_opt(common_arg(
         {"--kv-lowrank-window"}, "N",
         string_format("number of recent dense KV tokens to keep before low-rank eviction (default: %d)", params.kv_lowrank_window),

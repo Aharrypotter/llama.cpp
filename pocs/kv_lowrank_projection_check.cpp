@@ -148,6 +148,66 @@ int main() {
         return 1;
     }
 
+    common_kv_lowrank_basis_manifest asym_manifest = manifest;
+    asym_manifest.rank = 3;
+    asym_manifest.rank_k = 2;
+    asym_manifest.rank_v = 3;
+
+    common_kv_lowrank_basis_layer_data asym_basis;
+    asym_basis.layer = 0;
+    asym_basis.k = make_identity_like_basis(asym_manifest.rank_k, asym_manifest.head_dim * asym_manifest.n_head_kv);
+    asym_basis.v = make_identity_like_basis(asym_manifest.rank_v, asym_manifest.head_dim * asym_manifest.n_head_kv);
+
+    if (!expect_true(common_kv_lowrank_project_chunk(
+                asym_manifest, asym_basis, k_dense.data(), v_dense.data(), 2, a_k, a_v, &err), err.c_str())) {
+        return 1;
+    }
+    if (!expect_near_vec(a_k, { 10.0f, 11.0f, 20.0f, 21.0f }, "asym a_k")) {
+        return 1;
+    }
+    if (!expect_near_vec(a_v, { 30.0f, 31.0f, 32.0f, 40.0f, 41.0f, 42.0f }, "asym a_v")) {
+        return 1;
+    }
+
+    common_kv_lowrank_layer_state asym_state;
+    asym_state.layer = 0;
+    asym_state.rank = asym_manifest.rank;
+    asym_state.rank_k = asym_manifest.rank_k;
+    asym_state.rank_v = asym_manifest.rank_v;
+    asym_state.d_kv = asym_manifest.head_dim * asym_manifest.n_head_kv;
+
+    if (!expect_true(common_kv_lowrank_layer_append_projected_chunk(
+                asym_state, a_k.data(), a_v.data(), 2, &err), err.c_str())) {
+        return 1;
+    }
+    if (!expect_true(asym_state.a_k.size() == 4, "asym a_k state size should be 4")) {
+        return 1;
+    }
+    if (!expect_true(asym_state.a_v.size() == 6, "asym a_v state size should be 6")) {
+        return 1;
+    }
+    if (!expect_true(common_kv_lowrank_layer_memory_bytes(asym_state) == 40, "asym state memory should be 40 bytes")) {
+        return 1;
+    }
+
+    if (!expect_true(common_kv_lowrank_reconstruct_chunk(
+                asym_manifest, asym_basis, asym_state.a_k.data(), asym_state.a_v.data(),
+                asym_state.n_hist_tokens, k_recon, v_recon, &err), err.c_str())) {
+        return 1;
+    }
+    if (!expect_near_vec(k_recon, {
+                10.0f, 11.0f, 0.0f, 0.0f,
+                20.0f, 21.0f, 0.0f, 0.0f,
+            }, "asym k_recon")) {
+        return 1;
+    }
+    if (!expect_near_vec(v_recon, {
+                30.0f, 31.0f, 32.0f, 0.0f,
+                40.0f, 41.0f, 42.0f, 0.0f,
+            }, "asym v_recon")) {
+        return 1;
+    }
+
     common_kv_lowrank_context ctx;
     ctx.params.enabled = true;
     ctx.params.rank = manifest.rank;
