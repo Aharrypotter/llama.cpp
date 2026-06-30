@@ -13,8 +13,6 @@ struct llama_kv_blocksvd_params {
     int32_t block_size  = 64;
     int32_t rank        = 8;
     int32_t quant_bits  = 8;   // 8 or 16
-    bool    reconstruct = false;
-    int32_t window_size = 0;   // 0 = full sequence
 };
 
 struct llama_kv_blocksvd_chunk {

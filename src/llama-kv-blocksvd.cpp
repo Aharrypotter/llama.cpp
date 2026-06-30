@@ -1,5 +1,6 @@
 #include "llama-kv-blocksvd.h"
 #include "ggml.h"
+#include "llama-impl.h"
 
 #include <Eigen/SVD>
 
@@ -18,6 +19,8 @@ static int32_t llama_kv_blocksvd_dtype_size(int32_t quant_bits) {
 }
 
 // Store a 16-bit quantized value in little-endian byte order at dst[2*i].
+// The byte order is fixed regardless of host endianness so that serialized
+// chunks are portable across platforms.
 static void llama_kv_blocksvd_store_i16(int8_t * dst, int32_t i, int16_t value) {
     uint16_t u = static_cast<uint16_t>(value);
     dst[2*i + 0] = static_cast<int8_t>(u & 0xffu);
@@ -96,17 +99,47 @@ bool llama_kv_blocksvd_compress_chunk(
         int32_t n_kv_start,
         bool v_transposed) {
 
-    if (!ctx || n_kv <= 0) return false;
-    if (layer >= (int32_t) ctx->layers.size()) {
-        ctx->layers.resize(layer + 1);
+    if (!ctx) {
+        LLAMA_LOG_WARN("%s: null context\n", __func__);
+        return false;
+    }
+    if (!k || !v) {
+        LLAMA_LOG_WARN("%s: null K/V pointers\n", __func__);
+        return false;
+    }
+    if (layer < 0) {
+        LLAMA_LOG_WARN("%s: invalid layer %d\n", __func__, layer);
+        return false;
+    }
+    if (n_head_kv <= 0 || head_dim_k <= 0 || head_dim_v <= 0) {
+        LLAMA_LOG_WARN("%s: invalid head configuration (n_head_kv=%d, head_dim_k=%d, head_dim_v=%d)\n",
+                       __func__, n_head_kv, head_dim_k, head_dim_v);
+        return false;
+    }
+    if (n_kv <= 0 || n_kv_start < 0) {
+        LLAMA_LOG_WARN("%s: invalid sequence range (n_kv=%d, n_kv_start=%d)\n", __func__, n_kv, n_kv_start);
+        return false;
     }
 
     const int32_t block_size = ctx->params.block_size;
     const int32_t rank       = ctx->params.rank;
     const int32_t quant_bits = ctx->params.quant_bits;
 
-    if (block_size <= 0 || rank <= 0 || n_kv < block_size) {
+    if (block_size <= 0) {
+        LLAMA_LOG_WARN("%s: invalid block_size %d\n", __func__, block_size);
         return false;
+    }
+    if (rank <= 0) {
+        LLAMA_LOG_WARN("%s: invalid rank %d\n", __func__, rank);
+        return false;
+    }
+    if (quant_bits != 8 && quant_bits != 16) {
+        LLAMA_LOG_WARN("%s: invalid quant_bits %d (must be 8 or 16)\n", __func__, quant_bits);
+        return false;
+    }
+
+    if (layer >= (int32_t) ctx->layers.size()) {
+        ctx->layers.resize(layer + 1);
     }
 
     const int32_t n_flat_k = n_head_kv * head_dim_k;
@@ -139,16 +172,27 @@ bool llama_kv_blocksvd_compress_chunk(
         }
     }
 
-    // Process by blocks along the sequence dimension.
-    const int32_t n_blocks = n_kv / block_size;
+    // Process by blocks along the sequence dimension.  The final block may be
+    // smaller than block_size; we still compress it with an adaptive rank.
+    const int32_t n_blocks_full = n_kv / block_size;
+    const int32_t n_blocks      = n_blocks_full + (n_kv % block_size > 0 ? 1 : 0);
+
     for (int b = 0; b < n_blocks; ++b) {
         const int32_t start = b * block_size;
-        const int32_t end   = start + block_size;
+        const int32_t end   = std::min(start + block_size, n_kv);
+        const int32_t actual_block_size = end - start;
 
-        Eigen::Map<llama_kv_blocksvd_matrix_rm> M(X.data() + static_cast<size_t>(start) * n_flat, block_size, n_flat);
+        Eigen::Map<llama_kv_blocksvd_matrix_rm> M(X.data() + static_cast<size_t>(start) * n_flat,
+                                                  actual_block_size, n_flat);
         Eigen::JacobiSVD<llama_kv_blocksvd_matrix_rm> svd(M, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
-        const int32_t max_rank = std::min(block_size, n_flat);
+        if (svd.info() != Eigen::Success) {
+            LLAMA_LOG_WARN("%s: SVD failed for layer %d block [%d, %d)\n",
+                           __func__, layer, start, end);
+            return false;
+        }
+
+        const int32_t max_rank = std::min(actual_block_size, n_flat);
         const int32_t r        = std::min(rank, max_rank);
 
         auto U = svd.matrixU().leftCols(r);
@@ -163,16 +207,16 @@ bool llama_kv_blocksvd_compress_chunk(
         chunk.quant_bits = quant_bits;
 
         const int32_t dtype_size = llama_kv_blocksvd_dtype_size(quant_bits);
-        chunk.u_q.resize(static_cast<size_t>(block_size) * r * dtype_size);
+        chunk.u_q.resize(static_cast<size_t>(actual_block_size) * r * dtype_size);
         chunk.s_q.resize(static_cast<size_t>(r) * dtype_size);
         chunk.vh_q.resize(static_cast<size_t>(r) * n_flat * dtype_size);
 
-        std::vector<float> u_f(static_cast<size_t>(block_size) * r);
+        std::vector<float> u_f(static_cast<size_t>(actual_block_size) * r);
         std::vector<float> s_f(r);
         std::vector<float> v_f(static_cast<size_t>(r) * n_flat);
 
-        // U: (block_size, r)
-        for (int i = 0; i < block_size; ++i) {
+        // U: (actual_block_size, r)
+        for (int i = 0; i < actual_block_size; ++i) {
             for (int j = 0; j < r; ++j) {
                 u_f[static_cast<size_t>(i) * r + j] = U(i, j);
             }
@@ -207,8 +251,31 @@ bool llama_kv_blocksvd_decompress_chunk(
         int32_t head_dim_v,
         bool v_transposed) {
 
+    if (!k || !v) {
+        LLAMA_LOG_WARN("%s: null K/V pointers\n", __func__);
+        return false;
+    }
+    if (n_head_kv <= 0 || head_dim_k <= 0 || head_dim_v <= 0) {
+        LLAMA_LOG_WARN("%s: invalid head configuration (n_head_kv=%d, head_dim_k=%d, head_dim_v=%d)\n",
+                       __func__, n_head_kv, head_dim_k, head_dim_v);
+        return false;
+    }
+    if (chunk.seq_start < 0 || chunk.seq_end <= chunk.seq_start) {
+        LLAMA_LOG_WARN("%s: invalid chunk sequence range [%d, %d)\n",
+                       __func__, chunk.seq_start, chunk.seq_end);
+        return false;
+    }
+    if (chunk.quant_bits != 8 && chunk.quant_bits != 16) {
+        LLAMA_LOG_WARN("%s: invalid chunk quant_bits %d (must be 8 or 16)\n",
+                       __func__, chunk.quant_bits);
+        return false;
+    }
+
     const int32_t block_size = chunk.seq_end - chunk.seq_start;
-    if (block_size <= 0) return false;
+    if (block_size <= 0) {
+        LLAMA_LOG_WARN("%s: invalid block size %d\n", __func__, block_size);
+        return false;
+    }
 
     const int32_t n_flat_k   = n_head_kv * head_dim_k;
     const int32_t n_flat_v   = n_head_kv * head_dim_v;
@@ -216,13 +283,27 @@ bool llama_kv_blocksvd_decompress_chunk(
     const int32_t quant_bits = chunk.quant_bits;
     const int32_t dtype_size = llama_kv_blocksvd_dtype_size(quant_bits);
 
-    if (n_flat != n_flat_k + n_flat_v) return false;
+    if (n_flat != n_flat_k + n_flat_v) {
+        LLAMA_LOG_WARN("%s: chunk n_flat %d does not match head dims\n", __func__, n_flat);
+        return false;
+    }
 
     const int32_t rank = (int32_t) chunk.s_q.size() / dtype_size;
-    if (rank <= 0) return false;
+    if (rank <= 0) {
+        LLAMA_LOG_WARN("%s: invalid chunk rank %d\n", __func__, rank);
+        return false;
+    }
 
-    if ((int32_t) chunk.u_q.size() != block_size * rank * dtype_size) return false;
-    if ((int32_t) chunk.vh_q.size() != rank * n_flat * dtype_size) return false;
+    if ((int32_t) chunk.u_q.size() != block_size * rank * dtype_size) {
+        LLAMA_LOG_WARN("%s: chunk U buffer size mismatch (expected %d, got %zu)\n",
+                       __func__, block_size * rank * dtype_size, chunk.u_q.size());
+        return false;
+    }
+    if ((int32_t) chunk.vh_q.size() != rank * n_flat * dtype_size) {
+        LLAMA_LOG_WARN("%s: chunk Vh buffer size mismatch (expected %d, got %zu)\n",
+                       __func__, rank * n_flat * dtype_size, chunk.vh_q.size());
+        return false;
+    }
 
     std::vector<float> u_f(static_cast<size_t>(block_size) * rank);
     std::vector<float> s_f(rank);
