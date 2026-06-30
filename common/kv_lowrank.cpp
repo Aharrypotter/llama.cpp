@@ -12,6 +12,7 @@ common_kv_lowrank_params common_kv_lowrank_params_from_common(const common_param
     out.chunk       = params.kv_lowrank_chunk;
     out.sample_max_tokens = params.kv_lowrank_sample_max_tokens;
     out.reconstruct = params.kv_lowrank_reconstruct;
+    out.reconstruct_cache = params.kv_lowrank_reconstruct_cache;
     out.basis_path  = params.kv_lowrank_basis_path;
     out.samples_path = params.kv_lowrank_samples_path;
     return out;
@@ -86,7 +87,7 @@ bool common_kv_lowrank_context_append_policy_project_reconstruct_error(
         llama_kv_lowrank_error_stats & out_stats,
         std::string * err) {
     return llama_kv_lowrank_context_append_policy_project_reconstruct_error(
-            ctx, layer, k_dense, v_dense, n_tokens, out_stats, err);
+            ctx, layer, k_dense, v_dense, n_tokens, out_stats, nullptr, err);
 }
 
 bool common_kv_lowrank_reconstruct_chunk(
@@ -142,7 +143,7 @@ void common_kv_lowrank_log_config(const common_kv_lowrank_params & params) {
     const common_kv_lowrank_basis_info info = common_kv_lowrank_basis_probe(params.basis_path);
     const int32_t rank_k = params.rank_k > 0 ? params.rank_k : params.rank;
     const int32_t rank_v = params.rank_v > 0 ? params.rank_v : params.rank;
-    LOG_INF("%s: enabled rank=%d rank_k=%d rank_v=%d window=%d chunk=%d mode=%s basis=%s",
+    LOG_INF("%s: enabled rank=%d rank_k=%d rank_v=%d window=%d chunk=%d mode=%s reconstruct_cache=%s basis=%s",
             __func__,
             params.rank,
             rank_k,
@@ -150,6 +151,7 @@ void common_kv_lowrank_log_config(const common_kv_lowrank_params & params) {
             params.window,
             params.chunk,
             params.reconstruct ? "reconstruct" : "direct",
+            params.reconstruct_cache ? "on" : "off",
             params.basis_path.c_str());
     if (info.exists) {
         LOG_CNT(" (%zu bytes)\n", info.size);

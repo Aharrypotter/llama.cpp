@@ -18,6 +18,7 @@ struct llama_kv_lowrank_params {
     int32_t     chunk       = 64;
     int32_t     sample_max_tokens = 4096;
     bool        reconstruct = true;
+    bool        reconstruct_cache = false;
     std::string basis_path;
     std::string samples_path;
 };
@@ -79,6 +80,10 @@ struct llama_kv_lowrank_layer_state {
     std::vector<float> a_v;
     std::vector<float> pending_k;
     std::vector<float> pending_v;
+    std::vector<uint32_t> pending_slots;
+    std::vector<uint32_t> last_projected_slots;
+    std::vector<float> last_recon_k;
+    std::vector<float> last_recon_v;
     std::vector<float> sample_k;
     std::vector<float> sample_v;
 };
@@ -167,6 +172,7 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
         const float * v_dense,
         int32_t n_tokens,
         llama_kv_lowrank_error_stats & out_stats,
+        const uint32_t * token_slots = nullptr,
         std::string * err = nullptr);
 
 bool llama_kv_lowrank_reconstruct_chunk(

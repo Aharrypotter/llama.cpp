@@ -326,6 +326,13 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    // [EXPERIMENTAL] Block SVD KV cache compression parameters.
+    struct llama_kv_blocksvd_params {
+        int32_t block_size; // SVD block size along the sequence dimension
+        int32_t rank;       // low-rank dimension (0 = disabled)
+        int32_t quant_bits; // 8 or 16
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -362,6 +369,8 @@ extern "C" {
         const char * kv_lowrank_basis_path;
         const char * kv_lowrank_samples_path;
 
+        struct llama_kv_blocksvd_params kv_blocksvd_params;
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -387,6 +396,7 @@ extern "C" {
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool kv_lowrank;  // [EXPERIMENTAL] enable WHLR-KV observer state
         bool kv_lowrank_reconstruct; // [EXPERIMENTAL] prefer reconstruct mode over direct low-rank attention
+        bool kv_lowrank_reconstruct_cache; // [EXPERIMENTAL] write reconstructed historical KV back into cache
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

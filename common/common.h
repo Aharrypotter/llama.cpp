@@ -567,8 +567,12 @@ struct common_params {
     int32_t     kv_lowrank_chunk      = 64;
     int32_t     kv_lowrank_sample_max_tokens = 4096;
     bool        kv_lowrank_reconstruct = true;
+    bool        kv_lowrank_reconstruct_cache = false;
     std::string kv_lowrank_basis_path = ""; // sidecar basis manifest path                  // NOLINT
     std::string kv_lowrank_samples_path = ""; // optional dense KV sample .npz path          // NOLINT
+
+    bool kv_blocksvd_enabled = false;
+    struct llama_kv_blocksvd_params kv_blocksvd_params = {64, 8, 8};
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

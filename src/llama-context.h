@@ -8,6 +8,10 @@
 #include "llama-impl.h"
 #include "llama-kv-lowrank.h"
 
+#ifdef LLAMA_KV_BLOCKSVD
+#include "llama-kv-blocksvd.h"
+#endif
+
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
@@ -252,6 +256,10 @@ private:
 
     void kv_lowrank_shadow_project_current(const llama_memory_context_i * mctx);
 
+#ifdef LLAMA_KV_BLOCKSVD
+    void kv_blocksvd_shadow_compress_current(const llama_memory_context_i * mctx);
+#endif
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -275,6 +283,10 @@ private:
     std::unique_ptr<llama_memory_i> memory;
 
     llama_kv_lowrank_context kv_lowrank_ctx;
+
+#ifdef LLAMA_KV_BLOCKSVD
+    std::unique_ptr<llama_kv_blocksvd_context> kv_blocksvd_shadow;
+#endif
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -354,6 +366,10 @@ private:
 
     bool has_evaluated_once = false;
     bool kv_lowrank_shadow_warned = false;
+
+#ifdef LLAMA_KV_BLOCKSVD
+    bool kv_blocksvd_shadow_warned = false;
+#endif
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

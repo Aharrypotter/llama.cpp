@@ -168,6 +168,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.kv_lowrank = params.kv_lowrank;
     cparams.kv_lowrank_reconstruct = params.kv_lowrank_reconstruct;
+    cparams.kv_lowrank_reconstruct_cache = params.kv_lowrank_reconstruct_cache;
     cparams.kv_lowrank_rank = params.kv_lowrank_rank;
     cparams.kv_lowrank_rank_k = params.kv_lowrank_rank_k;
     cparams.kv_lowrank_rank_v = params.kv_lowrank_rank_v;
@@ -176,6 +177,7 @@ llama_context::llama_context(
     cparams.kv_lowrank_sample_max_tokens = params.kv_lowrank_sample_max_tokens;
     cparams.kv_lowrank_basis_path = params.kv_lowrank_basis_path ? params.kv_lowrank_basis_path : "";
     cparams.kv_lowrank_samples_path = params.kv_lowrank_samples_path ? params.kv_lowrank_samples_path : "";
+    cparams.kv_blocksvd_params = params.kv_blocksvd_params;
 
     {
         llama_kv_lowrank_params kv_lowrank_params;
@@ -187,6 +189,7 @@ llama_context::llama_context(
         kv_lowrank_params.chunk       = cparams.kv_lowrank_chunk;
         kv_lowrank_params.sample_max_tokens = cparams.kv_lowrank_sample_max_tokens;
         kv_lowrank_params.reconstruct = cparams.kv_lowrank_reconstruct;
+        kv_lowrank_params.reconstruct_cache = cparams.kv_lowrank_reconstruct_cache;
         kv_lowrank_params.basis_path  = cparams.kv_lowrank_basis_path;
         kv_lowrank_params.samples_path = cparams.kv_lowrank_samples_path;
 
@@ -213,6 +216,18 @@ llama_context::llama_context(
                     __func__, kv_lowrank_ctx.layers.size(), manifest.rank_k, manifest.rank_v, d_kv);
         }
     }
+
+#ifdef LLAMA_KV_BLOCKSVD
+    if (cparams.kv_blocksvd_params.rank > 0) {
+        kv_blocksvd_shadow = std::unique_ptr<llama_kv_blocksvd_context>(
+            llama_kv_blocksvd_init(cparams.kv_blocksvd_params));
+        LLAMA_LOG_INFO("%s: Block SVD shadow context enabled (block_size=%d rank=%d quant_bits=%d)\n",
+                __func__,
+                cparams.kv_blocksvd_params.block_size,
+                cparams.kv_blocksvd_params.rank,
+                cparams.kv_blocksvd_params.quant_bits);
+    }
+#endif
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1339,7 +1354,21 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
 
     synchronize();
 
+    std::vector<uint32_t> current_slots;
+    uint32_t current_stream = 0;
+    if (kv_lowrank_ctx.params.reconstruct_cache) {
+        std::string slot_error;
+        if (!kv_mctx->copy_current_slot_indices(current_slots, current_stream, &slot_error)) {
+            if (!kv_lowrank_shadow_warned) {
+                LLAMA_LOG_WARN("%s: WHLR-KV reconstruct-cache skipped: %s\n", __func__, slot_error.c_str());
+                kv_lowrank_shadow_warned = true;
+            }
+            return;
+        }
+    }
+
     int32_t projected_layers = 0;
+    int32_t reconstructed_layers = 0;
     int32_t observed_layers = 0;
     int32_t n_projected_tokens = 0;
     int32_t n_chunks_projected = 0;
@@ -1378,7 +1407,8 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
         std::string project_error;
         llama_kv_lowrank_error_stats stats;
         if (!llama_kv_lowrank_context_append_policy_project_reconstruct_error(
-                    kv_lowrank_ctx, il, k_dense.data(), v_dense.data(), ubatch.n_tokens, stats, &project_error)) {
+                    kv_lowrank_ctx, il, k_dense.data(), v_dense.data(), ubatch.n_tokens, stats,
+                    kv_lowrank_ctx.params.reconstruct_cache ? current_slots.data() : nullptr, &project_error)) {
             if (!kv_lowrank_shadow_warned) {
                 LLAMA_LOG_WARN("%s: WHLR-KV shadow projection skipped: %s\n", __func__, project_error.c_str());
                 kv_lowrank_shadow_warned = true;
@@ -1392,6 +1422,36 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
         n_pending_tokens = std::max(n_pending_tokens, stats.n_pending_tokens);
 
         if (stats.n_projected_tokens > 0) {
+            if (kv_lowrank_ctx.params.reconstruct_cache) {
+                const llama_kv_lowrank_layer_state * layer_state = nullptr;
+                for (const llama_kv_lowrank_layer_state & item : kv_lowrank_ctx.layers) {
+                    if (item.layer == static_cast<int32_t>(il)) {
+                        layer_state = &item;
+                        break;
+                    }
+                }
+                if (layer_state == nullptr) {
+                    if (!kv_lowrank_shadow_warned) {
+                        LLAMA_LOG_WARN("%s: WHLR-KV reconstruct-cache skipped: layer state not found\n", __func__);
+                        kv_lowrank_shadow_warned = true;
+                    }
+                    return;
+                }
+
+                std::string write_error;
+                if (!kv_mctx->replace_kv_rows_f32(
+                            il, current_stream, layer_state->last_projected_slots,
+                            layer_state->last_recon_k, layer_state->last_recon_v, &write_error)) {
+                    if (!kv_lowrank_shadow_warned) {
+                        LLAMA_LOG_WARN("%s: WHLR-KV reconstruct-cache write skipped: %s\n",
+                                __func__, write_error.c_str());
+                        kv_lowrank_shadow_warned = true;
+                    }
+                    return;
+                }
+                reconstructed_layers++;
+            }
+
             k_sum_abs += static_cast<double>(stats.k_mean_abs) * static_cast<double>(stats.n_values);
             v_sum_abs += static_cast<double>(stats.v_mean_abs) * static_cast<double>(stats.n_values);
             n_error_values += stats.n_values;
@@ -1406,7 +1466,7 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
     const double v_mean_abs = n_error_values > 0 ? v_sum_abs / static_cast<double>(n_error_values) : 0.0;
 
     LLAMA_LOG_INFO("%s: observed n_tokens=%u layers=%d projected_tokens=%d projected_chunks=%d "
-            "projected_layers=%d pending_tokens=%d window=%d chunk=%d history_bytes=%zu "
+            "projected_layers=%d reconstructed_layers=%d pending_tokens=%d window=%d chunk=%d history_bytes=%zu "
             "recon_err_k_max=%.6g recon_err_k_mean=%.6g recon_err_v_max=%.6g recon_err_v_mean=%.6g\n",
             __func__,
             ubatch.n_tokens,
@@ -1414,6 +1474,7 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
             n_projected_tokens,
             n_chunks_projected,
             projected_layers,
+            reconstructed_layers,
             n_pending_tokens,
             kv_lowrank_ctx.params.window,
             kv_lowrank_ctx.params.chunk,
@@ -1423,6 +1484,112 @@ void llama_context::kv_lowrank_shadow_project_current(const llama_memory_context
             (double) v_max_abs,
             v_mean_abs);
 }
+
+#ifdef LLAMA_KV_BLOCKSVD
+void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_context_i * mctx) {
+    if (!kv_blocksvd_shadow) {
+        return;
+    }
+
+    const auto * kv_mctx = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    if (kv_mctx == nullptr) {
+        if (!kv_blocksvd_shadow_warned) {
+            LLAMA_LOG_WARN("%s: Block SVD shadow compression currently supports only llama_kv_cache_context\n", __func__);
+            kv_blocksvd_shadow_warned = true;
+        }
+        return;
+    }
+
+    const llama_ubatch & ubatch = kv_mctx->get_ubatch();
+    if (ubatch.n_tokens == 0) {
+        return;
+    }
+
+    if (kv_mctx->type_k() != GGML_TYPE_F16 && kv_mctx->type_k() != GGML_TYPE_F32) {
+        if (!kv_blocksvd_shadow_warned) {
+            LLAMA_LOG_WARN("%s: Block SVD shadow compression supports f16/f32 K cache only, got %s\n",
+                    __func__, ggml_type_name(kv_mctx->type_k()));
+            kv_blocksvd_shadow_warned = true;
+        }
+        return;
+    }
+    if (kv_mctx->type_v() != GGML_TYPE_F16 && kv_mctx->type_v() != GGML_TYPE_F32) {
+        if (!kv_blocksvd_shadow_warned) {
+            LLAMA_LOG_WARN("%s: Block SVD shadow compression supports f16/f32 V cache only, got %s\n",
+                    __func__, ggml_type_name(kv_mctx->type_v()));
+            kv_blocksvd_shadow_warned = true;
+        }
+        return;
+    }
+
+    synchronize();
+
+    int32_t n_compressed_layers = 0;
+    int32_t n_tokens_total = 0;
+    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+        if (!model.hparams.has_kv(il)) {
+            continue;
+        }
+
+        std::vector<float> k_dense;
+        std::vector<float> v_dense;
+        std::string extract_error;
+        if (!kv_mctx->copy_current_kv_chunk_f32(il, k_dense, v_dense, &extract_error)) {
+            if (!kv_blocksvd_shadow_warned) {
+                LLAMA_LOG_WARN("%s: Block SVD shadow extraction skipped: %s\n", __func__, extract_error.c_str());
+                kv_blocksvd_shadow_warned = true;
+            }
+            return;
+        }
+
+        const int32_t d_k = model.hparams.n_embd_k_gqa(il);
+        const int32_t d_v = model.hparams.n_embd_v_gqa(il);
+        if (d_k <= 0 || d_v <= 0) {
+            continue;
+        }
+
+        const int32_t n_kv = k_dense.empty() ? 0 : (int32_t) k_dense.size() / d_k;
+        if (n_kv <= 0) {
+            continue;
+        }
+
+        // Only compress chunks that are at least one full block to avoid
+        // doing a tiny SVD for every single autoregressive token.
+        if (n_kv < cparams.kv_blocksvd_params.block_size) {
+            continue;
+        }
+
+        const int32_t n_head_kv  = model.hparams.n_head_kv(il);
+        const int32_t head_dim_k = model.hparams.n_embd_head_k(il);
+        const int32_t head_dim_v = model.hparams.n_embd_head_v(il);
+
+        if (!llama_kv_blocksvd_compress_chunk(
+                    kv_blocksvd_shadow.get(),
+                    (int32_t) il,
+                    k_dense.data(),
+                    v_dense.data(),
+                    n_head_kv,
+                    head_dim_k,
+                    head_dim_v,
+                    n_kv,
+                    0,
+                    false)) {
+            if (!kv_blocksvd_shadow_warned) {
+                LLAMA_LOG_WARN("%s: Block SVD shadow compression failed for layer %u\n", __func__, il);
+                kv_blocksvd_shadow_warned = true;
+            }
+            return;
+        }
+
+        n_compressed_layers++;
+        n_tokens_total = std::max(n_tokens_total, n_kv);
+    }
+
+    if (n_compressed_layers > 0) {
+        LLAMA_LOG_INFO("%s: compressed n_tokens=%d layers=%d\n", __func__, n_tokens_total, n_compressed_layers);
+    }
+}
+#endif
 
 int llama_context::encode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
@@ -1912,6 +2079,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //}
 
         kv_lowrank_shadow_project_current(mctx.get());
+
+#ifdef LLAMA_KV_BLOCKSVD
+        if (kv_blocksvd_shadow) {
+            kv_blocksvd_shadow_compress_current(mctx.get());
+        }
+#endif
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
@@ -3347,6 +3520,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_lowrank_sample_max_tokens=*/ 4096,
         /*.kv_lowrank_basis_path       =*/ nullptr,
         /*.kv_lowrank_samples_path     =*/ nullptr,
+        /*.kv_blocksvd_params          =*/ {64, 0, 8},
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -3361,6 +3535,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.kv_lowrank                  =*/ false,
         /*.kv_lowrank_reconstruct      =*/ true,
+        /*.kv_lowrank_reconstruct_cache=*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

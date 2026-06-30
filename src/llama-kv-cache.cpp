@@ -48,6 +48,26 @@ static void llama_kv_cache_decode_row(
     }
 }
 
+static void llama_kv_cache_encode_scalar(std::vector<uint8_t> & data, const ggml_type type, const size_t offset, const float value) {
+    if (type == GGML_TYPE_F16) {
+        const ggml_fp16_t encoded = ggml_fp32_to_fp16(value);
+        memcpy(data.data() + offset, &encoded, sizeof(encoded));
+        return;
+    }
+
+    memcpy(data.data() + offset, &value, sizeof(value));
+}
+
+static void llama_kv_cache_encode_row(
+        std::vector<uint8_t> & data,
+        const ggml_type type,
+        const int64_t n,
+        const float * src) {
+    for (int64_t i = 0; i < n; ++i) {
+        llama_kv_cache_encode_scalar(data, type, i*llama_kv_cache_type_size(type), src[i]);
+    }
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -1396,6 +1416,89 @@ bool llama_kv_cache::copy_current_kv_chunk_f32(
     return true;
 }
 
+bool llama_kv_cache::replace_kv_rows_f32(
+        int32_t il,
+        uint32_t stream,
+        const std::vector<uint32_t> & slots,
+        const std::vector<float> & k_rows,
+        const std::vector<float> & v_rows,
+        std::string * err) const {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    if (slots.empty()) {
+        return true;
+    }
+    if (stream >= get_n_stream()) {
+        return fail("WHLR-KV reconstruct-cache write got invalid KV stream");
+    }
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * v = layers[ikv].v;
+    if (k == nullptr || v == nullptr) {
+        return fail("WHLR-KV reconstruct-cache write requires both K and V cache tensors");
+    }
+
+    const size_t type_size_k = llama_kv_cache_type_size(k->type);
+    const size_t type_size_v = llama_kv_cache_type_size(v->type);
+    if (type_size_k == 0 || type_size_v == 0) {
+        return fail("WHLR-KV reconstruct-cache write currently supports f16/f32 KV cache types only");
+    }
+
+    const int64_t d_k = hparams.n_embd_k_gqa(il);
+    const int64_t d_v = hparams.n_embd_v_gqa(il);
+    if (d_k != d_v) {
+        return fail("WHLR-KV reconstruct-cache write currently requires K and V d_kv to match");
+    }
+
+    const size_t expected_values = slots.size()*static_cast<size_t>(d_k);
+    if (k_rows.size() != expected_values || v_rows.size() != expected_values) {
+        return fail("WHLR-KV reconstruct-cache write row data size does not match slot count");
+    }
+
+    const uint64_t kv_size = get_size();
+    const size_t row_bytes_k = ggml_row_size(k->type, d_k);
+    const size_t row_bytes_v = ggml_row_size(v->type, d_v);
+    std::vector<uint8_t> row_k(row_bytes_k);
+    std::vector<uint8_t> row_v(v_trans ? type_size_v : row_bytes_v);
+
+    for (size_t t = 0; t < slots.size(); ++t) {
+        const uint32_t idx = slots[t];
+        if (idx >= kv_size) {
+            return fail("WHLR-KV reconstruct-cache write got invalid KV slot");
+        }
+
+        const float * src_k = k_rows.data() + t*static_cast<size_t>(d_k);
+        llama_kv_cache_encode_row(row_k, k->type, d_k, src_k);
+        const size_t k_offset = static_cast<size_t>(stream)*static_cast<size_t>(k->nb[2])
+                              + static_cast<size_t>(idx)*static_cast<size_t>(k->nb[1]);
+        ggml_backend_tensor_set(k, row_k.data(), k_offset, row_k.size());
+
+        const float * src_v = v_rows.data() + t*static_cast<size_t>(d_v);
+        if (!v_trans) {
+            llama_kv_cache_encode_row(row_v, v->type, d_v, src_v);
+            const size_t v_offset = static_cast<size_t>(stream)*static_cast<size_t>(v->nb[2])
+                                  + static_cast<size_t>(idx)*static_cast<size_t>(v->nb[1]);
+            ggml_backend_tensor_set(v, row_v.data(), v_offset, row_bytes_v);
+        } else {
+            const size_t stream_offset = static_cast<size_t>(stream)*static_cast<size_t>(kv_size)*static_cast<size_t>(v->ne[0])*type_size_v;
+            for (int64_t j = 0; j < d_v; ++j) {
+                llama_kv_cache_encode_scalar(row_v, v->type, 0, src_v[j]);
+                const size_t v_offset = stream_offset
+                                      + (static_cast<size_t>(j)*static_cast<size_t>(kv_size) + static_cast<size_t>(idx))*type_size_v;
+                ggml_backend_tensor_set(v, row_v.data(), v_offset, type_size_v);
+            }
+        }
+    }
+
+    return true;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -2574,6 +2677,40 @@ bool llama_kv_cache_context::copy_current_kv_chunk_f32(
         std::vector<float> & out_v,
         std::string * err) const {
     return kv->copy_current_kv_chunk_f32(il, sinfos[i_cur], out_k, out_v, err);
+}
+
+bool llama_kv_cache_context::copy_current_slot_indices(
+        std::vector<uint32_t> & out_slots,
+        uint32_t & out_stream,
+        std::string * err) const {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    const llama_kv_cache::slot_info & sinfo = sinfos[i_cur];
+    if (sinfo.empty()) {
+        return fail("WHLR-KV reconstruct-cache requires a non-empty KV slot");
+    }
+    if (sinfo.n_stream() != 1) {
+        return fail("WHLR-KV reconstruct-cache currently supports one KV stream only");
+    }
+
+    out_stream = sinfo.strm[0];
+    out_slots = sinfo.idxs[0];
+    return true;
+}
+
+bool llama_kv_cache_context::replace_kv_rows_f32(
+        int32_t il,
+        uint32_t stream,
+        const std::vector<uint32_t> & slots,
+        const std::vector<float> & k_rows,
+        const std::vector<float> & v_rows,
+        std::string * err) const {
+    return kv->replace_kv_rows_f32(il, stream, slots, k_rows, v_rows, err);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

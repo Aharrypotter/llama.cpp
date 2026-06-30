@@ -9,12 +9,6 @@
 // This header lives in src/ so llama core code can call the CPU reference
 // compression/reconstruction path without depending on common/.
 
-struct llama_kv_blocksvd_params {
-    int32_t block_size  = 64;
-    int32_t rank        = 8;
-    int32_t quant_bits  = 8;   // 8 or 16
-};
-
 struct llama_kv_blocksvd_chunk {
     int32_t seq_start = 0;
     int32_t seq_end   = 0;

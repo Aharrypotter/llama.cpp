@@ -2129,6 +2129,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_LOWRANK_DIRECT"));
     add_opt(common_arg(
+        {"--kv-lowrank-reconstruct-cache"},
+        "replace projected historical KV cache rows with reconstructed A@B values (experimental behavior-changing baseline)",
+        [](common_params & params) {
+            params.kv_lowrank_reconstruct_cache = true;
+        }
+    ).set_env("LLAMA_ARG_KV_LOWRANK_RECONSTRUCT_CACHE"));
+    add_opt(common_arg(
+        {"--kv-blocksvd"},
+        "enable experimental Block SVD KV cache compression shadow",
+        [](common_params & params) {
+            params.kv_blocksvd_enabled = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-rank"}, "N",
+        string_format("Block SVD rank (default: %d)", params.kv_blocksvd_params.rank),
+        [](common_params & params, int value) {
+            params.kv_blocksvd_params.rank = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_RANK"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-block-size"}, "N",
+        string_format("Block SVD block size (default: %d)", params.kv_blocksvd_params.block_size),
+        [](common_params & params, int value) {
+            params.kv_blocksvd_params.block_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_BLOCK_SIZE"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-quant-bits"}, "N",
+        string_format("Block SVD quantization bits: 8 or 16 (default: %d)", params.kv_blocksvd_params.quant_bits),
+        [](common_params & params, int value) {
+            params.kv_blocksvd_params.quant_bits = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_QUANT_BITS"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

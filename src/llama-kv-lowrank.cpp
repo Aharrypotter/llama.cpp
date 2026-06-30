@@ -756,6 +756,7 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
         const float * v_dense,
         int32_t n_tokens,
         llama_kv_lowrank_error_stats & out_stats,
+        const uint32_t * token_slots,
         std::string * err) {
     auto fail = [err](std::string msg) {
         if (err) {
@@ -776,6 +777,9 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
     if (k_dense == nullptr || v_dense == nullptr) {
         return fail("low-rank KV policy append dense input pointers must not be null");
     }
+    if (ctx.params.reconstruct_cache && token_slots == nullptr) {
+        return fail("low-rank KV reconstruct-cache policy requires token slot indices");
+    }
     if (ctx.params.window <= 0 || ctx.params.chunk <= 0) {
         return fail("low-rank KV policy requires positive window and chunk");
     }
@@ -794,8 +798,14 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
     }
 
     const size_t n_dense_values = static_cast<size_t>(n_tokens) * static_cast<size_t>(state->d_kv);
+    state->last_projected_slots.clear();
+    state->last_recon_k.clear();
+    state->last_recon_v.clear();
     state->pending_k.insert(state->pending_k.end(), k_dense, k_dense + n_dense_values);
     state->pending_v.insert(state->pending_v.end(), v_dense, v_dense + n_dense_values);
+    if (token_slots != nullptr) {
+        state->pending_slots.insert(state->pending_slots.end(), token_slots, token_slots + n_tokens);
+    }
     state->n_pending_tokens += n_tokens;
 
     const int32_t n_eligible = state->n_pending_tokens - ctx.params.window;
@@ -831,6 +841,19 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
             llama_kv_lowrank_compute_error_stats(k_chunk, v_chunk, k_recon, v_recon);
         llama_kv_lowrank_accumulate_error_stats(out_stats, chunk_stats);
 
+        if (ctx.params.reconstruct_cache) {
+            if (state->pending_slots.size() < static_cast<size_t>(offset + ctx.params.chunk)) {
+                return fail("low-rank KV reconstruct-cache pending slot count does not match pending tokens");
+            }
+
+            state->last_projected_slots.insert(
+                    state->last_projected_slots.end(),
+                    state->pending_slots.begin() + offset,
+                    state->pending_slots.begin() + offset + ctx.params.chunk);
+            state->last_recon_k.insert(state->last_recon_k.end(), k_recon.begin(), k_recon.end());
+            state->last_recon_v.insert(state->last_recon_v.end(), v_recon.begin(), v_recon.end());
+        }
+
         std::string append_error;
         if (!llama_kv_lowrank_layer_append_projected_chunk(
                     *state, a_k.data(), a_v.data(), ctx.params.chunk, &append_error)) {
@@ -844,6 +867,9 @@ bool llama_kv_lowrank_context_append_policy_project_reconstruct_error(
     const size_t n_erase_values = static_cast<size_t>(n_project) * static_cast<size_t>(state->d_kv);
     state->pending_k.erase(state->pending_k.begin(), state->pending_k.begin() + n_erase_values);
     state->pending_v.erase(state->pending_v.begin(), state->pending_v.begin() + n_erase_values);
+    if (!state->pending_slots.empty()) {
+        state->pending_slots.erase(state->pending_slots.begin(), state->pending_slots.begin() + n_project);
+    }
     state->n_pending_tokens -= n_project;
     out_stats.n_pending_tokens = state->n_pending_tokens;
 
@@ -933,6 +959,10 @@ void llama_kv_lowrank_layer_clear(llama_kv_lowrank_layer_state & layer) {
     layer.a_v.clear();
     layer.pending_k.clear();
     layer.pending_v.clear();
+    layer.pending_slots.clear();
+    layer.last_projected_slots.clear();
+    layer.last_recon_k.clear();
+    layer.last_recon_v.clear();
     layer.sample_k.clear();
     layer.sample_v.clear();
 }

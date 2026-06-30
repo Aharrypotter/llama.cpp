@@ -79,7 +79,7 @@ static void llama_kv_blocksvd_dequantize_symmetric(
 }
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params) {
-    auto * ctx = new llama_kv_blocksvd_context{params};
+    auto * ctx = new llama_kv_blocksvd_context{params, {}};
     return ctx;
 }
 

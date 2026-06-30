@@ -177,6 +177,14 @@ public:
             std::vector<float> & out_v,
             std::string * err = nullptr) const;
 
+    bool replace_kv_rows_f32(
+            int32_t il,
+            uint32_t stream,
+            const std::vector<uint32_t> & slots,
+            const std::vector<float> & k_rows,
+            const std::vector<float> & v_rows,
+            std::string * err = nullptr) const;
+
     //
     // preparation API
     //
@@ -378,6 +386,16 @@ public:
             int32_t il,
             std::vector<float> & out_k,
             std::vector<float> & out_v,
+            std::string * err = nullptr) const;
+
+    bool copy_current_slot_indices(std::vector<uint32_t> & out_slots, uint32_t & out_stream, std::string * err = nullptr) const;
+
+    bool replace_kv_rows_f32(
+            int32_t il,
+            uint32_t stream,
+            const std::vector<uint32_t> & slots,
+            const std::vector<float> & k_rows,
+            const std::vector<float> & v_rows,
             std::string * err = nullptr) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache

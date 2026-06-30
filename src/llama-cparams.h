@@ -42,6 +42,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool kv_lowrank;
     bool kv_lowrank_reconstruct;
+    bool kv_lowrank_reconstruct_cache;
     int32_t kv_lowrank_rank;
     int32_t kv_lowrank_rank_k;
     int32_t kv_lowrank_rank_v;
@@ -50,6 +51,8 @@ struct llama_cparams {
     int32_t kv_lowrank_sample_max_tokens;
     std::string kv_lowrank_basis_path;
     std::string kv_lowrank_samples_path;
+
+    struct llama_kv_blocksvd_params kv_blocksvd_params;
 
     enum llama_pooling_type pooling_type;
 

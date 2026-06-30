@@ -1,7 +1,5 @@
 llama_add_compile_flags()
 
-option(LLAMA_KV_BLOCKSVD "Enable EdgeKV Block SVD KV cache compression" OFF)
-
 if (LLAMA_KV_BLOCKSVD)
     find_package(Eigen3 REQUIRED)
 endif()
