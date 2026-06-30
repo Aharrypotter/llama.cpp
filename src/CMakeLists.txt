@@ -1,5 +1,7 @@
 llama_add_compile_flags()
 
+find_package(Eigen3 REQUIRED)
+
 #
 # libraries
 #
@@ -23,6 +25,7 @@ add_library(llama
             llama-impl.cpp
             llama-io.cpp
             llama-kv-lowrank.cpp
+            llama-kv-blocksvd.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-memory.cpp
@@ -52,7 +55,7 @@ target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PUBLIC ggml Eigen3::Eigen)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
