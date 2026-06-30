@@ -366,6 +366,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // absolute cell index of the first token in the current ubatch's slot
+    int32_t current_slot_head() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

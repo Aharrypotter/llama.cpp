@@ -236,7 +236,16 @@ bool llama_kv_blocksvd_compress_chunk(
         llama_kv_blocksvd_quantize_symmetric(s_f.data(), chunk.s_q.data(), (int32_t) s_f.size(), quant_bits, chunk.s_scale);
         llama_kv_blocksvd_quantize_symmetric(v_f.data(), chunk.vh_q.data(), (int32_t) v_f.size(), quant_bits, chunk.vh_scale);
 
-        ctx->layers[layer].push_back(std::move(chunk));
+        // Avoid duplicate/overlapping chunks for the same sequence range.
+        auto & chunks = ctx->layers[layer];
+        chunks.erase(
+            std::remove_if(chunks.begin(), chunks.end(),
+                [&chunk](const llama_kv_blocksvd_chunk & existing) {
+                    return existing.seq_start == chunk.seq_start;
+                }),
+            chunks.end());
+
+        chunks.push_back(std::move(chunk));
     }
 
     return true;

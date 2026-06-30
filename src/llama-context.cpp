@@ -1524,6 +1524,12 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
 
     synchronize();
 
+    // Absolute cell index where the current ubatch starts in the KV cache.
+    // copy_current_kv_chunk_f32() returns only the current ubatch's tokens,
+    // so we must tell the compressor the real starting position to avoid
+    // overlapping chunks across ubatches.
+    const int32_t n_kv_start = kv_mctx->current_slot_head();
+
     int32_t n_compressed_layers = 0;
     int32_t n_tokens_total = 0;
     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
@@ -1572,7 +1578,7 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
                     head_dim_k,
                     head_dim_v,
                     n_kv,
-                    0,
+                    n_kv_start,
                     false)) {
             if (!kv_blocksvd_shadow_warned) {
                 LLAMA_LOG_WARN("%s: Block SVD shadow compression failed for layer %u\n", __func__, il);

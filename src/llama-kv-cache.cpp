@@ -2671,6 +2671,13 @@ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
 }
 
+int32_t llama_kv_cache_context::current_slot_head() const {
+    const llama_kv_cache::slot_info & sinfo = sinfos[i_cur];
+    GGML_ASSERT(!sinfo.empty());
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    return (int32_t) sinfo.head();
+}
+
 bool llama_kv_cache_context::copy_current_kv_chunk_f32(
         int32_t il,
         std::vector<float> & out_k,

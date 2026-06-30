@@ -572,7 +572,8 @@ struct common_params {
     std::string kv_lowrank_samples_path = ""; // optional dense KV sample .npz path          // NOLINT
 
     bool kv_blocksvd_enabled = false;
-    struct llama_kv_blocksvd_params kv_blocksvd_params = {64, 8, 8};
+    // rank=0 means disabled; kv_blocksvd_enabled is the master switch
+    struct llama_kv_blocksvd_params kv_blocksvd_params = {64, 0, 8};
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
