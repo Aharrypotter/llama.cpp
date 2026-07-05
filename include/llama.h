@@ -331,6 +331,7 @@ extern "C" {
         int32_t block_size; // SVD block size along the sequence dimension
         int32_t rank;       // low-rank dimension (0 = disabled)
         int32_t quant_bits; // 8 or 16
+        bool    reconstruct; // write reconstructed K/V back into the dense KV cache
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

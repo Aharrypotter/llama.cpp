@@ -3526,7 +3526,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_lowrank_sample_max_tokens=*/ 4096,
         /*.kv_lowrank_basis_path       =*/ nullptr,
         /*.kv_lowrank_samples_path     =*/ nullptr,
-        /*.kv_blocksvd_params          =*/ {64, 0, 8},
+        /*.kv_blocksvd_params          =*/ {64, 0, 8, false},
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

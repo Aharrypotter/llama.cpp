@@ -2173,6 +2173,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCKSVD_QUANT_BITS"));
     add_opt(common_arg(
+        {"--kv-blocksvd-reconstruct"},
+        "enable experimental Block SVD KV cache reconstruction (overwrite dense cache with reconstructed K/V)",
+        [](common_params & params) {
+            params.kv_blocksvd_params.reconstruct = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_RECONSTRUCT"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
