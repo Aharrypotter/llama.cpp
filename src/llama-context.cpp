@@ -218,14 +218,24 @@ llama_context::llama_context(
     }
 
 #ifdef LLAMA_KV_BLOCKSVD
-    if (cparams.kv_blocksvd_params.rank > 0) {
-        kv_blocksvd_shadow = std::unique_ptr<llama_kv_blocksvd_context>(
-            llama_kv_blocksvd_init(cparams.kv_blocksvd_params));
-        LLAMA_LOG_INFO("%s: Block SVD shadow context enabled (block_size=%d rank=%d quant_bits=%d)\n",
-                __func__,
-                cparams.kv_blocksvd_params.block_size,
-                cparams.kv_blocksvd_params.rank,
-                cparams.kv_blocksvd_params.quant_bits);
+    {
+        auto blocksvd_params = cparams.kv_blocksvd_params;
+        if (blocksvd_params.reconstruct && blocksvd_params.rank <= 0) {
+            blocksvd_params.rank = blocksvd_params.block_size;
+            LLAMA_LOG_WARN("%s: Block SVD reconstruct mode defaulting to rank=%d for quality; "
+                           "set --kv-blocksvd-rank to override (lower = more compression, less quality)\n",
+                    __func__, blocksvd_params.rank);
+        }
+        if (blocksvd_params.rank > 0) {
+            cparams.kv_blocksvd_params.rank = blocksvd_params.rank;
+            kv_blocksvd_shadow = std::unique_ptr<llama_kv_blocksvd_context>(
+                llama_kv_blocksvd_init(blocksvd_params));
+            LLAMA_LOG_INFO("%s: Block SVD shadow context enabled (block_size=%d rank=%d quant_bits=%d)\n",
+                    __func__,
+                    blocksvd_params.block_size,
+                    blocksvd_params.rank,
+                    blocksvd_params.quant_bits);
+        }
     }
 #endif
 
@@ -1502,6 +1512,17 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
 
     const llama_ubatch & ubatch = kv_mctx->get_ubatch();
     if (ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // Reconstruct mode needs per-stream slot indices and per-stream write-back;
+    // shadow mode only reads stream 0. Skip multi-stream ubatches for now.
+    if (ubatch.n_seqs_unq > 1) {
+        if (!kv_blocksvd_shadow_warned) {
+            LLAMA_LOG_WARN("%s: Block SVD shadow compression currently supports one KV stream only (got %u)\n",
+                    __func__, ubatch.n_seqs_unq);
+            kv_blocksvd_shadow_warned = true;
+        }
         return;
     }
 
