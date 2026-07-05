@@ -79,7 +79,7 @@ static void llama_kv_blocksvd_dequantize_symmetric(
 }
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params) {
-    auto * ctx = new llama_kv_blocksvd_context{params, {}};
+    auto * ctx = new llama_kv_blocksvd_context{params, {}, {}};
     return ctx;
 }
 
@@ -359,4 +359,123 @@ bool llama_kv_blocksvd_decompress_chunk(
     }
 
     return true;
+}
+
+bool llama_kv_blocksvd_append_and_reconstruct(
+        llama_kv_blocksvd_context * ctx,
+        int32_t layer,
+        const float * k,
+        const float * v,
+        const uint32_t * slots,
+        int32_t n_tokens,
+        int32_t n_head_kv,
+        int32_t head_dim_k,
+        int32_t head_dim_v,
+        int32_t n_kv_start,
+        bool v_transposed,
+        std::vector<uint32_t> & out_slots,
+        std::vector<float> & out_k,
+        std::vector<float> & out_v,
+        std::string * err) {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    if (!ctx) {
+        return fail("ctx is null");
+    }
+    if (layer < 0) {
+        return fail("invalid layer");
+    }
+    if (n_tokens <= 0) {
+        return true;
+    }
+    if (ctx->params.block_size <= 0) {
+        return fail("block_size must be > 0");
+    }
+    if (!k || !v || !slots) {
+        return fail("K/V/slots pointers must not be null");
+    }
+
+    if (layer >= (int32_t) ctx->layers.size()) {
+        ctx->layers.resize(layer + 1);
+    }
+    if (layer >= (int32_t) ctx->pending.size()) {
+        ctx->pending.resize(layer + 1);
+    }
+
+    auto & p = ctx->pending[layer];
+    const int32_t d_k = head_dim_k * n_head_kv;
+    const int32_t d_v = head_dim_v * n_head_kv;
+
+    // First call for this layer/session: record starting n_kv
+    if (p.n_kv_total == 0) {
+        p.n_kv_total = n_kv_start;
+    }
+
+    // Append incoming tokens
+    p.k.insert(p.k.end(), k, k + (size_t) n_tokens * d_k);
+    p.v.insert(p.v.end(), v, v + (size_t) n_tokens * d_v);
+    p.slots.insert(p.slots.end(), slots, slots + n_tokens);
+
+    out_slots.clear();
+    out_k.clear();
+    out_v.clear();
+
+    const int32_t block_size = ctx->params.block_size;
+    while ((int32_t) p.slots.size() >= block_size) {
+        // Compress one block
+        if (!llama_kv_blocksvd_compress_chunk(
+                ctx, layer,
+                p.k.data(), p.v.data(),
+                n_head_kv, head_dim_k, head_dim_v,
+                block_size,
+                p.n_kv_total,
+                v_transposed)) {
+            return fail("compress_chunk failed");
+        }
+
+        const llama_kv_blocksvd_chunk & chunk = ctx->layers[layer].back();
+
+        // Decompress it
+        std::vector<float> k_recon((size_t) block_size * d_k);
+        std::vector<float> v_recon((size_t) block_size * d_v);
+        if (!llama_kv_blocksvd_decompress_chunk(
+                chunk,
+                k_recon.data(), v_recon.data(),
+                n_head_kv, head_dim_k, head_dim_v,
+                v_transposed)) {
+            return fail("decompress_chunk failed");
+        }
+
+        // Append to output
+        out_slots.insert(out_slots.end(), p.slots.begin(), p.slots.begin() + block_size);
+        out_k.insert(out_k.end(), k_recon.begin(), k_recon.end());
+        out_v.insert(out_v.end(), v_recon.begin(), v_recon.end());
+
+        // Remove processed tokens from pending
+        const size_t n_k_values = (size_t) block_size * d_k;
+        const size_t n_v_values = (size_t) block_size * d_v;
+        p.k.erase(p.k.begin(), p.k.begin() + n_k_values);
+        p.v.erase(p.v.begin(), p.v.begin() + n_v_values);
+        p.slots.erase(p.slots.begin(), p.slots.begin() + block_size);
+        p.n_kv_total += block_size;
+    }
+
+    return true;
+}
+
+void llama_kv_blocksvd_clear_pending(llama_kv_blocksvd_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    for (auto & p : ctx->pending) {
+        p.k.clear();
+        p.v.clear();
+        p.slots.clear();
+        p.n_kv_total = 0;
+    }
 }

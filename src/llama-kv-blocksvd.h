@@ -41,6 +41,15 @@ struct llama_kv_blocksvd_context {
     llama_kv_blocksvd_params params;
     // layers -> chunks
     std::vector<std::vector<llama_kv_blocksvd_chunk>> layers;
+
+    // For reconstruct mode: accumulate tokens until a full block is ready
+    struct pending_layer {
+        std::vector<float> k;
+        std::vector<float> v;
+        std::vector<uint32_t> slots; // global cell slots
+        int32_t n_kv_total = 0;       // total n_kv at first pending token (for chunk seq_start)
+    };
+    std::vector<pending_layer> pending;
 };
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params);
@@ -70,3 +79,26 @@ bool llama_kv_blocksvd_decompress_chunk(
         int32_t head_dim_k,
         int32_t head_dim_v,
         bool v_transposed);
+
+// Accumulate dense K/V for a layer. When pending length reaches block_size,
+// compress, decompress, and return the reconstructed rows + slots so the caller
+// can write them back into the dense KV cache.
+bool llama_kv_blocksvd_append_and_reconstruct(
+        llama_kv_blocksvd_context * ctx,
+        int32_t layer,
+        const float * k,
+        const float * v,
+        const uint32_t * slots,
+        int32_t n_tokens,
+        int32_t n_head_kv,
+        int32_t head_dim_k,
+        int32_t head_dim_v,
+        int32_t n_kv_start,
+        bool v_transposed,
+        std::vector<uint32_t> & out_slots,
+        std::vector<float> & out_k,
+        std::vector<float> & out_v,
+        std::string * err = nullptr);
+
+// Clear all pending K/V/slots (e.g. on KV cache clear).
+void llama_kv_blocksvd_clear_pending(llama_kv_blocksvd_context * ctx);
