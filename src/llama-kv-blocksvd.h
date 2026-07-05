@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Backend-agnostic core for Block SVD KV cache compression.

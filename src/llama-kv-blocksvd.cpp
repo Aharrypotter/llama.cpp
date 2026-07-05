@@ -440,12 +440,14 @@ bool llama_kv_blocksvd_append_and_reconstruct(
 
         const llama_kv_blocksvd_chunk & chunk = ctx->layers[layer].back();
 
-        // Decompress it
-        std::vector<float> k_recon((size_t) block_size * d_k);
-        std::vector<float> v_recon((size_t) block_size * d_v);
+        // Decompress it. decompress_chunk writes at absolute positions [seq_start, seq_end)
+        // into arrays sized for chunk.n_kv tokens, so allocate full-size buffers and copy
+        // the relevant rows afterwards.
+        std::vector<float> k_recon_full((size_t) chunk.n_kv * d_k, 0.0f);
+        std::vector<float> v_recon_full((size_t) chunk.n_kv * d_v, 0.0f);
         if (!llama_kv_blocksvd_decompress_chunk(
                 chunk,
-                k_recon.data(), v_recon.data(),
+                k_recon_full.data(), v_recon_full.data(),
                 n_head_kv, head_dim_k, head_dim_v,
                 v_transposed)) {
             return fail("decompress_chunk failed");
@@ -453,8 +455,14 @@ bool llama_kv_blocksvd_append_and_reconstruct(
 
         // Append to output
         out_slots.insert(out_slots.end(), p.slots.begin(), p.slots.begin() + block_size);
-        out_k.insert(out_k.end(), k_recon.begin(), k_recon.end());
-        out_v.insert(out_v.end(), v_recon.begin(), v_recon.end());
+        const size_t k_copy_offset = (size_t) chunk.seq_start * d_k;
+        const size_t v_copy_offset = (size_t) chunk.seq_start * d_v;
+        out_k.insert(out_k.end(),
+                     k_recon_full.begin() + k_copy_offset,
+                     k_recon_full.begin() + k_copy_offset + (size_t) block_size * d_k);
+        out_v.insert(out_v.end(),
+                     v_recon_full.begin() + v_copy_offset,
+                     v_recon_full.begin() + v_copy_offset + (size_t) block_size * d_v);
 
         // Remove processed tokens from pending
         const size_t n_k_values = (size_t) block_size * d_k;

@@ -1530,6 +1530,19 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
     // overlapping chunks across ubatches.
     const int32_t n_kv_start = kv_mctx->current_slot_head();
 
+    std::vector<uint32_t> current_slots;
+    uint32_t current_stream = 0;
+    if (cparams.kv_blocksvd_params.reconstruct) {
+        std::string slots_err;
+        if (!kv_mctx->copy_current_slot_indices(current_slots, current_stream, &slots_err)) {
+            if (!kv_blocksvd_shadow_warned) {
+                LLAMA_LOG_WARN("%s: Block SVD reconstruct skipped: %s\n", __func__, slots_err.c_str());
+                kv_blocksvd_shadow_warned = true;
+            }
+            return;
+        }
+    }
+
     int32_t n_compressed_layers = 0;
     int32_t n_tokens_total = 0;
     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
@@ -1569,22 +1582,65 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
         const int32_t head_dim_k = model.hparams.n_embd_head_k(il);
         const int32_t head_dim_v = model.hparams.n_embd_head_v(il);
 
-        if (!llama_kv_blocksvd_compress_chunk(
-                    kv_blocksvd_shadow.get(),
-                    (int32_t) il,
-                    k_dense.data(),
-                    v_dense.data(),
-                    n_head_kv,
-                    head_dim_k,
-                    head_dim_v,
-                    n_kv,
-                    n_kv_start,
-                    false)) {
-            if (!kv_blocksvd_shadow_warned) {
-                LLAMA_LOG_WARN("%s: Block SVD shadow compression failed for layer %u\n", __func__, il);
-                kv_blocksvd_shadow_warned = true;
+        if (cparams.kv_blocksvd_params.reconstruct) {
+            std::vector<uint32_t> recon_slots;
+            std::vector<float> recon_k;
+            std::vector<float> recon_v;
+            std::string recon_err;
+            if (!llama_kv_blocksvd_append_and_reconstruct(
+                        kv_blocksvd_shadow.get(),
+                        (int32_t) il,
+                        k_dense.data(),
+                        v_dense.data(),
+                        current_slots.data(),
+                        n_kv,
+                        n_head_kv,
+                        head_dim_k,
+                        head_dim_v,
+                        n_kv_start,
+                        false,
+                        recon_slots,
+                        recon_k,
+                        recon_v,
+                        &recon_err)) {
+                if (!kv_blocksvd_shadow_warned) {
+                    LLAMA_LOG_WARN("%s: Block SVD reconstruct skipped: %s\n", __func__, recon_err.c_str());
+                    kv_blocksvd_shadow_warned = true;
+                }
+                return;
             }
-            return;
+
+            if (!recon_slots.empty()) {
+                std::string write_error;
+                if (!kv_mctx->replace_kv_rows_f32(
+                            il, current_stream, recon_slots,
+                            recon_k, recon_v, &write_error)) {
+                    if (!kv_blocksvd_shadow_warned) {
+                        LLAMA_LOG_WARN("%s: Block SVD reconstruct-cache write skipped: %s\n",
+                                __func__, write_error.c_str());
+                        kv_blocksvd_shadow_warned = true;
+                    }
+                    return;
+                }
+            }
+        } else {
+            if (!llama_kv_blocksvd_compress_chunk(
+                        kv_blocksvd_shadow.get(),
+                        (int32_t) il,
+                        k_dense.data(),
+                        v_dense.data(),
+                        n_head_kv,
+                        head_dim_k,
+                        head_dim_v,
+                        n_kv,
+                        n_kv_start,
+                        false)) {
+                if (!kv_blocksvd_shadow_warned) {
+                    LLAMA_LOG_WARN("%s: Block SVD shadow compression failed for layer %u\n", __func__, il);
+                    kv_blocksvd_shadow_warned = true;
+                }
+                return;
+            }
         }
 
         n_compressed_layers++;
@@ -1592,7 +1648,9 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
     }
 
     if (n_compressed_layers > 0) {
-        LLAMA_LOG_INFO("%s: compressed n_tokens=%d layers=%d\n", __func__, n_tokens_total, n_compressed_layers);
+        LLAMA_LOG_INFO("%s: %s n_tokens=%d layers=%d\n", __func__,
+                cparams.kv_blocksvd_params.reconstruct ? "reconstruct" : "compressed",
+                n_tokens_total, n_compressed_layers);
     }
 }
 #endif
