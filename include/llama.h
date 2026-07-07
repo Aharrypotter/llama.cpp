@@ -332,6 +332,10 @@ extern "C" {
         int32_t rank;       // low-rank dimension (0 = disabled)
         int32_t quant_bits; // 8 or 16
         bool    reconstruct; // write reconstructed K/V back into the dense KV cache
+        bool    cross_layer; // xKV-style: group consecutive layers and share SVD basis across the group
+        int32_t layer_group_size; // number of consecutive layers per xKV group
+        bool    backend;     // use xKV compressed blocks as real persistent backend
+        bool    memory_reduction; // eliminate persistent dense cache for compressed cells
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

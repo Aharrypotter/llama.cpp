@@ -220,18 +220,19 @@ llama_context::llama_context(
 #ifdef LLAMA_KV_BLOCKSVD
     {
         auto blocksvd_params = cparams.kv_blocksvd_params;
-        if (blocksvd_params.reconstruct && blocksvd_params.rank <= 0) {
+        if ((blocksvd_params.reconstruct || blocksvd_params.backend) && blocksvd_params.rank <= 0) {
             blocksvd_params.rank = blocksvd_params.block_size;
-            LLAMA_LOG_WARN("%s: Block SVD reconstruct mode defaulting to rank=%d for quality; "
+            LLAMA_LOG_WARN("%s: Block SVD %s mode defaulting to rank=%d for quality; "
                            "set --kv-blocksvd-rank to override (lower = more compression, less quality)\n",
-                    __func__, blocksvd_params.rank);
+                    __func__, blocksvd_params.backend ? "backend" : "reconstruct",
+                    blocksvd_params.rank);
         }
         if (blocksvd_params.rank > 0) {
             cparams.kv_blocksvd_params.rank = blocksvd_params.rank;
             kv_blocksvd_shadow = std::unique_ptr<llama_kv_blocksvd_context>(
                 llama_kv_blocksvd_init(blocksvd_params));
-            LLAMA_LOG_INFO("%s: Block SVD shadow context enabled (block_size=%d rank=%d quant_bits=%d)\n",
-                    __func__,
+            LLAMA_LOG_INFO("%s: Block SVD context enabled (backend=%d block_size=%d rank=%d quant_bits=%d)\n",
+                    __func__, (int) blocksvd_params.backend,
                     blocksvd_params.block_size,
                     blocksvd_params.rank,
                     blocksvd_params.quant_bits);
@@ -1321,6 +1322,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+#ifdef LLAMA_KV_BLOCKSVD
+    // Optional: release dense rows for cells that are backed by compressed xKV chunks.
+    // This is currently a bookkeeping-only step (the dense tensor memory is still
+    // allocated) and is gated by an environment variable because zeroing rows adds
+    // per-token overhead. It is useful for validating the release/materialize loop.
+    if (cparams.kv_blocksvd_params.backend && getenv("LLAMA_KV_BLOCKSVD_RELEASE")) {
+        auto * kv = dynamic_cast<llama_kv_cache *>(get_memory());
+        if (kv) {
+            kv->blocksvd_release_dense_cells(kv_blocksvd_shadow.get());
+        }
+    }
+#endif
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1515,17 +1529,6 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
         return;
     }
 
-    // Reconstruct mode needs per-stream slot indices and per-stream write-back;
-    // shadow mode only reads stream 0. Skip multi-stream ubatches for now.
-    if (ubatch.n_seqs_unq > 1) {
-        if (!kv_blocksvd_shadow_warned) {
-            LLAMA_LOG_WARN("%s: Block SVD shadow compression currently supports one KV stream only (got %u)\n",
-                    __func__, ubatch.n_seqs_unq);
-            kv_blocksvd_shadow_warned = true;
-        }
-        return;
-    }
-
     if (kv_mctx->type_k() != GGML_TYPE_F16 && kv_mctx->type_k() != GGML_TYPE_F32) {
         if (!kv_blocksvd_shadow_warned) {
             LLAMA_LOG_WARN("%s: Block SVD shadow compression supports f16/f32 K cache only, got %s\n",
@@ -1545,24 +1548,241 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
 
     synchronize();
 
-    // Absolute cell index where the current ubatch starts in the KV cache.
-    // copy_current_kv_chunk_f32() returns only the current ubatch's tokens,
-    // so we must tell the compressor the real starting position to avoid
-    // overlapping chunks across ubatches.
-    const int32_t n_kv_start = kv_mctx->current_slot_head();
+    const bool backend = cparams.kv_blocksvd_params.backend;
 
-    std::vector<uint32_t> current_slots;
-    uint32_t current_stream = 0;
-    if (cparams.kv_blocksvd_params.reconstruct) {
-        std::string slots_err;
-        if (!kv_mctx->copy_current_slot_indices(current_slots, current_stream, &slots_err)) {
-            if (!kv_blocksvd_shadow_warned) {
-                LLAMA_LOG_WARN("%s: Block SVD reconstruct skipped: %s\n", __func__, slots_err.c_str());
-                kv_blocksvd_shadow_warned = true;
-            }
+    // xKV-style cross-layer SVD: group consecutive KV layers and compress them
+    // together along the feature dimension.
+    if (cparams.kv_blocksvd_params.cross_layer) {
+        const llama_kv_cache::slot_info & sinfo = kv_mctx->current_slot_info();
+        if (sinfo.empty()) {
             return;
         }
+
+        // Build the ordered list of layers that actually have a KV cache.
+        std::vector<uint32_t> kv_layers;
+        for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+            if (model.hparams.has_kv(il)) {
+                kv_layers.push_back(il);
+            }
+        }
+
+        const int32_t group_size_target = cparams.kv_blocksvd_params.layer_group_size > 0
+                                              ? cparams.kv_blocksvd_params.layer_group_size
+                                              : (int32_t) kv_layers.size();
+
+        int32_t n_compressed_layers = 0;
+        int32_t n_tokens_total = 0;
+
+        for (size_t g = 0; g < kv_layers.size(); ) {
+            std::vector<uint32_t> group_layers;
+
+            const uint32_t first_il = kv_layers[g];
+            const uint32_t n_head_kv  = model.hparams.n_head_kv(first_il);
+            const uint32_t head_dim_k = model.hparams.n_embd_head_k(first_il);
+            const uint32_t head_dim_v = model.hparams.n_embd_head_v(first_il);
+            const uint32_t d_k = model.hparams.n_embd_k_gqa(first_il);
+            const uint32_t d_v = model.hparams.n_embd_v_gqa(first_il);
+
+            // Accumulate consecutive KV layers with identical shape.
+            while (g < kv_layers.size() && (int32_t) group_layers.size() < group_size_target) {
+                const uint32_t il = kv_layers[g];
+                if (model.hparams.n_head_kv(il) != n_head_kv ||
+                    model.hparams.n_embd_head_k(il) != head_dim_k ||
+                    model.hparams.n_embd_head_v(il) != head_dim_v ||
+                    model.hparams.n_embd_k_gqa(il) != d_k ||
+                    model.hparams.n_embd_v_gqa(il) != d_v) {
+                    break;
+                }
+                group_layers.push_back(il);
+                ++g;
+            }
+
+            if (group_layers.empty()) {
+                ++g;
+                continue;
+            }
+
+            const int32_t actual_group_size = (int32_t) group_layers.size();
+
+            // Process each KV stream independently.
+            for (size_t s = 0; s < sinfo.n_stream(); ++s) {
+                const uint32_t stream = sinfo.strm[s];
+                const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+
+                std::vector<std::vector<float>> group_k(actual_group_size);
+                std::vector<std::vector<float>> group_v(actual_group_size);
+                int32_t n_kv = -1;
+                bool ok = true;
+
+                for (int32_t l = 0; l < actual_group_size; ++l) {
+                    const uint32_t il = group_layers[l];
+                    std::string extract_error;
+                    if (!kv_mctx->copy_kv_chunk_f32_for_stream(il, (uint32_t) s, group_k[l], group_v[l], &extract_error)) {
+                        if (!kv_blocksvd_shadow_warned) {
+                            LLAMA_LOG_WARN("%s: Block SVD shadow extraction skipped: %s\n", __func__, extract_error.c_str());
+                            kv_blocksvd_shadow_warned = true;
+                        }
+                        ok = false;
+                        break;
+                    }
+
+                    const int32_t il_n_kv = group_k[l].empty() ? 0 : (int32_t) group_k[l].size() / d_k;
+                    if (il_n_kv <= 0) {
+                        ok = false;
+                        break;
+                    }
+                    if (n_kv < 0) {
+                        n_kv = il_n_kv;
+                    } else if (il_n_kv != n_kv) {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (!ok || n_kv <= 0) {
+                    continue;
+                }
+
+                std::vector<const float *> group_k_ptr;
+                std::vector<const float *> group_v_ptr;
+                group_k_ptr.reserve(actual_group_size);
+                group_v_ptr.reserve(actual_group_size);
+                for (auto & k : group_k) group_k_ptr.push_back(k.data());
+                for (auto & v : group_v) group_v_ptr.push_back(v.data());
+
+                const uint32_t * stream_slots = sinfo.idxs[s].data();
+                const llama_pos  * stream_pos  = &ubatch.pos[s * sinfo.size()];
+                const int32_t n_kv_start = sinfo.idxs[s].empty() ? 0 : (int32_t) sinfo.idxs[s][0];
+
+                if (backend) {
+                    std::vector<uint32_t> compressed_slots;
+                    std::vector<llama_pos> compressed_pos;
+                    std::string store_err;
+                    if (!llama_kv_blocksvd_append_and_compress_xkv_group_store(
+                                kv_blocksvd_shadow.get(),
+                                (int32_t) group_layers[0],
+                                group_k_ptr,
+                                group_v_ptr,
+                                stream_slots,
+                                stream_pos,
+                                n_kv,
+                                stream,
+                                seq_id,
+                                (int32_t) n_head_kv,
+                                (int32_t) head_dim_k,
+                                (int32_t) head_dim_v,
+                                compressed_slots,
+                                compressed_pos,
+                                &store_err)) {
+                        if (!kv_blocksvd_shadow_warned) {
+                            LLAMA_LOG_WARN("%s: Block SVD cross-layer store skipped: %s\n", __func__, store_err.c_str());
+                            kv_blocksvd_shadow_warned = true;
+                        }
+                        continue;
+                    }
+
+                    if (!compressed_slots.empty()) {
+                        kv_mctx->mark_compressed(stream, compressed_slots);
+                        n_compressed_layers += actual_group_size;
+                        n_tokens_total = std::max(n_tokens_total, n_kv);
+                    }
+                } else {
+                    std::vector<uint32_t> recon_slots;
+                    std::vector<std::vector<float>> recon_k;
+                    std::vector<std::vector<float>> recon_v;
+                    std::string recon_err;
+                    if (!llama_kv_blocksvd_append_and_reconstruct_xkv_group(
+                                kv_blocksvd_shadow.get(),
+                                (int32_t) group_layers[0],
+                                group_k_ptr,
+                                group_v_ptr,
+                                stream_slots,
+                                n_kv,
+                                stream,
+                                seq_id,
+                                (int32_t) n_head_kv,
+                                (int32_t) head_dim_k,
+                                (int32_t) head_dim_v,
+                                n_kv_start,
+                                recon_slots,
+                                recon_k,
+                                recon_v,
+                                &recon_err)) {
+                        if (!kv_blocksvd_shadow_warned) {
+                            LLAMA_LOG_WARN("%s: Block SVD cross-layer reconstruct skipped: %s\n", __func__, recon_err.c_str());
+                            kv_blocksvd_shadow_warned = true;
+                        }
+                        continue;
+                    }
+
+                    // Write back each reconstructed layer. out_k/out_v are laid out as
+                    // [layer0_block0, layer1_block0, ..., layerN_block0, layer0_block1, ...].
+                    if (!recon_slots.empty()) {
+                        const int32_t n_blocks_returned = (int32_t) recon_k.size() / actual_group_size;
+                        if (n_blocks_returned * actual_group_size != (int32_t) recon_k.size() ||
+                            n_blocks_returned * cparams.kv_blocksvd_params.block_size != (int32_t) recon_slots.size()) {
+                            if (!kv_blocksvd_shadow_warned) {
+                                LLAMA_LOG_WARN("%s: Block SVD cross-layer output layout mismatch\n", __func__);
+                                kv_blocksvd_shadow_warned = true;
+                            }
+                            continue;
+                        }
+
+                        for (int32_t b = 0; b < n_blocks_returned; ++b) {
+                            std::vector<uint32_t> block_slots(
+                                recon_slots.begin() + b * cparams.kv_blocksvd_params.block_size,
+                                recon_slots.begin() + (b + 1) * cparams.kv_blocksvd_params.block_size);
+                            for (int32_t l = 0; l < actual_group_size; ++l) {
+                                const uint32_t il = group_layers[l];
+                                std::string write_error;
+                                if (!kv_mctx->replace_kv_rows_f32(
+                                            il, stream, block_slots,
+                                            recon_k[b * actual_group_size + l],
+                                            recon_v[b * actual_group_size + l],
+                                            &write_error)) {
+                                    if (!kv_blocksvd_shadow_warned) {
+                                        LLAMA_LOG_WARN("%s: Block SVD cross-layer cache write skipped: %s\n",
+                                                __func__, write_error.c_str());
+                                        kv_blocksvd_shadow_warned = true;
+                                    }
+                                    continue;
+                                }
+                                n_compressed_layers++;
+                            }
+                        }
+                        n_tokens_total = std::max(n_tokens_total, n_kv);
+                    }
+                }
+            }
+        }
+
+        if (n_compressed_layers > 0) {
+            LLAMA_LOG_INFO("%s: cross-layer %s n_tokens=%d layers=%d\n", __func__,
+                    backend ? "stored" : "reconstruct",
+                    n_tokens_total, n_compressed_layers);
+        }
+        return;
     }
+
+    // Per-layer Block SVD path.  Multi-stream support is left for future work;
+    // for now only process the first stream so existing single-stream behavior
+    // is preserved.
+    if (ubatch.n_seqs_unq > 1) {
+        if (!kv_blocksvd_shadow_warned) {
+            LLAMA_LOG_WARN("%s: per-layer Block SVD currently supports one KV stream only (got %u)\n",
+                    __func__, ubatch.n_seqs_unq);
+            kv_blocksvd_shadow_warned = true;
+        }
+        return;
+    }
+
+    const llama_kv_cache::slot_info & sinfo = kv_mctx->current_slot_info();
+    if (sinfo.empty()) {
+        return;
+    }
+    const uint32_t current_stream = sinfo.strm[0];
+    const std::vector<uint32_t> & current_slots = sinfo.idxs[0];
+    const int32_t n_kv_start = kv_mctx->current_slot_head();
 
     int32_t n_compressed_layers = 0;
     int32_t n_tokens_total = 0;
@@ -1574,7 +1794,7 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
         std::vector<float> k_dense;
         std::vector<float> v_dense;
         std::string extract_error;
-        if (!kv_mctx->copy_current_kv_chunk_f32(il, k_dense, v_dense, &extract_error)) {
+        if (!kv_mctx->copy_kv_chunk_f32_for_stream(il, 0, k_dense, v_dense, &extract_error)) {
             if (!kv_blocksvd_shadow_warned) {
                 LLAMA_LOG_WARN("%s: Block SVD shadow extraction skipped: %s\n", __func__, extract_error.c_str());
                 kv_blocksvd_shadow_warned = true;
@@ -3434,6 +3654,12 @@ void llama_context::opt_epoch_iter(
 
     memory->clear(true);
 
+#ifdef LLAMA_KV_BLOCKSVD
+    if (kv_blocksvd_shadow) {
+        llama_kv_blocksvd_clear(kv_blocksvd_shadow.get());
+    }
+#endif
+
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
@@ -3605,7 +3831,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_lowrank_sample_max_tokens=*/ 4096,
         /*.kv_lowrank_basis_path       =*/ nullptr,
         /*.kv_lowrank_samples_path     =*/ nullptr,
-        /*.kv_blocksvd_params          =*/ {64, 0, 8, false},
+        /*.kv_blocksvd_params          =*/ {64, 0, 8, false, false, 4, false, false},
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

@@ -141,8 +141,9 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
+    const  layer_reuse_cb & reuse,
+    const llama_kv_blocksvd_params & bctx_params) :
+    model(model), hparams(model.hparams), bctx_params(bctx_params), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -191,6 +192,32 @@ llama_kv_cache::llama_kv_cache(
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
     }
+
+#ifdef LLAMA_KV_BLOCKSVD
+    cell_state_vec.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_state_vec[s].assign(kv_size, llama_kv_cell_state::DENSE);
+    }
+
+    if (bctx_params.memory_reduction && bctx_params.backend) {
+        m_blocksvd_staging.capacity = bctx_params.block_size;
+        m_blocksvd_staging.cell_to_slot.resize(n_stream);
+        m_blocksvd_staging.slot_to_cell.resize(n_stream);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            m_blocksvd_staging.cell_to_slot[s].assign(kv_size, -1);
+            m_blocksvd_staging.slot_to_cell[s].assign(m_blocksvd_staging.capacity, -1);
+        }
+    }
+#endif
+
+    const uint32_t cache_size =
+#ifdef LLAMA_KV_BLOCKSVD
+        (bctx_params.memory_reduction && bctx_params.backend) ? bctx_params.block_size : kv_size;
+#else
+        kv_size;
+#endif
+
+    this->cache_size = cache_size;
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
@@ -258,8 +285,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, cache_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, cache_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -268,8 +295,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, cache_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, cache_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -382,6 +409,9 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+#ifdef LLAMA_KV_BLOCKSVD
+        cell_state_vec[s].assign(get_size(), llama_kv_cell_state::DENSE);
+#endif
     }
 
     if (data) {
@@ -390,6 +420,227 @@ void llama_kv_cache::clear(bool data) {
         }
     }
 }
+
+#ifdef LLAMA_KV_BLOCKSVD
+void llama_kv_cache::mark_compressed(uint32_t stream, const std::vector<uint32_t> & slots) {
+    if (stream >= n_stream) {
+        return;
+    }
+    auto & cs = cell_state_vec[stream];
+    for (uint32_t idx : slots) {
+        if (idx < cs.size()) {
+            cs[idx] = llama_kv_cell_state::COMPRESSED;
+        }
+    }
+}
+
+void llama_kv_cache::clear_compressed(uint32_t stream) {
+    if (stream == UINT32_MAX) {
+        for (auto & cs : cell_state_vec) {
+            std::fill(cs.begin(), cs.end(), llama_kv_cell_state::DENSE);
+        }
+    } else if (stream < n_stream) {
+        std::fill(cell_state_vec[stream].begin(), cell_state_vec[stream].end(), llama_kv_cell_state::DENSE);
+    }
+}
+
+bool llama_kv_cache::is_compressed(uint32_t stream, uint32_t idx) const {
+    return cell_state(stream, idx) == llama_kv_cell_state::COMPRESSED;
+}
+
+llama_kv_cache::llama_kv_cell_state llama_kv_cache::cell_state(uint32_t stream, uint32_t idx) const {
+    if (stream >= n_stream || idx >= cell_state_vec[stream].size()) {
+        return llama_kv_cell_state::DENSE;
+    }
+    return cell_state_vec[stream][idx];
+}
+
+bool llama_kv_cache::blocksvd_stage_cells(uint32_t stream, const std::vector<uint32_t> & slots) {
+    if (stream >= n_stream || !memory_reduction_enabled()) {
+        return true;
+    }
+
+    auto & c2s = m_blocksvd_staging.cell_to_slot[stream];
+    auto & s2c = m_blocksvd_staging.slot_to_cell[stream];
+
+    for (uint32_t idx : slots) {
+        if (idx >= c2s.size()) {
+            return false;
+        }
+        if (c2s[idx] >= 0) {
+            continue; // already staged
+        }
+
+        int32_t slot = -1;
+        for (uint32_t i = 0; i < s2c.size(); ++i) {
+            if (s2c[i] < 0) {
+                slot = (int32_t)i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            return false; // staging full
+        }
+
+        c2s[idx] = slot;
+        s2c[slot] = (int32_t)idx;
+
+        // If this cell was previously compressed, mark it dense again.
+        cell_state_vec[stream][idx] = llama_kv_cell_state::DENSE;
+    }
+    return true;
+}
+
+std::vector<uint32_t> llama_kv_cache::blocksvd_logical_to_staging(uint32_t stream, const std::vector<uint32_t> & logical) const {
+    std::vector<uint32_t> res;
+    res.reserve(logical.size());
+
+    if (stream >= n_stream || !memory_reduction_enabled()) {
+        res = logical;
+        return res;
+    }
+
+    const auto & c2s = m_blocksvd_staging.cell_to_slot[stream];
+    for (uint32_t idx : logical) {
+        GGML_ASSERT(idx < c2s.size() && c2s[idx] >= 0);
+        res.push_back((uint32_t)c2s[idx]);
+    }
+    return res;
+}
+
+void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
+    if (!bctx || !bctx->params.backend) {
+        return;
+    }
+
+    for (auto & chunk : bctx->xkv_chunks) {
+        if (chunk.materialized) {
+            continue;
+        }
+        if (chunk.stream >= n_stream) {
+            continue;
+        }
+
+        auto & cells = v_cells[chunk.stream];
+
+        // Re-occupy cells if they were freed (future-proofing).
+        for (size_t i = 0; i < chunk.slots.size(); ++i) {
+            const uint32_t idx = chunk.slots[i];
+            if (cells.is_empty(idx)) {
+                cells.pos_set(idx, chunk.pos[i]);
+                if (chunk.seq_id >= 0) {
+                    cells.seq_add(idx, chunk.seq_id);
+                }
+            }
+        }
+
+        std::vector<std::vector<float>> k_rows;
+        std::vector<std::vector<float>> v_rows;
+        std::string err;
+        if (!llama_kv_blocksvd_decompress_xkv_chunk(chunk, k_rows, v_rows, &err)) {
+            LLAMA_LOG_WARN("%s: materialize failed: %s\n", __func__, err.c_str());
+            continue;
+        }
+
+        for (int l = 0; l < chunk.group_size; ++l) {
+            const int32_t il = chunk.layer_start + l;
+            replace_kv_rows_f32(il, chunk.stream, chunk.slots, k_rows[l], v_rows[l], &err);
+        }
+
+        // Mark all cells in this chunk as having valid dense data again.
+        auto & cs = cell_state_vec[chunk.stream];
+        for (uint32_t idx : chunk.slots) {
+            if (idx < cs.size()) {
+                cs[idx] = llama_kv_cell_state::DENSE;
+            }
+        }
+
+        chunk.materialized = true;
+    }
+}
+
+void llama_kv_cache::blocksvd_release_dense_cells(llama_kv_blocksvd_context * bctx) {
+    if (!bctx || !bctx->params.backend) {
+        return;
+    }
+
+    for (auto & chunk : bctx->xkv_chunks) {
+        if (chunk.stream >= n_stream) {
+            continue;
+        }
+
+        auto & cs = cell_state_vec[chunk.stream];
+
+        // Only release cells that are currently dense and have a persisted chunk.
+        bool needs_release = false;
+        for (uint32_t idx : chunk.slots) {
+            if (idx < cs.size() && cs[idx] == llama_kv_cell_state::DENSE) {
+                needs_release = true;
+                break;
+            }
+        }
+        if (!needs_release) {
+            continue;
+        }
+
+        const int64_t d_k = hparams.n_embd_k_gqa(chunk.layer_start);
+        const size_t n_values = chunk.slots.size() * static_cast<size_t>(d_k);
+
+        std::vector<float> zeros(n_values, 0.0f);
+        std::string err;
+        for (int l = 0; l < chunk.group_size; ++l) {
+            const int32_t il = chunk.layer_start + l;
+            if (!replace_kv_rows_f32(il, chunk.stream, chunk.slots, zeros, zeros, &err)) {
+                LLAMA_LOG_WARN("%s: failed to zero dense rows for layer %d: %s\n", __func__, il, err.c_str());
+                break;
+            }
+        }
+
+        for (uint32_t idx : chunk.slots) {
+            if (idx < cs.size()) {
+                cs[idx] = llama_kv_cell_state::COMPRESSED;
+            }
+        }
+
+        // Mark chunk as not materialized so the next forward pass will reconstruct it.
+        chunk.materialized = false;
+    }
+}
+
+size_t llama_kv_cache::blocksvd_saved_bytes() const {
+    size_t cells_compressed = 0;
+    for (const auto & cs : cell_state_vec) {
+        for (auto s : cs) {
+            if (s == llama_kv_cell_state::COMPRESSED) {
+                ++cells_compressed;
+            }
+        }
+    }
+    if (cells_compressed == 0) {
+        return 0;
+    }
+
+    // Count layers that participate in the KV cache.
+    size_t n_kv_layers = 0;
+    for (const auto & layer : layers) {
+        if (layer.k != nullptr || layer.v != nullptr) {
+            ++n_kv_layers;
+        }
+    }
+
+    if (n_kv_layers == 0) {
+        return 0;
+    }
+
+    // Use the first KV layer as representative for per-cell size.
+    const auto & first = layers.front();
+    const size_t bytes_per_cell = n_kv_layers * (
+        ggml_row_size(first.k->type, hparams.n_embd_k_gqa(first.il)) +
+        ggml_row_size(first.v->type, hparams.n_embd_v_gqa(first.il)));
+
+    return cells_compressed * bytes_per_cell;
+}
+#endif
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -793,6 +1044,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     bool updated = false;
 
+#ifdef LLAMA_KV_BLOCKSVD
+    blocksvd_materialize(lctx->get_kv_blocksvd());
+#endif
+
     auto * sched = lctx->get_sched();
 
     if (!sc_info.empty()) {
@@ -1108,6 +1363,17 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
         }
+
+#ifdef LLAMA_KV_BLOCKSVD
+        if (memory_reduction_enabled()) {
+            const uint32_t stream = sinfo.strm[s];
+            std::string err;
+            if (!blocksvd_stage_cells(stream, sinfo.idxs[s])) {
+                // Should not happen if flush runs before a block is full.
+                LLAMA_LOG_WARN("%s: failed to stage cells for stream %d\n", __func__, stream);
+            }
+        }
+#endif
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -1198,19 +1464,23 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t phys_size    = cache_size;
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // In memory-reduction mode the persistent tensor is only a staging buffer.
+    // The attention graph will reconstruct the full n_kv tensor via a custom op.
+    const uint32_t n_view = (memory_reduction_enabled() ? cache_size : n_kv);
+
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_view, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*phys_size),
+            ggml_row_size(k->type, n_embd_k_gqa*phys_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1218,7 +1488,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t phys_size    = cache_size;
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE]
@@ -1226,23 +1496,26 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // In memory-reduction mode the persistent tensor is only a staging buffer.
+    const uint32_t n_view = (memory_reduction_enabled() ? cache_size : n_kv);
+
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_view, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*phys_size),         // v->nb[3]
+                ggml_row_size(v->type, n_embd_v_gqa*phys_size)*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
-            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
-            ggml_row_size(v->type, kv_size),                        // v->nb[2]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            n_view, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
+            ggml_row_size(v->type, phys_size*hparams.n_embd_head_v(il)),  // v->nb[1]
+            ggml_row_size(v->type, phys_size),                        // v->nb[2]
+            ggml_row_size(v->type, phys_size*n_embd_v_gqa),           // v->nb[3]
+            ggml_row_size(v->type, phys_size*n_embd_v_gqa)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1573,11 +1846,22 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+#ifdef LLAMA_KV_BLOCKSVD
+    const bool use_staging = memory_reduction_enabled();
+#else
+    const bool use_staging = false;
+#endif
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        const uint32_t stream = sinfo.strm[s];
+        const int64_t offs = stream*(int64_t)cache_size;
+
+        std::vector<uint32_t> phys = use_staging
+            ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
+            : sinfo.idxs[s];
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[s*sinfo.size() + i] = offs + phys[i];
         }
     }
 }
@@ -1589,26 +1873,42 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+#ifdef LLAMA_KV_BLOCKSVD
+    const bool use_staging = memory_reduction_enabled();
+#else
+    const bool use_staging = false;
+#endif
+
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const uint32_t stream = sinfo.strm[s];
+            const int64_t offs = stream*(int64_t)cache_size;
+
+            std::vector<uint32_t> phys = use_staging
+                ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
+                : sinfo.idxs[s];
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                data[s*sinfo.size() + i] = offs + phys[i];
             }
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = get_size();
+        const int64_t phys_kv_size = cache_size;
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
+            const uint32_t stream = sinfo.strm[s];
+            const int64_t offs = stream*phys_kv_size*n_embd_v_gqa;
+
+            std::vector<uint32_t> phys = use_staging
+                ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
+                : sinfo.idxs[s];
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*phys_kv_size + phys[i];
                 }
             }
         }
@@ -2708,6 +3008,35 @@ bool llama_kv_cache_context::copy_current_slot_indices(
     out_stream = sinfo.strm[0];
     out_slots = sinfo.idxs[0];
     return true;
+}
+
+bool llama_kv_cache_context::copy_kv_chunk_f32_for_stream(
+        int32_t il,
+        uint32_t stream_idx,
+        std::vector<float> & out_k,
+        std::vector<float> & out_v,
+        std::string * err) const {
+    auto fail = [err](std::string msg) {
+        if (err) {
+            *err = std::move(msg);
+        }
+        return false;
+    };
+
+    const llama_kv_cache::slot_info & sinfo = sinfos[i_cur];
+    if (sinfo.empty()) {
+        return fail("stream copy requires a non-empty KV slot");
+    }
+    if (stream_idx >= sinfo.n_stream()) {
+        return fail("stream index out of range");
+    }
+
+    llama_kv_cache::slot_info sinfo_stream;
+    sinfo_stream.resize(1);
+    sinfo_stream.strm[0] = sinfo.strm[stream_idx];
+    sinfo_stream.idxs[0] = sinfo.idxs[stream_idx];
+
+    return kv->copy_current_kv_chunk_f32(il, sinfo_stream, out_k, out_v, err);
 }
 
 bool llama_kv_cache_context::replace_kv_rows_f32(

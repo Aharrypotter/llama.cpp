@@ -256,9 +256,13 @@ private:
 
     void kv_lowrank_shadow_project_current(const llama_memory_context_i * mctx);
 
+public:
 #ifdef LLAMA_KV_BLOCKSVD
     void kv_blocksvd_shadow_compress_current(const llama_memory_context_i * mctx);
+    llama_kv_blocksvd_context * get_kv_blocksvd() const { return kv_blocksvd_shadow.get(); }
 #endif
+
+private:
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

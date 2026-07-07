@@ -5,7 +5,12 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#ifdef LLAMA_KV_BLOCKSVD
+#include "llama-kv-blocksvd.h"
+#endif
+
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -107,7 +112,8 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        const llama_kv_blocksvd_params & bctx_params = {});
 
     ~llama_kv_cache() = default;
 
@@ -185,6 +191,29 @@ public:
             const std::vector<float> & v_rows,
             std::string * err = nullptr) const;
 
+#ifdef LLAMA_KV_BLOCKSVD
+    // Per-cell state for the Block SVD backend.
+    enum class llama_kv_cell_state : uint8_t {
+        DENSE,      // cell has valid dense K/V in the cache tensor
+        COMPRESSED, // dense K/V has been released; only the xKV chunk holds data
+    };
+
+    // Mark/unmark compressed slots (used by Block SVD backend).
+    void mark_compressed(uint32_t stream, const std::vector<uint32_t> & slots);
+    void clear_compressed(uint32_t stream = UINT32_MAX);
+    bool is_compressed(uint32_t stream, uint32_t idx) const;
+    llama_kv_cell_state cell_state(uint32_t stream, uint32_t idx) const;
+
+    // Report the theoretical number of dense K/V bytes currently stored only as xKV chunks.
+    size_t blocksvd_saved_bytes() const;
+
+    // Release dense rows for cells that are backed by persisted xKV chunks.
+    // This is a bookkeeping step: the dense tensor memory is still allocated,
+    // but the cells are marked COMPRESSED so future memory-reduction passes
+    // know they can be reclaimed.
+    void blocksvd_release_dense_cells(llama_kv_blocksvd_context * bctx);
+#endif
+
     //
     // preparation API
     //
@@ -228,6 +257,9 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // Block SVD params (kept for memory-reduction decisions); empty when not compiled in.
+    const llama_kv_blocksvd_params bctx_params;
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
@@ -241,6 +273,9 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // physical size of the dense K/V tensors (<= kv_size; smaller in memory-reduction mode)
+    uint32_t cache_size = 0;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -277,6 +312,34 @@ private:
     std::vector<uint32_t> v_heads;
 
     std::vector<llama_kv_cells> v_cells;
+
+#ifdef LLAMA_KV_BLOCKSVD
+public:
+    // Per-stream staging buffer that holds only the current incomplete block.
+    using blocksvd_staging_t = llama_kv_blocksvd_staging_t;
+
+    bool memory_reduction_enabled() const { return bctx_params.memory_reduction && bctx_params.backend; }
+    const blocksvd_staging_t & get_blocksvd_staging() const { return m_blocksvd_staging; }
+
+private:
+    // Per-cell state for the Block SVD backend.
+    std::vector<std::vector<llama_kv_cell_state>> cell_state_vec;
+
+    // Staging buffer metadata for memory-reduction mode.
+    blocksvd_staging_t m_blocksvd_staging;
+
+    // Reconstruct persisted xKV chunks back into the dense cache before attention.
+    void blocksvd_materialize(llama_kv_blocksvd_context * bctx);
+
+    // Map newly assigned logical cells into staging slots.
+    bool blocksvd_stage_cells(uint32_t stream, const std::vector<uint32_t> & slots);
+
+    // Translate logical cell indices to their current staging slots.
+    std::vector<uint32_t> blocksvd_logical_to_staging(uint32_t stream, const std::vector<uint32_t> & logical) const;
+
+    // Compress the current staging block(s) and release their slots.
+    bool blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, std::string * err = nullptr);
+#endif
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
@@ -393,6 +456,15 @@ public:
 
     bool copy_current_slot_indices(std::vector<uint32_t> & out_slots, uint32_t & out_stream, std::string * err = nullptr) const;
 
+    bool copy_kv_chunk_f32_for_stream(
+            int32_t il,
+            uint32_t stream_idx,
+            std::vector<float> & out_k,
+            std::vector<float> & out_v,
+            std::string * err = nullptr) const;
+
+    const llama_kv_cache::slot_info & current_slot_info() const { return sinfos[i_cur]; }
+
     bool replace_kv_rows_f32(
             int32_t il,
             uint32_t stream,
@@ -400,6 +472,12 @@ public:
             const std::vector<float> & k_rows,
             const std::vector<float> & v_rows,
             std::string * err = nullptr) const;
+
+#ifdef LLAMA_KV_BLOCKSVD
+    void mark_compressed(uint32_t stream, const std::vector<uint32_t> & slots) const {
+        kv->mark_compressed(stream, slots);
+    }
+#endif
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

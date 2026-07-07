@@ -38,7 +38,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const llama_kv_blocksvd_params & bctx_params = {});
 
     ~llama_memory_hybrid() = default;
 

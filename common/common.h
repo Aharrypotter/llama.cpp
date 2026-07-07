@@ -573,7 +573,7 @@ struct common_params {
 
     bool kv_blocksvd_enabled = false;
     // rank=0 means disabled; kv_blocksvd_enabled is the master switch
-    struct llama_kv_blocksvd_params kv_blocksvd_params = {64, 0, 8, false};
+    struct llama_kv_blocksvd_params kv_blocksvd_params = {64, 0, 8, false, false, 4, false, false};
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

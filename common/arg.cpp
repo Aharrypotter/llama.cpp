@@ -2181,6 +2181,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCKSVD_RECONSTRUCT"));
     add_opt(common_arg(
+        {"--kv-blocksvd-cross-layer"},
+        "enable xKV-style cross-layer SVD (shadow measurement unless --kv-blocksvd-backend is also set)",
+        [](common_params & params) {
+            params.kv_blocksvd_enabled = true;
+            params.kv_blocksvd_params.cross_layer = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_CROSS_LAYER"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-backend"},
+        "use xKV compressed blocks as the real KV-cache backend (materializes before attention)",
+        [](common_params & params) {
+            params.kv_blocksvd_enabled = true;
+            params.kv_blocksvd_params.backend = true;
+            params.kv_blocksvd_params.cross_layer = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_BACKEND"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-memory-reduction"},
+        "eliminate the persistent dense KV cache for compressed xKV cells (CPU-only in first milestone)",
+        [](common_params & params) {
+            params.kv_blocksvd_enabled = true;
+            params.kv_blocksvd_params.backend = true;
+            params.kv_blocksvd_params.cross_layer = true;
+            params.kv_blocksvd_params.memory_reduction = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_MEMORY_REDUCTION"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-layer-group-size"}, "N",
+        string_format("number of consecutive layers per cross-layer SVD group (default: %d)", params.kv_blocksvd_params.layer_group_size),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::runtime_error("--kv-blocksvd-layer-group-size must be > 0");
+            }
+            params.kv_blocksvd_params.layer_group_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_LAYER_GROUP_SIZE"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

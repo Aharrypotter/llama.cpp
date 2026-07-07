@@ -1527,7 +1527,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_lowrank_reconstruct_cache = params.kv_lowrank_reconstruct_cache;
 
     if (params.kv_blocksvd_enabled) {
-        cparams.kv_blocksvd_params = params.kv_blocksvd_params;
+        // Backward compatibility: cross-layer shadow measurement still defaults to
+        // reconstruct mode unless the user explicitly asks for the real backend.
+        auto blocksvd_params = params.kv_blocksvd_params;
+        if (blocksvd_params.cross_layer && !blocksvd_params.backend) {
+            blocksvd_params.reconstruct = true;
+        }
+        cparams.kv_blocksvd_params = blocksvd_params;
     }
 
     cparams.type_k = params.cache_type_k;

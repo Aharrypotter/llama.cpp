@@ -191,6 +191,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    if (LLAMA_KV_BLOCKSVD)
+        llama_build_and_test(test-kv-blocksvd.cpp)
+        target_include_directories(test-kv-blocksvd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test-kv-blocksvd PRIVATE LLAMA_KV_BLOCKSVD)
+    endif()
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
