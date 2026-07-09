@@ -1262,6 +1262,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+#ifdef LLAMA_KV_BLOCKSVD
+    // In memory-reduction mode, materialize compressed chunks back into staging
+    // before the attention graph is built.
+    if (cparams.kv_blocksvd_params.backend && cparams.kv_blocksvd_params.memory_reduction) {
+        auto * kv = dynamic_cast<llama_kv_cache *>(get_memory());
+        if (kv) {
+            kv->blocksvd_materialize(kv_blocksvd_shadow.get());
+        }
+    }
+#endif
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1760,6 +1771,15 @@ void llama_context::kv_blocksvd_shadow_compress_current(const llama_memory_conte
             LLAMA_LOG_INFO("%s: cross-layer %s n_tokens=%d layers=%d\n", __func__,
                     backend ? "stored" : "reconstruct",
                     n_tokens_total, n_compressed_layers);
+
+            // In memory-reduction mode, release staging slots for compressed cells.
+            if (backend && cparams.kv_blocksvd_params.memory_reduction) {
+                auto * kv = dynamic_cast<llama_kv_cache *>(get_memory());
+                if (kv) {
+                    std::string flush_err;
+                    kv->blocksvd_flush_staging(kv_blocksvd_shadow.get(), &flush_err);
+                }
+            }
         }
         return;
     }

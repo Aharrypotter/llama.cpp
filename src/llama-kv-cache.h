@@ -155,6 +155,7 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_phys_size() const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -212,6 +213,13 @@ public:
     // but the cells are marked COMPRESSED so future memory-reduction passes
     // know they can be reclaimed.
     void blocksvd_release_dense_cells(llama_kv_blocksvd_context * bctx);
+
+    // Release staging slots for cells marked COMPRESSED, making them available
+    // for future token writes or materialize operations.
+    bool blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, std::string * err = nullptr);
+
+    // Reconstruct persisted xKV chunks back into the dense/staging cache before attention.
+    void blocksvd_materialize(llama_kv_blocksvd_context * bctx);
 #endif
 
     //
@@ -328,17 +336,11 @@ private:
     // Staging buffer metadata for memory-reduction mode.
     blocksvd_staging_t m_blocksvd_staging;
 
-    // Reconstruct persisted xKV chunks back into the dense cache before attention.
-    void blocksvd_materialize(llama_kv_blocksvd_context * bctx);
-
     // Map newly assigned logical cells into staging slots.
     bool blocksvd_stage_cells(uint32_t stream, const std::vector<uint32_t> & slots);
 
     // Translate logical cell indices to their current staging slots.
     std::vector<uint32_t> blocksvd_logical_to_staging(uint32_t stream, const std::vector<uint32_t> & logical) const;
-
-    // Compress the current staging block(s) and release their slots.
-    bool blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, std::string * err = nullptr);
 #endif
 
     // maps from a sequence id to a stream id

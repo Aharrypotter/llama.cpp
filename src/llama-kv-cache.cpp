@@ -146,6 +146,16 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(model.hparams), bctx_params(bctx_params), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
+#ifdef LLAMA_KV_BLOCKSVD
+    // Chunked attention reads K/V tensors as float* directly, so force F32.
+    // Also disable V transposition since the compute function assumes non-transposed layout.
+    if (bctx_params.memory_reduction && bctx_params.backend) {
+        type_k = GGML_TYPE_F32;
+        type_v = GGML_TYPE_F32;
+        this->v_trans = false;
+    }
+#endif
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -200,7 +210,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     if (bctx_params.memory_reduction && bctx_params.backend) {
-        m_blocksvd_staging.capacity = bctx_params.block_size;
+        m_blocksvd_staging.capacity = kv_size;
         m_blocksvd_staging.cell_to_slot.resize(n_stream);
         m_blocksvd_staging.slot_to_cell.resize(n_stream);
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -212,7 +222,9 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t cache_size =
 #ifdef LLAMA_KV_BLOCKSVD
-        (bctx_params.memory_reduction && bctx_params.backend) ? bctx_params.block_size : kv_size;
+        // memory_reduction enables the flush/compress/materialize cycle but currently
+        // uses full kv_size for tensors. Reducing to block_size requires chunked attention.
+        kv_size;
 #else
         kv_size;
 #endif
@@ -502,8 +514,12 @@ std::vector<uint32_t> llama_kv_cache::blocksvd_logical_to_staging(uint32_t strea
 
     const auto & c2s = m_blocksvd_staging.cell_to_slot[stream];
     for (uint32_t idx : logical) {
-        GGML_ASSERT(idx < c2s.size() && c2s[idx] >= 0);
-        res.push_back((uint32_t)c2s[idx]);
+        if (idx < c2s.size() && c2s[idx] >= 0) {
+            res.push_back((uint32_t)c2s[idx]);
+        } else {
+            // Cell not staged yet (e.g. during graph reservation) — use slot 0 as placeholder.
+            res.push_back(0);
+        }
     }
     return res;
 }
@@ -534,6 +550,15 @@ void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
             }
         }
 
+        // In memory-reduction mode, allocate staging slots for this chunk before writing.
+        if (memory_reduction_enabled()) {
+            if (!blocksvd_stage_cells(chunk.stream, chunk.slots)) {
+                LLAMA_LOG_WARN("%s: staging full, cannot materialize chunk (layer %d)\n",
+                        __func__, chunk.layer_start);
+                continue;
+            }
+        }
+
         std::vector<std::vector<float>> k_rows;
         std::vector<std::vector<float>> v_rows;
         std::string err;
@@ -542,9 +567,14 @@ void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
             continue;
         }
 
+        // In memory-reduction mode, write to physical staging slots.
+        const std::vector<uint32_t> & write_slots = memory_reduction_enabled()
+            ? blocksvd_logical_to_staging(chunk.stream, chunk.slots)
+            : chunk.slots;
+
         for (int l = 0; l < chunk.group_size; ++l) {
             const int32_t il = chunk.layer_start + l;
-            replace_kv_rows_f32(il, chunk.stream, chunk.slots, k_rows[l], v_rows[l], &err);
+            replace_kv_rows_f32(il, chunk.stream, write_slots, k_rows[l], v_rows[l], &err);
         }
 
         // Mark all cells in this chunk as having valid dense data again.
@@ -605,6 +635,40 @@ void llama_kv_cache::blocksvd_release_dense_cells(llama_kv_blocksvd_context * bc
         // Mark chunk as not materialized so the next forward pass will reconstruct it.
         chunk.materialized = false;
     }
+}
+
+bool llama_kv_cache::blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, std::string * /*err*/) {
+    if (!bctx || !memory_reduction_enabled()) {
+        return true;
+    }
+
+    uint32_t n_released = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & c2s = m_blocksvd_staging.cell_to_slot[s];
+        auto & s2c = m_blocksvd_staging.slot_to_cell[s];
+        auto & cs  = cell_state_vec[s];
+
+        for (uint32_t cell = 0; cell < (uint32_t)c2s.size(); ++cell) {
+            if (c2s[cell] < 0) {
+                continue;
+            }
+            if (cell >= cs.size() || cs[cell] != llama_kv_cell_state::COMPRESSED) {
+                continue;
+            }
+
+            const int32_t slot = c2s[cell];
+            s2c[slot] = -1;
+            c2s[cell] = -1;
+            ++n_released;
+        }
+    }
+
+    if (n_released > 0) {
+        LLAMA_LOG_DEBUG("%s: released %u staging slots\n", __func__, n_released);
+    }
+
+    return true;
 }
 
 size_t llama_kv_cache::blocksvd_saved_bytes() const {
@@ -1045,7 +1109,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     bool updated = false;
 
 #ifdef LLAMA_KV_BLOCKSVD
-    blocksvd_materialize(lctx->get_kv_blocksvd());
+    if (!memory_reduction_enabled()) {
+        blocksvd_materialize(lctx->get_kv_blocksvd());
+    }
 #endif
 
     auto * sched = lctx->get_sched();
@@ -1421,6 +1487,10 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_phys_size() const {
+    return cache_size;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1450,13 +1520,16 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
+    // In memory-reduction mode, attention sees at most cache_size rows.
+    const uint32_t max_kv = memory_reduction_enabled() ? cache_size : UINT32_MAX;
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
-    return result;
+    return std::min(result, max_kv);
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1540,13 +1613,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
+        const int64_t phys_size = cache_size;
 
         assert(n_embd_gqa == k->ne[0]);
-        assert(kv_size    == k->ne[1]);
+        assert(phys_size  == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, phys_size*n_stream);
     }
 
     // store the current K values into the cache
@@ -1576,13 +1649,13 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
-            const int64_t kv_size = get_size();
+            const int64_t phys_size = cache_size;
 
             assert(n_embd_gqa == v->ne[0]);
-            assert(kv_size    == v->ne[1]);
+            assert(phys_size  == v->ne[1]);
 
             // merge the buffer across all streams because the idxs are global
-            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+            v = ggml_reshape_2d(ctx, v, n_embd_gqa, phys_size*n_stream);
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
@@ -1653,7 +1726,7 @@ bool llama_kv_cache::copy_current_kv_chunk_f32(
     out_v.assign(static_cast<size_t>(n_tokens) * static_cast<size_t>(d_v), 0.0f);
 
     const uint32_t stream = sinfo.strm[0];
-    const uint64_t kv_size = get_size();
+    const uint64_t kv_size = cache_size;  // physical tensor row count
 
     const size_t row_bytes_k = ggml_row_size(k->type, d_k);
     std::vector<uint8_t> row_k(row_bytes_k);
@@ -1734,7 +1807,7 @@ bool llama_kv_cache::replace_kv_rows_f32(
         return fail("WHLR-KV reconstruct-cache write row data size does not match slot count");
     }
 
-    const uint64_t kv_size = get_size();
+    const uint64_t kv_size = cache_size;  // physical tensor row count
     const size_t row_bytes_k = ggml_row_size(k->type, d_k);
     const size_t row_bytes_v = ggml_row_size(v->type, d_v);
     std::vector<uint8_t> row_k(row_bytes_k);
@@ -1922,9 +1995,10 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
+        const uint32_t n = std::min(cells.size(), cache_size);
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        for (uint32_t i = 0; i < n; ++i) {
+            data[s*n + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
 }
@@ -2317,7 +2391,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) cache_size*n_stream);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
@@ -2874,7 +2948,8 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    // For graph reservation, n_kv must match the physical tensor dimension.
+    n_kv = kv->memory_reduction_enabled() ? kv->get_phys_size() : kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
 
