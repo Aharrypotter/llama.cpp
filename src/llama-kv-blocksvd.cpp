@@ -1212,3 +1212,181 @@ void llama_kv_blocksvd_clear(llama_kv_blocksvd_context * ctx) {
     ctx->xkv_chunks.clear();
     ctx->layers.clear();
 }
+
+// --- Chunked Attention Compute ---
+
+#include "ggml.h"
+#include <cmath>
+#include <cstring>
+
+void llama_chunked_attn_compute(
+        struct ggml_tensor * dst,
+        int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    GGML_UNUSED(nth);
+
+    const struct ggml_tensor * a = dst->src[0]; // Q
+    const struct ggml_tensor * b = dst->src[1]; // K (staged)
+    const struct ggml_tensor * c = dst->src[2]; // V (staged)
+
+    auto * p = (llama_chunked_attn_params *) userdata;
+    const auto * bctx    = p->bctx;
+    const auto * staging = p->staging;
+    const int32_t il         = p->il;
+    const int32_t n_head_kv  = p->n_head_kv;
+    const int32_t n_head_q   = p->n_head_q;
+    const int32_t head_dim_k = p->head_dim_k;
+    const int32_t head_dim_v = p->head_dim_v;
+    const float scale        = p->scale;
+    const uint32_t n_stream  = p->n_stream;
+    const uint32_t cache_size = p->cache_size;
+
+    const int32_t n_tokens = (int32_t) a->ne[2];
+    const int32_t d_k = n_head_kv * head_dim_k;
+    const int32_t d_v = n_head_kv * head_dim_v;
+
+    const int32_t n_rep = n_head_q / n_head_kv;
+
+    float * out = (float *) dst->data;
+    const size_t out_size = (size_t) head_dim_v * n_head_q * n_tokens;
+    memset(out, 0, out_size * sizeof(float));
+
+    const bool has_causal = !p->q_pos.empty();
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        // Collect and pre-decompress chunks relevant to this layer and stream
+        struct decompressed_chunk {
+            const float * k_data;
+            const float * v_data;
+            int32_t n_tokens;
+            std::vector<llama_pos> pos;
+        };
+        std::vector<decompressed_chunk> chunks;
+        std::vector<std::vector<std::vector<float>>> chunk_storage;
+
+        for (size_t ci = 0; ci < bctx->xkv_chunks.size(); ++ci) {
+            const auto & chunk = bctx->xkv_chunks[ci];
+            if (chunk.stream != s) continue;
+            if (il < chunk.layer_start || il >= chunk.layer_start + chunk.group_size) continue;
+
+            const int32_t local_layer = il - chunk.layer_start;
+
+            std::vector<std::vector<float>> k_rows, v_rows;
+            std::string err;
+            if (!llama_kv_blocksvd_decompress_xkv_chunk(chunk, k_rows, v_rows, &err)) {
+                continue;
+            }
+
+            decompressed_chunk dc;
+            dc.k_data   = k_rows[local_layer].data();
+            dc.v_data   = v_rows[local_layer].data();
+            dc.n_tokens = (int32_t) chunk.slots.size();
+            dc.pos      = chunk.pos;
+
+            // Move storage to keep data alive
+            chunk_storage.push_back(std::move(k_rows));
+            chunk_storage.push_back(std::move(v_rows));
+            // Fix up pointers after move
+            dc.k_data = chunk_storage[chunk_storage.size() - 2][local_layer].data();
+            dc.v_data = chunk_storage[chunk_storage.size() - 1][local_layer].data();
+
+            chunks.push_back(std::move(dc));
+        }
+
+        for (int32_t hq = 0; hq < n_head_q; ++hq) {
+            const int32_t hkv = hq / n_rep;
+
+            for (int32_t tq = 0; tq < n_tokens; ++tq) {
+                const float * q_vec = (const float *)((const char *)a->data +
+                    tq * a->nb[2] + hq * a->nb[1]);
+
+                const llama_pos q_position = has_causal ? p->q_pos[tq] : INT32_MAX;
+
+                float M_acc = -INFINITY;
+                float S_acc = 0.0f;
+                float VKQ_acc[256];
+                GGML_ASSERT(head_dim_v <= 256);
+                memset(VKQ_acc, 0, (size_t)head_dim_v * sizeof(float));
+
+                // --- Part 1: Active window (staged cells) ---
+                {
+                    const auto & s2c = staging->slot_to_cell[s];
+                    for (uint32_t slot = 0; slot < cache_size; ++slot) {
+                        if (s2c[slot] < 0) continue;
+
+                        if (has_causal && (size_t)slot < p->slot_pos.size() &&
+                            p->slot_pos[slot] > q_position) {
+                            continue;
+                        }
+
+                        const float * k_vec = (const float *)((const char *)b->data +
+                            s * b->nb[3] + slot * b->nb[2] + hkv * b->nb[1]);
+
+                        float dot = 0.0f;
+                        for (int32_t d = 0; d < head_dim_k; ++d) {
+                            dot += q_vec[d] * k_vec[d];
+                        }
+                        dot *= scale;
+
+                        const float * v_vec = (const float *)((const char *)c->data +
+                            s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1]);
+
+                        float M_new = std::max(M_acc, dot);
+                        float exp_old = expf(M_acc - M_new);
+                        float exp_new = expf(dot - M_new);
+                        float S_new = S_acc * exp_old + exp_new;
+
+                        for (int32_t d = 0; d < head_dim_v; ++d) {
+                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_vec[d] * exp_new;
+                        }
+                        M_acc = M_new;
+                        S_acc = S_new;
+                    }
+                }
+
+                // --- Part 2: Compressed chunks (pre-decompressed) ---
+                for (const auto & dc : chunks) {
+                    for (int32_t tc = 0; tc < dc.n_tokens; ++tc) {
+                        if (has_causal && !dc.pos.empty() &&
+                            dc.pos[tc] > q_position) {
+                            continue;
+                        }
+
+                        const float * k_vec = dc.k_data + (size_t)tc * d_k + (size_t)hkv * head_dim_k;
+
+                        float dot = 0.0f;
+                        for (int32_t d = 0; d < head_dim_k; ++d) {
+                            dot += q_vec[d] * k_vec[d];
+                        }
+                        dot *= scale;
+
+                        const float * v_vec = dc.v_data + (size_t)tc * d_v + (size_t)hkv * head_dim_v;
+
+                        float M_new = std::max(M_acc, dot);
+                        float exp_old = expf(M_acc - M_new);
+                        float exp_new = expf(dot - M_new);
+                        float S_new = S_acc * exp_old + exp_new;
+
+                        for (int32_t d = 0; d < head_dim_v; ++d) {
+                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_vec[d] * exp_new;
+                        }
+                        M_acc = M_new;
+                        S_acc = S_new;
+                    }
+                }
+
+                // --- Normalize ---
+                float * dst_vec = out + (size_t)tq * n_head_q * head_dim_v +
+                                        (size_t)hq * head_dim_v;
+                if (S_acc > 0.0f) {
+                    const float inv_s = 1.0f / S_acc;
+                    for (int32_t d = 0; d < head_dim_v; ++d) {
+                        dst_vec[d] = VKQ_acc[d] * inv_s;
+                    }
+                }
+            }
+        }
+    }
+}

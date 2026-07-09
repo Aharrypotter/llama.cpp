@@ -329,6 +329,9 @@ public:
     bool memory_reduction_enabled() const { return bctx_params.memory_reduction && bctx_params.backend; }
     const blocksvd_staging_t & get_blocksvd_staging() const { return m_blocksvd_staging; }
 
+    bool cell_is_empty(uint32_t stream, uint32_t cell) const { return v_cells[stream].is_empty(cell); }
+    llama_pos cell_pos_get(uint32_t stream, uint32_t cell) const { return v_cells[stream].pos_get(cell); }
+
 private:
     // Per-cell state for the Block SVD backend.
     std::vector<std::vector<llama_kv_cell_state>> cell_state_vec;
@@ -479,6 +482,14 @@ public:
     void mark_compressed(uint32_t stream, const std::vector<uint32_t> & slots) const {
         kv->mark_compressed(stream, slots);
     }
+
+    bool is_memory_reduction_enabled() const { return kv->memory_reduction_enabled(); }
+    const llama_kv_blocksvd_staging_t * get_staging() const { return &kv->get_blocksvd_staging(); }
+    uint32_t get_cache_size() const { return kv->get_phys_size(); }
+    uint32_t get_n_stream() const { return kv->get_n_stream(); }
+    const llama_kv_blocksvd_context * get_blocksvd_ctx() const;
+
+    std::vector<llama_pos> get_slot_positions(uint32_t stream) const;
 #endif
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache

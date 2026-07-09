@@ -7,6 +7,9 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#ifdef LLAMA_KV_BLOCKSVD
+#include "llama-kv-blocksvd.h"
+#endif
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -524,7 +527,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // When chunked attention replaces all standard attention ops, the mask tensor
+    // is unused and the allocator skips it — don't try to fill a null buffer.
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -553,7 +560,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -2296,6 +2305,65 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     llama_kv_lowrank_observe_attn_shapes(cparams, hparams, mctx_cur, q_cur, k_cur, v_cur, k, v, il, n_tokens);
+
+#ifdef LLAMA_KV_BLOCKSVD
+    if (mctx_cur->is_memory_reduction_enabled()) {
+        const auto * bctx = mctx_cur->get_blocksvd_ctx();
+        if (bctx && !bctx->xkv_chunks.empty()) {
+            // Chunked attention: use custom op that iterates compressed chunks
+            auto params = std::make_unique<llama_chunked_attn_params>();
+            params->bctx       = bctx;
+            params->staging    = mctx_cur->get_staging();
+            params->il         = il;
+            params->n_kv       = mctx_cur->get_n_kv();
+            params->n_head_kv  = (int32_t) hparams.n_head_kv(il);
+            params->n_head_q   = (int32_t) hparams.n_head(il);
+            params->head_dim_k = (int32_t) hparams.n_embd_head_k(il);
+            params->head_dim_v = (int32_t) hparams.n_embd_head_v(il);
+            params->scale      = kq_scale;
+            params->n_stream   = mctx_cur->get_n_stream();
+            params->cache_size = mctx_cur->get_cache_size();
+
+            // Causal masking: populate positions for query tokens and staging slots
+            if (n_tokens > 1) {
+                params->q_pos.resize(n_tokens);
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    params->q_pos[i] = ubatch.pos[i];
+                }
+                params->slot_pos = mctx_cur->get_slot_positions(0);
+            }
+
+            void * udata = params.get();
+            res->chunked_attn_params.push_back(std::move(params));
+
+            // Output: [head_dim_v * n_head_q, n_tokens]
+            const int64_t out_dim = hparams.n_embd_head_v(il) * hparams.n_head(il);
+
+            ggml_tensor * args[3] = { q, k, v };
+            ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                out_dim, n_tokens, 1, 1,
+                args, 3, llama_chunked_attn_compute, 1, udata);
+            ggml_set_name(cur, "chunked_attn");
+            cb(cur, "kqv_out", il);
+
+            cur = ggml_reshape_2d(ctx0, cur, out_dim, n_tokens);
+
+            if (inp->self_v_rot) {
+                cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+            }
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+
+            return cur;
+        }
+    }
+#endif
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

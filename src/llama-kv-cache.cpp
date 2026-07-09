@@ -3030,6 +3030,25 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+#ifdef LLAMA_KV_BLOCKSVD
+const llama_kv_blocksvd_context * llama_kv_cache_context::get_blocksvd_ctx() const {
+    return lctx ? lctx->get_kv_blocksvd() : nullptr;
+}
+
+std::vector<llama_pos> llama_kv_cache_context::get_slot_positions(uint32_t stream) const {
+    const auto & staging = kv->get_blocksvd_staging();
+    const uint32_t cs = kv->get_phys_size();
+    std::vector<llama_pos> result(cs, -1);
+    for (uint32_t slot = 0; slot < cs; ++slot) {
+        int32_t cell = staging.slot_to_cell[stream][slot];
+        if (cell >= 0 && !kv->cell_is_empty(stream, (uint32_t)cell)) {
+            result[slot] = kv->cell_pos_get(stream, (uint32_t)cell);
+        }
+    }
+    return result;
+}
+#endif
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }

@@ -13,6 +13,10 @@
 #include <map>
 
 struct ggml_cgraph;
+
+#ifdef LLAMA_KV_BLOCKSVD
+struct llama_chunked_attn_params;
+#endif
 struct ggml_context;
 struct ggml_tensor;
 
@@ -684,6 +688,11 @@ public:
 
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
+
+#ifdef LLAMA_KV_BLOCKSVD
+    // Persistent storage for chunked attention custom op params (lives as long as the graph).
+    std::vector<std::unique_ptr<llama_chunked_attn_params>> chunked_attn_params;
+#endif
 
     ggml_cgraph * gf;
 

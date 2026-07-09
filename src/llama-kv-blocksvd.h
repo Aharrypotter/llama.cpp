@@ -254,3 +254,33 @@ bool llama_kv_blocksvd_reconstruct_layer(
 // Clear all pending K/V/slots and persistent chunks (e.g. on KV cache clear).
 void llama_kv_blocksvd_clear_pending(llama_kv_blocksvd_context * ctx);
 void llama_kv_blocksvd_clear(llama_kv_blocksvd_context * ctx);
+
+// --- Chunked Attention (Tier 3: iterative materialize + online softmax) ---
+
+struct ggml_tensor;
+
+// Parameters passed via userdata to the chunked attention custom op.
+struct llama_chunked_attn_params {
+    const llama_kv_blocksvd_context * bctx;
+    const llama_kv_blocksvd_staging_t * staging;
+    int32_t il;
+    uint32_t n_kv;
+    int32_t n_head_kv;
+    int32_t n_head_q;
+    int32_t head_dim_k;
+    int32_t head_dim_v;
+    float scale;
+    uint32_t n_stream;
+    uint32_t cache_size;
+    std::vector<llama_pos> q_pos;
+    std::vector<llama_pos> slot_pos;
+};
+
+// Custom op compute function: chunked attention with online softmax.
+// dst: [head_dim_v * n_head_q, n_tokens]
+// dst->src[0] (q): [head_dim_k, n_head_kv, cache_size, n_stream] (raw Q reshaped)
+// dst->src[1] (k_active): the staged K tensor (physical staging buffer view)
+// dst->src[2] (v_active): the staged V tensor (physical staging buffer view)
+void llama_chunked_attn_compute(
+        struct ggml_tensor * dst,
+        int ith, int nth, void * userdata);
