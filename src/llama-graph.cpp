@@ -14,6 +14,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
