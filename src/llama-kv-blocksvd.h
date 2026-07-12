@@ -126,6 +126,28 @@ struct llama_kv_blocksvd_context {
         int32_t n_tokens = 0;
     };
     mutable std::vector<std::unique_ptr<decoded_chunk>> decode_cache;
+
+    // Per-forward rank-domain factor cache for direct low-rank attention.
+    // Populated lazily by llama_kv_lowrank_direct_attn_compute. All layers in
+    // an xKV chunk share the same U/S/Vh factors (that's the xKV cross-layer
+    // property); only the layer offset into Vh's "combined_dim" varies. Cached
+    // buffers are the fp32-dequant + US premultiply results.
+    struct rank_chunk {
+        int32_t n_tokens = 0;        // tokens in this compressed block
+        int32_t r_k      = 0;        // K-side rank
+        int32_t r_v      = 0;        // V-side rank
+        int32_t combined_k_dim = 0;  // group_size * n_head_kv * head_dim_k
+        int32_t combined_v_dim = 0;  // group_size * n_head_kv * head_dim_v
+        // US_k: (n_tokens, r_k) row-major; premultiplied U_k * diag(S_k)
+        std::vector<float> us_k;
+        // US_v: (n_tokens, r_v) row-major
+        std::vector<float> us_v;
+        // Vh_k dequantized: (r_k, combined_k_dim) row-major
+        std::vector<float> vh_k;
+        // Vh_v dequantized: (r_v, combined_v_dim) row-major
+        std::vector<float> vh_v;
+    };
+    mutable std::vector<std::unique_ptr<rank_chunk>> rank_cache;
 };
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params);
@@ -312,5 +334,16 @@ struct llama_chunked_attn_params {
 // dst->src[2] (v_active): [head_dim_v, n_head_kv, cache_size, n_stream] (F32, non-transposed)
 // n_stream must be 1 in this milestone.
 void llama_chunked_attn_compute(
+        struct ggml_tensor * dst,
+        int ith, int nth, void * userdata);
+
+// Direct low-rank attention consumer: same params + dst/src layout as
+// llama_chunked_attn_compute, but consumes compressed factors without
+// materializing dense per-token K/V for each block.
+//
+// Phase 2 status: stub — delegates to llama_chunked_attn_compute and prints a
+// one-shot marker. Phase 3 replaces the body with the rank-domain kernel
+// described in the direct-consumer plan (kv_lowrank_direct_reference.py).
+void llama_kv_lowrank_direct_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata);

@@ -2339,11 +2339,20 @@ ggml_tensor * llm_graph_context::build_attn(
             // Output: [head_dim_v * n_head_q, n_tokens]
             const int64_t out_dim = hparams.n_embd_head_v(il) * hparams.n_head(il);
 
+            // Direct low-rank consumer opt-in: --kv-lowrank-direct (i.e. !cparams.kv_lowrank_reconstruct)
+            // routes to the rank-domain kernel. In Phase 2 this is a stub that
+            // delegates to llama_chunked_attn_compute; Phase 3 replaces the body.
+            const bool use_lowrank_direct = !cparams.kv_lowrank_reconstruct;
+            ggml_custom_op_t compute_fn = use_lowrank_direct
+                ? llama_kv_lowrank_direct_attn_compute
+                : llama_chunked_attn_compute;
+            const char * op_name = use_lowrank_direct ? "kv_lowrank_direct_attn" : "chunked_attn";
+
             ggml_tensor * args[3] = { q, k, v };
             ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
                 out_dim, n_tokens, 1, 1,
-                args, 3, llama_chunked_attn_compute, 1, udata);
-            ggml_set_name(cur, "chunked_attn");
+                args, 3, compute_fn, 1, udata);
+            ggml_set_name(cur, op_name);
             cb(cur, "kqv_out", il);
 
             cur = ggml_reshape_2d(ctx0, cur, out_dim, n_tokens);
