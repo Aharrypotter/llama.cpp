@@ -47,7 +47,10 @@ set(LLAMA_SOURCES
 )
 
 if (LLAMA_KV_BLOCKSVD)
-    list(APPEND LLAMA_SOURCES llama-kv-blocksvd.cpp)
+    list(APPEND LLAMA_SOURCES
+        llama-kv-blocksvd.cpp
+        llama-kv-blocksvd-execution.cpp
+    )
 endif()
 
 add_library(llama ${LLAMA_SOURCES})
