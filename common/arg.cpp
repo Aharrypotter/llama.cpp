@@ -931,6 +931,15 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (!common_kv_lowrank_validate(kv_lowrank_params, &kv_lowrank_error)) {
             throw std::invalid_argument("error: " + kv_lowrank_error);
         }
+
+        // --kv-lowrank-direct only takes effect when compressed KV storage is active.
+        // Reject silent misconfiguration where the user requests the direct kernel
+        // but no compressed backend is enabled.
+        if (!params.kv_lowrank_reconstruct && !params.kv_blocksvd_params.memory_reduction) {
+            throw std::invalid_argument(
+                "error: --kv-lowrank-direct requires --kv-blocksvd-memory-reduction "
+                "(the direct low-rank consumer only runs against compressed KV storage)");
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;

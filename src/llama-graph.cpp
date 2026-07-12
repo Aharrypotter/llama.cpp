@@ -2307,6 +2307,18 @@ ggml_tensor * llm_graph_context::build_attn(
     llama_kv_lowrank_observe_attn_shapes(cparams, hparams, mctx_cur, q_cur, k_cur, v_cur, k, v, il, n_tokens);
 
 #ifdef LLAMA_KV_BLOCKSVD
+    // Defensive: warn once if --kv-lowrank-direct was requested without the
+    // memory-reduction backend. The CLI arg validator catches this at parse time,
+    // but library users going through llama_context_default_params() can bypass
+    // arg parsing and land here silently.
+    if (!cparams.kv_lowrank_reconstruct && !mctx_cur->is_memory_reduction_enabled()) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: --kv-lowrank-direct requested but memory-reduction is disabled; "
+                    "the direct low-rank kernel will not run (falling back to dense attention)\n",
+                    __func__);
+        }
+    }
     if (mctx_cur->is_memory_reduction_enabled()) {
         const auto * bctx = mctx_cur->get_blocksvd_ctx();
         if (bctx) {
