@@ -40,6 +40,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         unified,
         kv_size,
         n_seq_max,
+        kv_size, // n_ubatch not plumbed to hybrid; use kv_size (memory_reduction unused here)
         n_pad,
         n_swa,
         swa_type,

@@ -329,7 +329,8 @@ extern "C" {
     // [EXPERIMENTAL] Block SVD KV cache compression parameters.
     struct llama_kv_blocksvd_params {
         int32_t block_size; // SVD block size along the sequence dimension
-        int32_t rank;       // low-rank dimension (0 = disabled)
+        int32_t rank;       // low-rank dimension for K (0 = disabled)
+        int32_t rank_v;     // low-rank dimension for V (0 = inherit rank)
         int32_t quant_bits; // 8 or 16
         bool    reconstruct; // write reconstructed K/V back into the dense KV cache
         bool    cross_layer; // xKV-style: group consecutive layers and share SVD basis across the group

@@ -7,12 +7,15 @@ BIN=/Users/hoyi/paper/llama.cpp/build/bin
 python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 50)" > "$PROMPT_FILE"
 
 echo "=== dense baseline ==="
-"$BIN/llama-perplexity" -m "$MODEL" -f "$PROMPT_FILE" -c 128 -ngl 0 -t 4 2>&1 | tee /tmp/ppl_dense.log
+"$BIN/llama-perplexity" -m "$MODEL" -f "$PROMPT_FILE" -c 128 -b 128 -ngl 0 -t 4 --kv-unified 2>&1 | tee /tmp/ppl_dense.log
 
-echo "=== xKV backend ==="
-"$BIN/llama-perplexity" -m "$MODEL" -f "$PROMPT_FILE" -c 128 -ngl 0 -t 4 \
+echo "=== xKV backend (memory_reduction=on, chunked_attn) ==="
+"$BIN/llama-perplexity" -m "$MODEL" -f "$PROMPT_FILE" -c 128 -b 128 -ngl 0 -t 4 --kv-unified \
   --kv-blocksvd --kv-blocksvd-backend --kv-blocksvd-cross-layer \
+  --kv-blocksvd-memory-reduction \
   --kv-blocksvd-block-size 16 --kv-blocksvd-rank 8 2>&1 | tee /tmp/ppl_xkv.log
 
 echo "dense ppl:" $(grep -oE 'Final estimate: PPL = [0-9.]+' /tmp/ppl_dense.log | tail -1)
 echo "xkv   ppl:" $(grep -oE 'Final estimate: PPL = [0-9.]+' /tmp/ppl_xkv.log | tail -1)
+echo "chunked_attn active line:"
+grep "chunked_attn active" /tmp/ppl_xkv.log | head -1

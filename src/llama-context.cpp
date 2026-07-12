@@ -6,6 +6,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -356,6 +358,20 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+#ifdef LLAMA_KV_BLOCKSVD
+        // Wire bctx into kv_cache so its clear() drops the bctx pending buffer too.
+        if (kv_blocksvd_shadow) {
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                kv->blocksvd_attach(kv_blocksvd_shadow.get());
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                if (auto * b = iswa->get_base()) b->blocksvd_attach(kv_blocksvd_shadow.get());
+                if (auto * w = iswa->get_swa())  w->blocksvd_attach(kv_blocksvd_shadow.get());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                if (auto * a = hyb->get_mem_attn()) a->blocksvd_attach(kv_blocksvd_shadow.get());
+            }
+        }
+#endif
     }
 
     // init backends
@@ -697,6 +713,27 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
+
+#ifdef LLAMA_KV_BLOCKSVD
+    // chunked_attn owns host-side workspace (params struct, position vectors, per-forward
+    // chunk list, VKQ accumulator) that lives outside the ggml compute buffer. Report it
+    // separately so the reserved compute buffer + this host workspace matches the process
+    // memory footprint at runtime. Task #24: prevents the 0.19 vs 0.24 MiB mismatch.
+    if (gf_res_reserve) {
+        size_t chunked_attn_bytes = 0;
+        for (const auto & p : gf_res_reserve->chunked_attn_params) {
+            if (p) {
+                chunked_attn_bytes += p->bytes();
+            }
+        }
+        if (chunked_attn_bytes > 0) {
+            LLAMA_LOG_INFO("%s: chunked_attn host workspace = %8.2f MiB (%zu op invocations)\n",
+                    __func__,
+                    chunked_attn_bytes / 1024.0 / 1024.0,
+                    gf_res_reserve->chunked_attn_params.size());
+        }
+    }
+#endif
 
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
@@ -1263,12 +1300,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
 #ifdef LLAMA_KV_BLOCKSVD
-    // In memory-reduction mode, materialize compressed chunks back into staging
-    // before the attention graph is built.
-    if (cparams.kv_blocksvd_params.backend && cparams.kv_blocksvd_params.memory_reduction) {
+    // Under memory-reduction mode, chunked_attn reads compressed chunks directly:
+    // materializing them back into staging would immediately exhaust the small
+    // physical buffer. Keep materialize only for the non-memory-reduction backend.
+    if (cparams.kv_blocksvd_params.backend && !cparams.kv_blocksvd_params.memory_reduction) {
         auto * kv = dynamic_cast<llama_kv_cache *>(get_memory());
         if (kv) {
             kv->blocksvd_materialize(kv_blocksvd_shadow.get());
+        }
+    }
+
+    // decode_cache is intentionally *not* reset per forward. xkv_chunks is append-only
+    // (new chunks are push_back'd during compression; existing chunks are never mutated
+    // in place), so a previously decoded chunk remains valid across forwards. The cache
+    // is invalidated together with xkv_chunks in llama_kv_blocksvd_clear() (called from
+    // llama_kv_cache::clear and the finetune reset path). Per-forward reset was the
+    // symptom of Task #23: n_ubatch=1 decode dropped to ~0.26x dense throughput because
+    // every token redecompressed every chunk from scratch.
+
+    // Wire this context into the memory context so that graph builders can
+    // reach the blocksvd shadow via mctx_cur->get_blocksvd_ctx().
+    if (mctx) {
+        if (auto * kvctx = dynamic_cast<llama_kv_cache_context *>(mctx)) {
+            kvctx->set_lctx(this);
         }
     }
 #endif
@@ -3851,7 +3905,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_lowrank_sample_max_tokens=*/ 4096,
         /*.kv_lowrank_basis_path       =*/ nullptr,
         /*.kv_lowrank_samples_path     =*/ nullptr,
-        /*.kv_blocksvd_params          =*/ {64, 0, 8, false, false, 4, false, false},
+        /*.kv_blocksvd_params          =*/ {64, 0, 0, 8, false, false, 4, false, false},
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

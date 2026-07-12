@@ -2309,8 +2309,9 @@ ggml_tensor * llm_graph_context::build_attn(
 #ifdef LLAMA_KV_BLOCKSVD
     if (mctx_cur->is_memory_reduction_enabled()) {
         const auto * bctx = mctx_cur->get_blocksvd_ctx();
-        if (bctx && !bctx->xkv_chunks.empty()) {
-            // Chunked attention: use custom op that iterates compressed chunks
+        if (bctx) {
+            // Chunked attention: sole attention path under memory_reduction.
+            // Empty xkv_chunks is a valid state (first forward before any block is compressed).
             auto params = std::make_unique<llama_chunked_attn_params>();
             params->bctx       = bctx;
             params->staging    = mctx_cur->get_staging();
@@ -2324,14 +2325,13 @@ ggml_tensor * llm_graph_context::build_attn(
             params->n_stream   = mctx_cur->get_n_stream();
             params->cache_size = mctx_cur->get_cache_size();
 
-            // Causal masking: populate positions for query tokens and staging slots
-            if (n_tokens > 1) {
-                params->q_pos.resize(n_tokens);
-                for (int32_t i = 0; i < n_tokens; ++i) {
-                    params->q_pos[i] = ubatch.pos[i];
-                }
-                params->slot_pos = mctx_cur->get_slot_positions(0);
+            // Causal masking: populate positions for every token unconditionally.
+            // The compute op asserts q_pos.size() == n_tokens.
+            params->q_pos.resize(n_tokens);
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                params->q_pos[i] = ubatch.pos[i];
             }
+            params->slot_pos = mctx_cur->get_slot_positions(0);
 
             void * udata = params.get();
             res->chunked_attn_params.push_back(std::move(params));

@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -137,6 +138,7 @@ llama_kv_cache::llama_kv_cache(
                      bool   unified,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
+                 uint32_t   n_ubatch,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
@@ -209,8 +211,23 @@ llama_kv_cache::llama_kv_cache(
         cell_state_vec[s].assign(kv_size, llama_kv_cell_state::DENSE);
     }
 
+    // Compute physical cache_size for memory_reduction mode.
+    uint32_t blocksvd_cache_size = kv_size;
     if (bctx_params.memory_reduction && bctx_params.backend) {
-        m_blocksvd_staging.capacity = kv_size;
+        const uint32_t B = bctx_params.block_size > 0 ? (uint32_t) bctx_params.block_size : 16u;
+        const uint32_t S = n_stream;
+        const uint32_t U = n_ubatch;
+        const uint32_t per_stream_ubatch = (U + S - 1) / S;
+        const uint32_t rounded = ((per_stream_ubatch + B - 1) / B) * B;
+        blocksvd_cache_size = std::max(2u * B, rounded + B);
+        // Clamp to kv_size (never oversubscribe the logical space).
+        blocksvd_cache_size = std::min(blocksvd_cache_size, kv_size);
+        LLAMA_LOG_INFO("%s: blocksvd memory_reduction: cache_size=%u (B=%u, U=%u, S=%u, kv_size=%u)\n",
+                __func__, blocksvd_cache_size, B, U, S, kv_size);
+    }
+
+    if (bctx_params.memory_reduction && bctx_params.backend) {
+        m_blocksvd_staging.capacity = blocksvd_cache_size;
         m_blocksvd_staging.cell_to_slot.resize(n_stream);
         m_blocksvd_staging.slot_to_cell.resize(n_stream);
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -222,9 +239,7 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t cache_size =
 #ifdef LLAMA_KV_BLOCKSVD
-        // memory_reduction enables the flush/compress/materialize cycle but currently
-        // uses full kv_size for tensors. Reducing to block_size requires chunked attention.
-        kv_size;
+        blocksvd_cache_size;
 #else
         kv_size;
 #endif
@@ -423,8 +438,23 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
 #ifdef LLAMA_KV_BLOCKSVD
         cell_state_vec[s].assign(get_size(), llama_kv_cell_state::DENSE);
+        if (memory_reduction_enabled() && s < m_blocksvd_staging.cell_to_slot.size()) {
+            std::fill(m_blocksvd_staging.cell_to_slot[s].begin(),
+                      m_blocksvd_staging.cell_to_slot[s].end(), -1);
+            std::fill(m_blocksvd_staging.slot_to_cell[s].begin(),
+                      m_blocksvd_staging.slot_to_cell[s].end(), -1);
+        }
 #endif
     }
+
+#ifdef LLAMA_KV_BLOCKSVD
+    // Drop pending accumulators + compressed xkv chunks that bctx keeps outside kv_cache.
+    // Without this, the (< block_size) tail from a prior chunk lingers into the next chunk
+    // and re-stages cells that the fresh kv_cache doesn't know about.
+    if (m_blocksvd_bctx) {
+        llama_kv_blocksvd_clear(m_blocksvd_bctx);
+    }
+#endif
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -526,6 +556,13 @@ std::vector<uint32_t> llama_kv_cache::blocksvd_logical_to_staging(uint32_t strea
 
 void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
     if (!bctx || !bctx->params.backend) {
+        return;
+    }
+
+    // Under memory_reduction, chunked_attn reads compressed chunks directly
+    // via the custom op; re-staging every compressed cell would immediately
+    // exhaust the small physical buffer and defeat the whole scheme.
+    if (memory_reduction_enabled()) {
         return;
     }
 
@@ -642,6 +679,13 @@ bool llama_kv_cache::blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, st
         return true;
     }
 
+    uint32_t used_before = 0;
+    uint32_t n_compressed_cells = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (auto v : m_blocksvd_staging.slot_to_cell[s]) if (v >= 0) ++used_before;
+        for (auto c : cell_state_vec[s]) if (c == llama_kv_cell_state::COMPRESSED) ++n_compressed_cells;
+    }
+
     uint32_t n_released = 0;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -664,9 +708,17 @@ bool llama_kv_cache::blocksvd_flush_staging(llama_kv_blocksvd_context * bctx, st
         }
     }
 
-    if (n_released > 0) {
-        LLAMA_LOG_DEBUG("%s: released %u staging slots\n", __func__, n_released);
+    uint32_t used_after = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        for (auto v : m_blocksvd_staging.slot_to_cell[s]) {
+            if (v >= 0) ++used_after;
+        }
     }
+    if (n_released > 0 || used_after > 0) {
+        LLAMA_LOG_DEBUG("%s: used_before=%u compressed_cells=%u released=%u used_after=%u/%u\n",
+                __func__, used_before, n_compressed_cells, n_released, used_after, m_blocksvd_staging.capacity);
+    }
+    (void) used_before; (void) n_compressed_cells; (void) used_after;
 
     return true;
 }
@@ -1053,6 +1105,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
+    // Snapshot blocksvd staging so we can roll it back after the dry-run.
+    // apply_ubatch() below mutates m_blocksvd_staging.{cell_to_slot,slot_to_cell};
+    // without this restore, staging fills up during prepare and real decode
+    // then hits "staging full" on the second call.
+    auto staging_c2s_snapshot = m_blocksvd_staging.cell_to_slot;
+    auto staging_s2c_snapshot = m_blocksvd_staging.slot_to_cell;
+    auto cell_state_snapshot  = cell_state_vec;
+
     bool success = true;
 
     for (const auto & ubatch : ubatches) {
@@ -1097,6 +1157,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             head = it->v_heads_old[s];
         }
     }
+
+    // Restore blocksvd staging to its pre-dry-run state.
+    m_blocksvd_staging.cell_to_slot = std::move(staging_c2s_snapshot);
+    m_blocksvd_staging.slot_to_cell = std::move(staging_s2c_snapshot);
+    cell_state_vec                  = std::move(cell_state_snapshot);
 
     if (!success) {
         return {};
@@ -1478,6 +1543,13 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+#ifdef LLAMA_KV_BLOCKSVD
+    // Under memory_reduction, chunked_attn owns positional handling; K-shift
+    // cannot address rows that live only in compressed chunks.
+    if (memory_reduction_enabled()) {
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -1735,7 +1807,21 @@ bool llama_kv_cache::copy_current_kv_chunk_f32(
     std::vector<uint8_t> row_v(v_trans ? type_size_v : row_bytes_v);
 
     for (uint32_t t = 0; t < n_tokens; ++t) {
-        const uint32_t idx = sinfo.idxs[0][t];
+        const uint32_t logical_idx = sinfo.idxs[0][t];
+
+        // Under memory_reduction the physical K/V tensors are indexed by
+        // staging slot, not by logical cell.  Translate here; the cell must
+        // still be staged since we are about to compress it in this cycle.
+        uint32_t idx = logical_idx;
+#ifdef LLAMA_KV_BLOCKSVD
+        if (memory_reduction_enabled()) {
+            const auto & c2s = m_blocksvd_staging.cell_to_slot[stream];
+            if (logical_idx >= c2s.size() || c2s[logical_idx] < 0) {
+                return fail("WHLR-KV shadow extraction: logical cell has no staging slot");
+            }
+            idx = (uint32_t) c2s[logical_idx];
+        }
+#endif
 
         const size_t k_offset = static_cast<size_t>(stream)*static_cast<size_t>(k->nb[2])
                               + static_cast<size_t>(idx)*static_cast<size_t>(k->nb[1]);
@@ -1991,6 +2077,16 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
+#ifdef LLAMA_KV_BLOCKSVD
+    if (memory_reduction_enabled()) {
+        // K-shift is disabled under memory_reduction (see get_can_shift); this
+        // path should not be reached.  Zero the tensor defensively so callers
+        // that inspect it observe a neutral state.
+        GGML_ASSERT(false && "set_input_k_shift called under memory_reduction");
+        return;
+    }
+#endif
+
     int32_t * data = (int32_t *) dst->data;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2200,6 +2296,21 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
+#ifdef LLAMA_KV_BLOCKSVD
+    if (memory_reduction_enabled()) {
+        // chunked_attn owns causal masking; the standard mask tensor (if still
+        // present in the graph) is unused.  Fill with -INF (fully masked) so
+        // any accidental consumer observes a safe value.
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) {
+            LLAMA_LOG_DEBUG("%s: memory_reduction guard active (kq_mask filled with -INF)\n", __func__);
+        }
+        const size_t n_elem = ggml_nelements(dst);
+        std::fill_n(data, n_elem, -INFINITY);
+        return;
+    }
+#endif
+
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 
@@ -2235,6 +2346,15 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
+
+#ifdef LLAMA_KV_BLOCKSVD
+    if (memory_reduction_enabled()) {
+        // No architecture using pos_bucket is currently supported under
+        // memory_reduction; assert so the mismatch is caught early.
+        GGML_ASSERT(false && "set_input_pos_bucket called under memory_reduction");
+        return;
+    }
+#endif
 
     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
     const auto & cells = v_cells[0];
@@ -2433,6 +2553,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
 
+#ifdef LLAMA_KV_BLOCKSVD
+    GGML_ASSERT(!memory_reduction_enabled() && "state save is not supported under memory_reduction");
+#endif
+
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2485,6 +2609,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
+
+#ifdef LLAMA_KV_BLOCKSVD
+    GGML_ASSERT(!memory_reduction_enabled() && "state load is not supported under memory_reduction");
+#endif
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 

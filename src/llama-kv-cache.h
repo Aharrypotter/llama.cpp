@@ -108,6 +108,7 @@ public:
                          bool   unified,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_ubatch,
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
@@ -220,6 +221,11 @@ public:
 
     // Reconstruct persisted xKV chunks back into the dense/staging cache before attention.
     void blocksvd_materialize(llama_kv_blocksvd_context * bctx);
+
+    // Register the blocksvd context so kv_cache::clear() can drop the pending
+    // staging accumulator (which is owned by bctx, not kv_cache). Called once
+    // by llama_context after both objects are constructed.
+    void blocksvd_attach(llama_kv_blocksvd_context * bctx) { m_blocksvd_bctx = bctx; }
 #endif
 
     //
@@ -338,6 +344,9 @@ private:
 
     // Staging buffer metadata for memory-reduction mode.
     blocksvd_staging_t m_blocksvd_staging;
+
+    // Non-owning: bctx whose pending accumulator must be reset on clear().
+    llama_kv_blocksvd_context * m_blocksvd_bctx = nullptr;
 
     // Map newly assigned logical cells into staging slots.
     bool blocksvd_stage_cells(uint32_t stream, const std::vector<uint32_t> & slots);
@@ -488,6 +497,7 @@ public:
     uint32_t get_cache_size() const { return kv->get_phys_size(); }
     uint32_t get_n_stream() const { return kv->get_n_stream(); }
     const llama_kv_blocksvd_context * get_blocksvd_ctx() const;
+    void set_lctx(llama_context * l) { lctx = l; }
 
     std::vector<llama_pos> get_slot_positions(uint32_t stream) const;
 #endif

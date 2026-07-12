@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -10,35 +11,8 @@
 // This header lives in src/ so llama core code can call the CPU reference
 // compression/reconstruction path without depending on common/.
 
-struct llama_kv_blocksvd_chunk {
-    int32_t seq_start = 0;
-    int32_t seq_end   = 0;
-
-    // Total sequence length of the layer.  Required to compute the correct
-    // stride when writing back the transposed V cache.
-    int32_t n_kv = 0;
-
-    // Flat feature dimension: n_head_kv * (head_dim_k + head_dim_v)
-    int32_t n_flat = 0;
-
-    // Quantization metadata.  The quantized buffers below store raw bytes;
-    // element size is quant_bits / 8.
-    int32_t quant_bits = 8;
-
-    // Quantized U: (block_size, rank)
-    std::vector<int8_t> u_q;
-    float u_scale = 1.0f;
-
-    // Quantized S: (rank,)
-    std::vector<int8_t> s_q;
-    float s_scale = 1.0f;
-
-    // Quantized Vh: (rank, n_flat)
-    std::vector<int8_t> vh_q;
-    float vh_scale = 1.0f;
-};
-
-// Quantized SVD factors for one cross-layer K or V matrix.
+// Quantized SVD factors for one K or V matrix.
+// Used by both the xKV cross-layer chunk and the per-layer chunk below.
 struct llama_kv_blocksvd_xkv_factors {
     int32_t rank = 0;
     int32_t quant_bits = 8;
@@ -54,6 +28,27 @@ struct llama_kv_blocksvd_xkv_factors {
     // Quantized Vh: (rank, n_dim)
     std::vector<int8_t> vh_q;
     float vh_scale = 1.0f;
+};
+
+// Per-layer Block SVD chunk. Stores K and V as separate low-rank factors so
+// they can carry independent ranks and are not forced to share a single joint
+// SVD basis.
+struct llama_kv_blocksvd_chunk {
+    int32_t seq_start = 0;
+    int32_t seq_end   = 0;
+
+    // Total sequence length of the layer at compression time. Required to
+    // compute the correct stride when writing back the transposed V cache.
+    int32_t n_kv = 0;
+
+    // Flat feature dimensions: n_head_kv * head_dim_k and n_head_kv * head_dim_v.
+    int32_t n_flat_k = 0;
+    int32_t n_flat_v = 0;
+
+    int32_t quant_bits = 8;
+
+    llama_kv_blocksvd_xkv_factors k_factors;
+    llama_kv_blocksvd_xkv_factors v_factors;
 };
 
 // Persistent storage for one compressed xKV cross-layer block.
@@ -118,6 +113,19 @@ struct llama_kv_blocksvd_context {
         std::vector<llama_pos> pos;        // token positions
     };
     std::vector<pending_xkv_group> pending_xkv;
+
+    // Per-forward decode cache for chunked attention.
+    // Indexed by xkv_chunks index; each slot holds the group-decompressed K/V for
+    // that chunk so the compute op does not decode the same chunk N_layer times per forward.
+    // Reset at the start of each ubatch via llama_kv_blocksvd_reset_decode_cache.
+    struct decoded_chunk {
+        // Per-layer flat K rows: [group_size][n_tokens * n_head_kv * head_dim_k]
+        std::vector<std::vector<float>> k;
+        // Per-layer flat V rows: [group_size][n_tokens * n_head_kv * head_dim_v]
+        std::vector<std::vector<float>> v;
+        int32_t n_tokens = 0;
+    };
+    mutable std::vector<std::unique_ptr<decoded_chunk>> decode_cache;
 };
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params);
@@ -255,6 +263,9 @@ bool llama_kv_blocksvd_reconstruct_layer(
 void llama_kv_blocksvd_clear_pending(llama_kv_blocksvd_context * ctx);
 void llama_kv_blocksvd_clear(llama_kv_blocksvd_context * ctx);
 
+// Invalidate the per-forward decode cache. Call before graph build in each ubatch.
+void llama_kv_blocksvd_reset_decode_cache(llama_kv_blocksvd_context * ctx);
+
 // --- Chunked Attention (Tier 3: iterative materialize + online softmax) ---
 
 struct ggml_tensor;
@@ -274,13 +285,32 @@ struct llama_chunked_attn_params {
     uint32_t cache_size;
     std::vector<llama_pos> q_pos;
     std::vector<llama_pos> slot_pos;
+
+    // Reservation-side workspace footprint of this op invocation.
+    // Includes: the params struct itself, both position vectors (capacity),
+    // the transient VKQ_acc accumulator (head_dim_v F32), and the transient
+    // chunks list built per forward (reserved to xkv_chunks.size()).
+    // The output tensor is allocated by ggml and is *not* included here.
+    size_t bytes() const {
+        size_t b = sizeof(*this);
+        b += q_pos.capacity()    * sizeof(llama_pos);
+        b += slot_pos.capacity() * sizeof(llama_pos);
+        b += (size_t) head_dim_v * sizeof(float);
+        // chunk_ref inside compute: 2 pointers + int32 + pointer-to-vector.
+        // Approximate with 4 pointers per chunk to stay portable.
+        const size_t chunk_ref_sz = 4 * sizeof(void *);
+        const size_t n_chunks = bctx ? bctx->xkv_chunks.size() : 0;
+        b += n_chunks * chunk_ref_sz;
+        return b;
+    }
 };
 
 // Custom op compute function: chunked attention with online softmax.
 // dst: [head_dim_v * n_head_q, n_tokens]
-// dst->src[0] (q): [head_dim_k, n_head_kv, cache_size, n_stream] (raw Q reshaped)
-// dst->src[1] (k_active): the staged K tensor (physical staging buffer view)
-// dst->src[2] (v_active): the staged V tensor (physical staging buffer view)
+// dst->src[0] (q):        [head_dim_k, n_head_q,  n_tokens] (F32, pre-stream-split)
+// dst->src[1] (k_active): [head_dim_k, n_head_kv, cache_size, n_stream] (F32)
+// dst->src[2] (v_active): [head_dim_v, n_head_kv, cache_size, n_stream] (F32, non-transposed)
+// n_stream must be 1 in this milestone.
 void llama_chunked_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata);

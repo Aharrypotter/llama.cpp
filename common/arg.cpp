@@ -2144,7 +2144,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_BLOCKSVD"));
     add_opt(common_arg(
         {"--kv-blocksvd-rank"}, "N",
-        string_format("Block SVD rank (default: %d)", params.kv_blocksvd_params.rank),
+        string_format("Block SVD rank for K (default: %d). Also used for V unless --kv-blocksvd-rank-v is set.", params.kv_blocksvd_params.rank),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::runtime_error("--kv-blocksvd-rank must be >= 0");
@@ -2152,6 +2152,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_blocksvd_params.rank = value;
         }
     ).set_env("LLAMA_ARG_KV_BLOCKSVD_RANK"));
+    add_opt(common_arg(
+        {"--kv-blocksvd-rank-v"}, "N",
+        string_format("Block SVD rank for V (default: %d, 0 = inherit --kv-blocksvd-rank)", params.kv_blocksvd_params.rank_v),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error("--kv-blocksvd-rank-v must be >= 0");
+            }
+            params.kv_blocksvd_params.rank_v = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCKSVD_RANK_V"));
     add_opt(common_arg(
         {"--kv-blocksvd-block-size"}, "N",
         string_format("Block SVD block size (default: %d)", params.kv_blocksvd_params.block_size),
