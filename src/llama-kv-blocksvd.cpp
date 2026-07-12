@@ -1222,11 +1222,6 @@ void llama_kv_blocksvd_reset_decode_cache(llama_kv_blocksvd_context * ctx) {
 void llama_chunked_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata) {
-    if (ith != 0) {
-        return;
-    }
-    GGML_UNUSED(nth);
-
     const struct ggml_tensor * a = dst->src[0]; // Q
     const struct ggml_tensor * b = dst->src[1]; // K (staged)
     const struct ggml_tensor * c = dst->src[2]; // V (staged)
@@ -1251,41 +1246,35 @@ void llama_chunked_attn_compute(
 
     const int32_t n_rep = n_head_q / n_head_kv;
 
-    static std::atomic<bool> logged_once{false};
-    if (!logged_once.exchange(true)) {
-        LLAMA_LOG_INFO("%s: chunked_attn active (il=%d n_head_q=%d n_head_kv=%d head_dim_k=%d head_dim_v=%d cache_size=%u chunks=%zu)\n",
-                __func__, il, n_head_q, n_head_kv, head_dim_k, head_dim_v, cache_size,
-                bctx ? bctx->xkv_chunks.size() : (size_t)0);
-    }
-
     float * out = (float *) dst->data;
     const size_t out_size = (size_t) head_dim_v * n_head_q * n_tokens;
-    memset(out, 0, out_size * sizeof(float));
 
     // Causal masking is always on: q_pos is populated for every token by build_attn.
     // A missing q_pos would indicate a caller bug.
     GGML_ASSERT((int32_t) p->q_pos.size() == n_tokens && "chunked_attn: q_pos must cover every token");
 
-    std::vector<float> VKQ_acc((size_t) head_dim_v);
+    // === Hoist phase: thread 0 populates decode_cache + chunks list ===
+    // Other threads spin on p->hoist_done until this completes.
+    if (ith == 0) {
+        static std::atomic<bool> logged_once{false};
+        if (!logged_once.exchange(true)) {
+            LLAMA_LOG_INFO("%s: chunked_attn active (il=%d n_head_q=%d n_head_kv=%d head_dim_k=%d head_dim_v=%d cache_size=%u chunks=%zu nth=%d)\n",
+                    __func__, il, n_head_q, n_head_kv, head_dim_k, head_dim_v, cache_size,
+                    bctx ? bctx->xkv_chunks.size() : (size_t)0, nth);
+        }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        // Build the list of chunks that intersect this layer, populating the
-        // per-forward decode cache lazily. Cache lives on bctx and is reset
-        // by llama_kv_blocksvd_reset_decode_cache at the start of each ubatch.
-        struct chunk_ref {
-            const float * k_data;
-            const float * v_data;
-            int32_t n_tokens;
-            const std::vector<llama_pos> * pos;
-        };
-        std::vector<chunk_ref> chunks;
-        chunks.reserve(bctx->xkv_chunks.size());
+        memset(out, 0, out_size * sizeof(float));
+
+        p->chunks_dense.clear();
+        p->chunks_dense.reserve(bctx->xkv_chunks.size());
 
         auto & decode_cache = bctx->decode_cache;
         if (decode_cache.size() < bctx->xkv_chunks.size()) {
             decode_cache.resize(bctx->xkv_chunks.size());
         }
 
+        // n_stream == 1 (asserted above), so we only build refs for stream 0.
+        const uint32_t s = 0;
         for (size_t ci = 0; ci < bctx->xkv_chunks.size(); ++ci) {
             const auto & chunk = bctx->xkv_chunks[ci];
             if (chunk.stream != s) {
@@ -1309,18 +1298,38 @@ void llama_chunked_attn_compute(
 
             const int32_t local_layer = il - chunk.layer_start;
             const auto & dc = decode_cache[ci];
-            chunk_ref ref;
+            llama_chunked_attn_chunk_ref ref;
             ref.k_data   = dc->k[local_layer].data();
             ref.v_data   = dc->v[local_layer].data();
             ref.n_tokens = dc->n_tokens;
             ref.pos      = &chunk.pos;
-            chunks.push_back(ref);
+            p->chunks_dense.push_back(ref);
         }
 
-        for (int32_t hq = 0; hq < n_head_q; ++hq) {
+        // Release the barrier for worker threads.
+        p->hoist_done.store(1, std::memory_order_release);
+    } else {
+        while (p->hoist_done.load(std::memory_order_acquire) == 0) {
+            // spin — thread 0's hoist is short (memset + a few ms decompress)
+        }
+    }
+
+    // === Compute phase: all threads split (hq, tq) work items ===
+    // n_stream == 1 asserted; refs live on p->chunks_dense (populated by thread 0).
+    const uint32_t s = 0;
+    const auto & chunks = p->chunks_dense;
+    const auto & s2c    = staging->slot_to_cell[s];
+
+    std::vector<float> VKQ_acc((size_t) head_dim_v);
+
+    const int64_t total = (int64_t) n_head_q * n_tokens;
+    for (int64_t idx = ith; idx < total; idx += nth) {
+        const int32_t hq = (int32_t) (idx / n_tokens);
+        const int32_t tq = (int32_t) (idx % n_tokens);
+        {
             const int32_t hkv = hq / n_rep;
 
-            for (int32_t tq = 0; tq < n_tokens; ++tq) {
+            {
                 const float * q_vec = (const float *)((const char *)a->data +
                     tq * a->nb[2] + hq * a->nb[1]);
 
@@ -1332,7 +1341,6 @@ void llama_chunked_attn_compute(
 
                 // --- Part 1: Active window (staged cells) ---
                 {
-                    const auto & s2c = staging->slot_to_cell[s];
                     for (uint32_t slot = 0; slot < cache_size; ++slot) {
                         if (s2c[slot] < 0) {
                             continue;
@@ -1476,11 +1484,6 @@ static const llama_kv_blocksvd_context::rank_chunk * lowrank_direct_ensure_rank_
 void llama_kv_lowrank_direct_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata) {
-    if (ith != 0) {
-        return;
-    }
-    GGML_UNUSED(nth);
-
     const struct ggml_tensor * a = dst->src[0]; // Q
     const struct ggml_tensor * b = dst->src[1]; // K (staged, active window only)
     const struct ggml_tensor * c = dst->src[2]; // V (staged, active window only)
@@ -1500,39 +1503,30 @@ void llama_kv_lowrank_direct_attn_compute(
     GGML_ASSERT(n_stream == 1 && "kv_lowrank_direct: multi-stream not supported in this milestone");
 
     const int32_t n_tokens = (int32_t) a->ne[2];
-    const int32_t d_k_flat = n_head_kv * head_dim_k;
-    const int32_t d_v_flat = n_head_kv * head_dim_v;
-    (void) d_k_flat;
-    (void) d_v_flat;
 
     const int32_t n_rep = n_head_q / n_head_kv;
 
-    static std::atomic<bool> logged_once{false};
-    if (!logged_once.exchange(true)) {
-        LLAMA_LOG_INFO("%s: kv_lowrank_direct active (il=%d n_head_q=%d n_head_kv=%d head_dim_k=%d head_dim_v=%d cache_size=%u chunks=%zu)\n",
-                __func__, il, n_head_q, n_head_kv, head_dim_k, head_dim_v, cache_size,
-                bctx ? bctx->xkv_chunks.size() : (size_t) 0);
-    }
-
     float * out = (float *) dst->data;
     const size_t out_size = (size_t) head_dim_v * n_head_q * n_tokens;
-    memset(out, 0, out_size * sizeof(float));
 
     GGML_ASSERT((int32_t) p->q_pos.size() == n_tokens && "kv_lowrank_direct: q_pos must cover every token");
 
-    // Build the per-forward list of (rank-cache, layer_offset) refs for chunks
-    // that intersect this layer. layer_offset selects which slice of Vh's
-    // combined_dim belongs to this il inside the cross-layer group.
-    struct chunk_ref {
-        const llama_kv_blocksvd_context::rank_chunk * rc;
-        const std::vector<llama_pos> * pos;
-        int32_t layer_offset_k;   // local_layer * n_head_kv * head_dim_k
-        int32_t layer_offset_v;   // local_layer * n_head_kv * head_dim_v
-    };
-    std::vector<chunk_ref> refs;
-    refs.reserve(bctx->xkv_chunks.size());
+    // === Hoist phase: thread 0 populates rank_cache + refs list ===
+    // n_stream == 1 asserted above.
+    if (ith == 0) {
+        static std::atomic<bool> logged_once{false};
+        if (!logged_once.exchange(true)) {
+            LLAMA_LOG_INFO("%s: kv_lowrank_direct active (il=%d n_head_q=%d n_head_kv=%d head_dim_k=%d head_dim_v=%d cache_size=%u chunks=%zu nth=%d)\n",
+                    __func__, il, n_head_q, n_head_kv, head_dim_k, head_dim_v, cache_size,
+                    bctx ? bctx->xkv_chunks.size() : (size_t) 0, nth);
+        }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+        memset(out, 0, out_size * sizeof(float));
+
+        p->chunks_rank.clear();
+        p->chunks_rank.reserve(bctx->xkv_chunks.size());
+
+        const uint32_t s = 0;
         for (size_t ci = 0; ci < bctx->xkv_chunks.size(); ++ci) {
             const auto & chunk = bctx->xkv_chunks[ci];
             if (chunk.stream != s) {
@@ -1547,24 +1541,38 @@ void llama_kv_lowrank_direct_attn_compute(
                 continue;
             }
             const int32_t local_layer = il - chunk.layer_start;
-            chunk_ref ref;
+            llama_kv_lowrank_direct_chunk_ref ref;
             ref.rc = rc;
             ref.pos = &chunk.pos;
             ref.layer_offset_k = local_layer * n_head_kv * head_dim_k;
             ref.layer_offset_v = local_layer * n_head_kv * head_dim_v;
-            refs.push_back(ref);
+            p->chunks_rank.push_back(ref);
         }
 
-        std::vector<float> VKQ_acc((size_t) head_dim_v);
-        // Rank-domain scratch, reused across (hq, tq, chunk) iterations.
-        // Sized to the max rank we may encounter in refs; grown lazily below.
-        std::vector<float> qVh_k;
-        std::vector<float> v_val((size_t) head_dim_v);
+        p->hoist_done.store(1, std::memory_order_release);
+    } else {
+        while (p->hoist_done.load(std::memory_order_acquire) == 0) {
+            // spin — thread 0's hoist runs dequant per chunk (~few ms)
+        }
+    }
 
-        for (int32_t hq = 0; hq < n_head_q; ++hq) {
+    // === Compute phase: all threads split (hq, tq) work items ===
+    const uint32_t s = 0;
+    const auto & refs = p->chunks_rank;
+
+    // Per-thread scratch — declared inside the parallel region.
+    std::vector<float> VKQ_acc((size_t) head_dim_v);
+    std::vector<float> qVh_k;
+    std::vector<float> v_val((size_t) head_dim_v);
+
+    const int64_t total = (int64_t) n_head_q * n_tokens;
+    for (int64_t idx = ith; idx < total; idx += nth) {
+        const int32_t hq = (int32_t) (idx / n_tokens);
+        const int32_t tq = (int32_t) (idx % n_tokens);
+        {
             const int32_t hkv = hq / n_rep;
 
-            for (int32_t tq = 0; tq < n_tokens; ++tq) {
+            {
                 const float * q_vec = (const float *)((const char *) a->data +
                     tq * a->nb[2] + hq * a->nb[1]);
 
@@ -1616,7 +1624,7 @@ void llama_kv_lowrank_direct_attn_compute(
 
                 // --- Part 2: Compressed chunks (rank-domain) ---
                 for (const auto & ref : refs) {
-                    const auto * rc = ref.rc;
+                    const auto * rc = static_cast<const llama_kv_blocksvd_context::rank_chunk *>(ref.rc);
                     const int32_t r_k = rc->r_k;
                     const int32_t r_v = rc->r_v;
                     const int32_t combined_k_dim = rc->combined_k_dim;
@@ -1688,7 +1696,5 @@ void llama_kv_lowrank_direct_attn_compute(
                 }
             }
         }
-
-        refs.clear();
     }
 }

@@ -2364,7 +2364,7 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_tensor * args[3] = { q, k, v };
             ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
                 out_dim, n_tokens, 1, 1,
-                args, 3, compute_fn, 1, udata);
+                args, 3, compute_fn, GGML_N_TASKS_MAX, udata);
             ggml_set_name(cur, op_name);
             cb(cur, "kqv_out", il);
 

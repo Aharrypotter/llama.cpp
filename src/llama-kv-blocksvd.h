@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -292,6 +293,22 @@ void llama_kv_blocksvd_reset_decode_cache(llama_kv_blocksvd_context * ctx);
 
 struct ggml_tensor;
 
+// Per-invocation refs built by thread 0 during the hoist phase and
+// consumed read-only by all threads after the barrier.
+struct llama_chunked_attn_chunk_ref {
+    const float * k_data;
+    const float * v_data;
+    int32_t n_tokens;
+    const std::vector<llama_pos> * pos;
+};
+
+struct llama_kv_lowrank_direct_chunk_ref {
+    const void * rc; // rank_chunk *, opaque here to avoid header exposing internals
+    const std::vector<llama_pos> * pos;
+    int32_t layer_offset_k;
+    int32_t layer_offset_v;
+};
+
 // Parameters passed via userdata to the chunked attention custom op.
 struct llama_chunked_attn_params {
     const llama_kv_blocksvd_context * bctx;
@@ -307,6 +324,18 @@ struct llama_chunked_attn_params {
     uint32_t cache_size;
     std::vector<llama_pos> q_pos;
     std::vector<llama_pos> slot_pos;
+
+    // Per-invocation shared state populated by thread 0 in the hoist phase
+    // and read by all worker threads after the spin-barrier.
+    // Populated by whichever compute callback runs (chunked_attn or
+    // lowrank_direct); only one is used per callback.
+    mutable std::vector<llama_chunked_attn_chunk_ref>        chunks_dense;
+    mutable std::vector<llama_kv_lowrank_direct_chunk_ref>   chunks_rank;
+    // Atomic spin-barrier: 0 = thread 0 has not yet finished hoisting,
+    // 1 = hoist complete, worker threads may enter the compute phase.
+    // Fresh instance per graph node (per build_attn call), so no reuse
+    // hazards across ubatches.
+    mutable std::atomic<int> hoist_done{0};
 
     // Reservation-side workspace footprint of this op invocation.
     // Includes: the params struct itself, both position vectors (capacity),
