@@ -98,6 +98,11 @@ static llama_kv_blocksvd_context * make_int8_dispatch_context(std::string & err)
         llama_kv_blocksvd_free(ctx);
         return nullptr;
     }
+    if (ctx->xkv_generation != 2) {
+        err = "dispatch fixture generation did not track both xKV chunks";
+        llama_kv_blocksvd_free(ctx);
+        return nullptr;
+    }
     return ctx;
 }
 
@@ -128,6 +133,15 @@ static void test_int8_reconstruct_dispatch() {
     for (int32_t position = 0; position < 32; ++position) {
         assert(dispatch.block_positions[position] == position);
     }
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch layer_zero_dispatch;
+    ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 0, 0, 0, layer_zero_dispatch, &err);
+    assert(ok);
+    assert(layer_zero_dispatch.layer_index == 0);
+    assert(layer_zero_dispatch.u_q == dispatch.u_q);
+    assert(layer_zero_dispatch.vh_q == dispatch.vh_q);
+    assert(layer_zero_dispatch.rank_scale == dispatch.rank_scale);
+    assert(layer_zero_dispatch.block_positions == dispatch.block_positions);
 
     const size_t k_u_count  = static_cast<size_t>(dispatch.n_blocks) * dispatch.block_size * dispatch.rank_k;
     const size_t v_u_count  = static_cast<size_t>(dispatch.n_blocks) * dispatch.block_size * dispatch.rank_v;
@@ -391,6 +405,11 @@ static void test_int8_reconstruct_dispatch() {
     assert(dispatch.n_blocks == before_failure.n_blocks);
     assert(dispatch.u_q == before_failure.u_q);
 
+    const uint64_t generation_before_clear = ctx->xkv_generation;
+    llama_kv_blocksvd_clear(ctx);
+    assert(ctx->xkv_chunks.empty());
+    assert(ctx->xkv_generation == generation_before_clear + 1);
+
     std::printf("test-kv-blocksvd: INT8 reconstruct dispatch OK\n");
     llama_kv_blocksvd_free(ctx);
 }
@@ -479,6 +498,7 @@ static bool export_int8_golden(const std::filesystem::path & output_dir) {
     if (!ctx) {
         return false;
     }
+    assert(ctx->xkv_generation == 0);
 
     const int32_t group_size = 2;
     const int32_t n_head_kv  = 2;
@@ -634,6 +654,8 @@ int main(int argc, char ** argv) {
     params.layer_group_size = 2;
 
     auto * ctx = llama_kv_blocksvd_init(params);
+    assert(ctx != nullptr);
+    assert(ctx->xkv_generation == 0);
 
     const int group_size = 2;
     const int n_head_kv  = 4;
@@ -667,6 +689,7 @@ int main(int argc, char ** argv) {
             cslots, cpos, &err);
     assert(ok);
     assert(ctx->xkv_chunks.size() == 1);
+    assert(ctx->xkv_generation == 1);
 
     const auto & chunk = ctx->xkv_chunks.back();
     {

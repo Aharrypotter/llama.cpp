@@ -91,6 +91,9 @@ struct llama_kv_blocksvd_context {
 
     // For backend mode: persistent compressed xKV cross-layer chunks.
     std::vector<llama_kv_blocksvd_xkv_chunk> xkv_chunks;
+    // Incremented whenever the packed-factor set changes. Graph inputs use
+    // this to invalidate reconstruct graphs that embed a snapshot of it.
+    uint64_t                                 xkv_generation = 0;
 
     // For reconstruct mode: accumulate tokens until a full block is ready
     struct pending_layer {

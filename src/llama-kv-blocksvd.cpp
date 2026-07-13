@@ -165,7 +165,8 @@ static bool llama_kv_blocksvd_factor_matrix(
 }
 
 llama_kv_blocksvd_context * llama_kv_blocksvd_init(const llama_kv_blocksvd_params & params) {
-    auto * ctx = new llama_kv_blocksvd_context{params, {}, {}, {}, {}, {}, {}};
+    auto * ctx  = new llama_kv_blocksvd_context{};
+    ctx->params = params;
     return ctx;
 }
 
@@ -909,6 +910,7 @@ bool llama_kv_blocksvd_append_and_compress_xkv_group_store(
         chunk.v_factors  = std::move(v_factors);
 
         ctx->xkv_chunks.push_back(std::move(chunk));
+        ++ctx->xkv_generation;
 
         out_compressed_slots.insert(out_compressed_slots.end(), p->slots.begin(), p->slots.begin() + block_size);
         out_compressed_pos.insert(out_compressed_pos.end(), p->pos.begin(), p->pos.begin() + block_size);
@@ -1198,6 +1200,9 @@ void llama_kv_blocksvd_clear(llama_kv_blocksvd_context * ctx) {
         return;
     }
     llama_kv_blocksvd_clear_pending(ctx);
+    if (!ctx->xkv_chunks.empty()) {
+        ++ctx->xkv_generation;
+    }
     ctx->xkv_chunks.clear();
     ctx->layers.clear();
     ctx->decode_cache.clear();
