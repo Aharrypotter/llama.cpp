@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #undef NDEBUG
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -26,6 +27,293 @@ static bool write_raw(const std::filesystem::path & path, const std::vector<T> &
             reinterpret_cast<const char *>(values.data()),
             static_cast<std::streamsize>(values.size() * sizeof(T)));
     return output.good();
+}
+
+static llama_kv_blocksvd_context * make_int8_dispatch_context(std::string & err) {
+    llama_kv_blocksvd_params params{};
+    params.block_size       = 16;
+    params.rank             = 8;
+    params.rank_v           = 4;
+    params.quant_bits       = 8;
+    params.cross_layer      = true;
+    params.layer_group_size = 2;
+
+    auto * ctx = llama_kv_blocksvd_init(params);
+    if (!ctx) {
+        err = "could not initialize dispatch context";
+        return nullptr;
+    }
+
+    constexpr int32_t group_size = 2;
+    constexpr int32_t n_head_kv  = 2;
+    constexpr int32_t head_dim_k = 32;
+    constexpr int32_t head_dim_v = 16;
+    constexpr int32_t n_tokens   = 16;
+    constexpr int32_t d_k        = n_head_kv * head_dim_k;
+    constexpr int32_t d_v        = n_head_kv * head_dim_v;
+
+    std::mt19937                          generator(20260716);
+    std::uniform_real_distribution<float> distribution(-0.5f, 0.5f);
+
+    // Insert the later block first so the dispatch packer must establish the
+    // position-sorted consumer order rather than inheriting storage order.
+    for (int32_t first_position : { 16, 0 }) {
+        std::vector<std::vector<float>> k(group_size), v(group_size);
+        std::vector<const float *>      kp(group_size), vp(group_size);
+        for (int32_t layer = 0; layer < group_size; ++layer) {
+            k[layer].resize(static_cast<size_t>(n_tokens) * d_k);
+            v[layer].resize(static_cast<size_t>(n_tokens) * d_v);
+            for (float & value : k[layer]) {
+                value = distribution(generator);
+            }
+            for (float & value : v[layer]) {
+                value = distribution(generator);
+            }
+            kp[layer] = k[layer].data();
+            vp[layer] = v[layer].data();
+        }
+
+        std::vector<uint32_t>  slots(n_tokens);
+        std::vector<llama_pos> positions(n_tokens);
+        for (int32_t token = 0; token < n_tokens; ++token) {
+            slots[token]     = static_cast<uint32_t>(first_position + token);
+            positions[token] = first_position + token;
+        }
+
+        std::vector<uint32_t>  compressed_slots;
+        std::vector<llama_pos> compressed_positions;
+        if (!llama_kv_blocksvd_append_and_compress_xkv_group_store(ctx, 0, kp, vp, slots.data(), positions.data(),
+                                                                   n_tokens, 0, 0, n_head_kv, head_dim_k, head_dim_v,
+                                                                   compressed_slots, compressed_positions, &err)) {
+            llama_kv_blocksvd_free(ctx);
+            return nullptr;
+        }
+    }
+
+    if (ctx->xkv_chunks.size() != 2) {
+        err = "dispatch fixture did not produce two xKV chunks";
+        llama_kv_blocksvd_free(ctx);
+        return nullptr;
+    }
+    return ctx;
+}
+
+static size_t align_dispatch_bytes(size_t bytes) {
+    constexpr size_t alignment = llama_kv_blocksvd_int8_reconstruct_dispatch::buffer_alignment;
+    return ((bytes + alignment - 1) / alignment) * alignment;
+}
+
+static void test_int8_reconstruct_dispatch() {
+    std::string err;
+    auto *      ctx = make_int8_dispatch_context(err);
+    assert(ctx != nullptr);
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+    bool ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 1, 0, 0, dispatch, &err);
+    assert(ok);
+    assert(dispatch.n_blocks == 2);
+    assert(dispatch.block_size == 16);
+    assert(dispatch.rank_k == 8);
+    assert(dispatch.rank_v == 4);
+    assert(dispatch.group_size == 2);
+    assert(dispatch.layer_start == 0);
+    assert(dispatch.layer_index == 1);
+    assert(dispatch.n_head_kv == 2);
+    assert(dispatch.head_dim_k == 32);
+    assert(dispatch.head_dim_v == 16);
+    assert(dispatch.block_positions.size() == 32);
+    for (int32_t position = 0; position < 32; ++position) {
+        assert(dispatch.block_positions[position] == position);
+    }
+
+    const size_t k_u_count  = static_cast<size_t>(dispatch.n_blocks) * dispatch.block_size * dispatch.rank_k;
+    const size_t v_u_count  = static_cast<size_t>(dispatch.n_blocks) * dispatch.block_size * dispatch.rank_v;
+    const size_t k_vh_count = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_k * dispatch.group_size *
+                              dispatch.n_head_kv * dispatch.head_dim_k;
+    const size_t v_vh_count = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_v * dispatch.group_size *
+                              dispatch.n_head_kv * dispatch.head_dim_v;
+    const size_t k_scale_count = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_k;
+    const size_t v_scale_count = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_v;
+
+    assert(dispatch.v_u_offset_bytes == static_cast<int32_t>(align_dispatch_bytes(k_u_count)));
+    assert(dispatch.v_vh_offset_bytes == static_cast<int32_t>(align_dispatch_bytes(k_vh_count)));
+    assert(dispatch.v_rank_scale_offset_bytes ==
+           static_cast<int32_t>(align_dispatch_bytes(k_scale_count * sizeof(float))));
+    assert(dispatch.u_q.size() * sizeof(int8_t) == align_dispatch_bytes(dispatch.v_u_offset_bytes + v_u_count));
+    assert(dispatch.vh_q.size() * sizeof(int8_t) == align_dispatch_bytes(dispatch.v_vh_offset_bytes + v_vh_count));
+    assert(dispatch.rank_scale.size() * sizeof(float) ==
+           align_dispatch_bytes(dispatch.v_rank_scale_offset_bytes + v_scale_count * sizeof(float)));
+
+    for (size_t i = k_u_count; i < static_cast<size_t>(dispatch.v_u_offset_bytes); ++i) {
+        assert(dispatch.u_q[i] == 0);
+    }
+    for (size_t i = k_vh_count; i < static_cast<size_t>(dispatch.v_vh_offset_bytes); ++i) {
+        assert(dispatch.vh_q[i] == 0);
+    }
+    for (size_t i = k_scale_count; i < static_cast<size_t>(dispatch.v_rank_scale_offset_bytes) / sizeof(float); ++i) {
+        assert(dispatch.rank_scale[i] == 0.0f);
+    }
+
+    const size_t dense_k_bytes =
+        static_cast<size_t>(dispatch.n_head_kv) * dispatch.n_blocks * dispatch.block_size * dispatch.head_dim_k * 2;
+    const size_t dense_v_bytes =
+        static_cast<size_t>(dispatch.n_head_kv) * dispatch.n_blocks * dispatch.block_size * dispatch.head_dim_v * 2;
+    assert(dispatch.dense_v_offset_bytes == static_cast<int32_t>(align_dispatch_bytes(dense_k_bytes)));
+    assert(dispatch.dense_total_bytes ==
+           static_cast<int32_t>(align_dispatch_bytes(dispatch.dense_v_offset_bytes + dense_v_bytes)));
+    const auto htp_op_params = dispatch.htp_op_params();
+    static_assert(llama_kv_blocksvd_int8_reconstruct_dispatch::htp_op_param_count <= 16);
+    assert(htp_op_params[0] == dispatch.n_blocks);
+    assert(htp_op_params[5] == dispatch.layer_index);
+    assert(htp_op_params[9] == dispatch.v_u_offset_bytes);
+    assert(htp_op_params[13] == dispatch.dense_total_bytes);
+
+    const auto * k_u_q   = dispatch.u_q.data();
+    const auto * v_u_q   = dispatch.u_q.data() + dispatch.v_u_offset_bytes;
+    const auto * k_vh_q  = dispatch.vh_q.data();
+    const auto * v_vh_q  = dispatch.vh_q.data() + dispatch.v_vh_offset_bytes;
+    const auto * k_scale = dispatch.rank_scale.data();
+    const auto * v_scale = dispatch.rank_scale.data() + dispatch.v_rank_scale_offset_bytes / sizeof(float);
+
+    std::vector<const llama_kv_blocksvd_xkv_chunk *> sorted_chunks;
+    for (const auto & chunk : ctx->xkv_chunks) {
+        sorted_chunks.push_back(&chunk);
+    }
+    std::sort(sorted_chunks.begin(), sorted_chunks.end(),
+              [](const auto * lhs, const auto * rhs) { return lhs->pos.front() < rhs->pos.front(); });
+
+    for (int32_t block = 0; block < dispatch.n_blocks; ++block) {
+        std::vector<std::vector<float>> dense_k;
+        std::vector<std::vector<float>> dense_v;
+        ok = llama_kv_blocksvd_decompress_xkv_chunk(*sorted_chunks[block], dense_k, dense_v, &err);
+        assert(ok);
+        for (int32_t token = 0; token < dispatch.block_size; ++token) {
+            for (int32_t head = 0; head < dispatch.n_head_kv; ++head) {
+                for (int32_t d = 0; d < dispatch.head_dim_k; ++d) {
+                    float actual = 0.0f;
+                    for (int32_t rank = 0; rank < dispatch.rank_k; ++rank) {
+                        const size_t u_index =
+                            (static_cast<size_t>(block) * dispatch.block_size + token) * dispatch.rank_k + rank;
+                        const size_t vh_index =
+                            ((((static_cast<size_t>(block) * dispatch.rank_k + rank) * dispatch.group_size +
+                               dispatch.layer_index) *
+                                  dispatch.n_head_kv +
+                              head) *
+                             dispatch.head_dim_k) +
+                            d;
+                        actual += static_cast<float>(k_u_q[u_index]) *
+                                  k_scale[static_cast<size_t>(block) * dispatch.rank_k + rank] *
+                                  static_cast<float>(k_vh_q[vh_index]);
+                    }
+                    const size_t reference_index =
+                        (static_cast<size_t>(token) * dispatch.n_head_kv + head) * dispatch.head_dim_k + d;
+                    assert(std::fabs(actual - dense_k[dispatch.layer_index][reference_index]) < 1e-5f);
+                }
+                for (int32_t d = 0; d < dispatch.head_dim_v; ++d) {
+                    float actual = 0.0f;
+                    for (int32_t rank = 0; rank < dispatch.rank_v; ++rank) {
+                        const size_t u_index =
+                            (static_cast<size_t>(block) * dispatch.block_size + token) * dispatch.rank_v + rank;
+                        const size_t vh_index =
+                            ((((static_cast<size_t>(block) * dispatch.rank_v + rank) * dispatch.group_size +
+                               dispatch.layer_index) *
+                                  dispatch.n_head_kv +
+                              head) *
+                             dispatch.head_dim_v) +
+                            d;
+                        actual += static_cast<float>(v_u_q[u_index]) *
+                                  v_scale[static_cast<size_t>(block) * dispatch.rank_v + rank] *
+                                  static_cast<float>(v_vh_q[vh_index]);
+                    }
+                    const size_t reference_index =
+                        (static_cast<size_t>(token) * dispatch.n_head_kv + head) * dispatch.head_dim_v + d;
+                    assert(std::fabs(actual - dense_v[dispatch.layer_index][reference_index]) < 1e-5f);
+                }
+            }
+        }
+    }
+
+    const auto  before_failure = dispatch;
+    std::string failure_error;
+    ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 99, 0, 0, dispatch, &failure_error);
+    assert(!ok);
+    assert(!failure_error.empty());
+    assert(dispatch.n_blocks == before_failure.n_blocks);
+    assert(dispatch.u_q == before_failure.u_q);
+
+    std::printf("test-kv-blocksvd: INT8 reconstruct dispatch OK\n");
+    llama_kv_blocksvd_free(ctx);
+}
+
+static bool export_int8_dispatch_golden(const std::filesystem::path & output_dir) {
+    std::string err;
+    auto *      ctx = make_int8_dispatch_context(err);
+    if (!ctx) {
+        std::fprintf(stderr, "INT8 dispatch fixture setup failed: %s\n", err.c_str());
+        return false;
+    }
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+    bool ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 1, 0, 0, dispatch, &err);
+    if (!ok) {
+        std::fprintf(stderr, "INT8 dispatch pack failed: %s\n", err.c_str());
+        llama_kv_blocksvd_free(ctx);
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(output_dir, filesystem_error);
+    if (filesystem_error) {
+        std::fprintf(stderr, "Could not create dispatch golden directory: %s\n", filesystem_error.message().c_str());
+        llama_kv_blocksvd_free(ctx);
+        return false;
+    }
+
+    ok = write_raw(output_dir / "u_q.i8", dispatch.u_q) && write_raw(output_dir / "vh_q.i8", dispatch.vh_q) &&
+         write_raw(output_dir / "rank_scale.f32", dispatch.rank_scale) &&
+         write_raw(output_dir / "block_positions.i32", dispatch.block_positions);
+    if (!ok) {
+        std::fprintf(stderr, "Could not write one or more dispatch golden data files\n");
+        llama_kv_blocksvd_free(ctx);
+        return false;
+    }
+
+    std::ofstream manifest(output_dir / "manifest.json");
+    manifest << "{\n"
+             << "  \"schema_version\": 1,\n"
+             << "  \"storage_abi\": \"htp_4src_1dst_aligned_v1\",\n"
+             << "  \"producer\": \"llama.cpp BlockSVD xKV dispatch packer\",\n"
+             << "  \"source_seed\": 20260716,\n"
+             << "  \"n_blocks\": " << dispatch.n_blocks << ",\n"
+             << "  \"block_size\": " << dispatch.block_size << ",\n"
+             << "  \"r_k\": " << dispatch.rank_k << ",\n"
+             << "  \"r_v\": " << dispatch.rank_v << ",\n"
+             << "  \"group_size\": " << dispatch.group_size << ",\n"
+             << "  \"layer_start\": " << dispatch.layer_start << ",\n"
+             << "  \"layer_index\": " << dispatch.layer_index << ",\n"
+             << "  \"h_kv\": " << dispatch.n_head_kv << ",\n"
+             << "  \"d_k\": " << dispatch.head_dim_k << ",\n"
+             << "  \"d_v\": " << dispatch.head_dim_v << ",\n"
+             << "  \"buffer_alignment\": " << dispatch.buffer_alignment << ",\n"
+             << "  \"v_u_offset_bytes\": " << dispatch.v_u_offset_bytes << ",\n"
+             << "  \"v_vh_offset_bytes\": " << dispatch.v_vh_offset_bytes << ",\n"
+             << "  \"v_rank_scale_offset_bytes\": " << dispatch.v_rank_scale_offset_bytes << ",\n"
+             << "  \"dense_v_offset_bytes\": " << dispatch.dense_v_offset_bytes << ",\n"
+             << "  \"dense_total_bytes\": " << dispatch.dense_total_bytes << ",\n"
+             << "  \"u_buffer_bytes\": " << dispatch.u_q.size() * sizeof(int8_t) << ",\n"
+             << "  \"vh_buffer_bytes\": " << dispatch.vh_q.size() * sizeof(int8_t) << ",\n"
+             << "  \"rank_scale_buffer_bytes\": " << dispatch.rank_scale.size() * sizeof(float) << ",\n"
+             << "  \"htp_op_params\": [" << dispatch.n_blocks << ", " << dispatch.block_size << ", " << dispatch.rank_k
+             << ", " << dispatch.rank_v << ", " << dispatch.group_size << ", " << dispatch.layer_index << ", "
+             << dispatch.n_head_kv << ", " << dispatch.head_dim_k << ", " << dispatch.head_dim_v << ", "
+             << dispatch.v_u_offset_bytes << ", " << dispatch.v_vh_offset_bytes << ", "
+             << dispatch.v_rank_scale_offset_bytes << ", " << dispatch.dense_v_offset_bytes << ", "
+             << dispatch.dense_total_bytes << "]\n"
+             << "}\n";
+    ok = manifest.good();
+
+    llama_kv_blocksvd_free(ctx);
+    return ok;
 }
 
 static bool export_int8_golden(const std::filesystem::path & output_dir) {
@@ -173,12 +461,15 @@ static bool export_int8_golden(const std::filesystem::path & output_dir) {
 }
 
 int main(int argc, char ** argv) {
-    const char * export_dir = nullptr;
+    const char * export_dir          = nullptr;
+    const char * dispatch_export_dir = nullptr;
     if (argc != 1) {
         if (argc == 3 && std::string(argv[1]) == "--export-int8-golden") {
             export_dir = argv[2];
+        } else if (argc == 3 && std::string(argv[1]) == "--export-int8-dispatch-golden") {
+            dispatch_export_dir = argv[2];
         } else {
-            std::fprintf(stderr, "usage: %s [--export-int8-golden DIR]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--export-int8-golden DIR | --export-int8-dispatch-golden DIR]\n", argv[0]);
             return 2;
         }
     }
@@ -420,6 +711,11 @@ int main(int argc, char ** argv) {
     }
 
     if (export_dir && !export_int8_golden(export_dir)) {
+        llama_kv_blocksvd_free(ctx);
+        return 1;
+    }
+    test_int8_reconstruct_dispatch();
+    if (dispatch_export_dir && !export_int8_dispatch_golden(dispatch_export_dir)) {
         llama_kv_blocksvd_free(ctx);
         return 1;
     }
