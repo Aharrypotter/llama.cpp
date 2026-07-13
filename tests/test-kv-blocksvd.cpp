@@ -472,6 +472,78 @@ static void test_int8_reconstruct_pool() {
         assert(pool.block_positions[index] == -1);
     }
 
+    const auto assert_component_prefix_unchanged = [](const auto & before,
+                                                       size_t       before_base,
+                                                       const auto & after,
+                                                       size_t       after_base,
+                                                       size_t       stride,
+                                                       size_t       blocks) {
+        assert(std::equal(
+            before.begin() + before_base, before.begin() + before_base + blocks * stride,
+            after.begin() + after_base));
+    };
+    const auto append_fixture_block = [ctx](int32_t first_position) {
+        auto chunk = ctx->xkv_chunks.front();
+        for (int32_t token = 0; token < static_cast<int32_t>(chunk.pos.size()); ++token) {
+            chunk.slots[token] = static_cast<uint32_t>(first_position + token);
+            chunk.pos[token]   = first_position + token;
+        }
+        chunk.materialized = false;
+        ctx->xkv_chunks.push_back(std::move(chunk));
+        ++ctx->xkv_generation;
+    };
+
+    auto before_append = pool;
+    append_fixture_block(32);
+    llama_kv_blocksvd_int8_pool_update update;
+    ok = llama_kv_blocksvd_refresh_int8_reconstruct_pool(*ctx, 1, 0, 0, pool, update, &err);
+    assert(ok);
+    assert(!update.full_repack);
+    assert(update.first_dirty_block == 2);
+    assert(update.last_dirty_block == 3);
+    assert(pool.valid_blocks == 3);
+    assert_component_prefix_unchanged(before_append.u_q, 0, pool.u_q, 0, k_u_stride, 2);
+    assert_component_prefix_unchanged(before_append.u_q, static_cast<size_t>(before_append.v_u_offset_bytes),
+                                      pool.u_q, static_cast<size_t>(pool.v_u_offset_bytes), v_u_stride, 2);
+    assert_component_prefix_unchanged(before_append.vh_q, 0, pool.vh_q, 0, k_vh_stride, 2);
+    assert_component_prefix_unchanged(before_append.vh_q, static_cast<size_t>(before_append.v_vh_offset_bytes),
+                                      pool.vh_q, static_cast<size_t>(pool.v_vh_offset_bytes), v_vh_stride, 2);
+    assert_component_prefix_unchanged(before_append.rank_scale, 0, pool.rank_scale, 0,
+                                      static_cast<size_t>(pool.rank_k), 2);
+    assert_component_prefix_unchanged(
+        before_append.rank_scale,
+        static_cast<size_t>(before_append.v_rank_scale_offset_bytes) / sizeof(float), pool.rank_scale,
+        static_cast<size_t>(pool.v_rank_scale_offset_bytes) / sizeof(float), static_cast<size_t>(pool.rank_v), 2);
+    assert_component_prefix_unchanged(before_append.block_positions, 0, pool.block_positions, 0,
+                                      static_cast<size_t>(pool.block_size), 2);
+    for (int32_t position = 32; position < 48; ++position) {
+        assert(pool.block_positions[position] == position);
+    }
+
+    ok = llama_kv_blocksvd_refresh_int8_reconstruct_pool(*ctx, 1, 0, 0, pool, update, &err);
+    assert(ok);
+    assert(!update.full_repack);
+    assert(update.first_dirty_block == 3);
+    assert(update.last_dirty_block == 3);
+
+    before_append = pool;
+    append_fixture_block(48);
+    ok = llama_kv_blocksvd_refresh_int8_reconstruct_pool(*ctx, 1, 0, 0, pool, update, &err);
+    assert(ok);
+    assert(!update.full_repack);
+    assert(update.first_dirty_block == 3);
+    assert(update.last_dirty_block == 4);
+    assert(pool.valid_blocks == 4);
+    assert_component_prefix_unchanged(before_append.u_q, 0, pool.u_q, 0, k_u_stride, 3);
+    assert_component_prefix_unchanged(before_append.vh_q, 0, pool.vh_q, 0, k_vh_stride, 3);
+    assert_component_prefix_unchanged(before_append.rank_scale, 0, pool.rank_scale, 0,
+                                      static_cast<size_t>(pool.rank_k), 3);
+    assert_component_prefix_unchanged(before_append.block_positions, 0, pool.block_positions, 0,
+                                      static_cast<size_t>(pool.block_size), 3);
+    for (int32_t position = 48; position < 64; ++position) {
+        assert(pool.block_positions[position] == position);
+    }
+
     const auto before_failure = pool;
     ok = llama_kv_blocksvd_pack_int8_reconstruct_pool(*ctx, 1, 0, 0, 1, pool, &err);
     assert(!ok);

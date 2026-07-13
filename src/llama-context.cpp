@@ -458,6 +458,15 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef LLAMA_KV_BLOCKSVD
+    // The execution registry owns backend buffers. Drop the context-owned
+    // reference while the scheduler and backends are still alive; graph inputs
+    // keep any in-flight pool alive until the graph results are destroyed.
+    if (kv_blocksvd_shadow) {
+        kv_blocksvd_shadow->execution_pools.reset();
+    }
+#endif
+
     if (kv_lowrank_ctx.enabled() && !kv_lowrank_ctx.params.samples_path.empty()) {
         std::string sample_error;
         if (llama_kv_lowrank_context_write_samples_npz(

@@ -126,10 +126,10 @@ class llm_graph_input_blocksvd_state final : public llm_graph_input_i {
 
 class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
   public:
-    llm_graph_input_blocksvd_dispatch(const llama_kv_blocksvd_context *           bctx,
-                                      llama_kv_blocksvd_int8_reconstruct_dispatch dispatch) :
+    llm_graph_input_blocksvd_dispatch(const llama_kv_blocksvd_context *   bctx,
+                                      llama_kv_blocksvd_int8_backend_view view) :
         bctx(bctx),
-        dispatch(std::move(dispatch)),
+        view(std::move(view)),
         observed_generation(bctx->xkv_generation) {}
 
     void add_consumer(llama_chunked_attn_params * consumer) {
@@ -139,90 +139,12 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
-        GGML_ASSERT(u_q && vh_q && rank_scale && block_positions);
-        GGML_ASSERT(ggml_nbytes(u_q) == dispatch.u_q.size() * sizeof(int8_t));
-        GGML_ASSERT(ggml_nbytes(vh_q) == dispatch.vh_q.size() * sizeof(int8_t));
-        GGML_ASSERT(ggml_nbytes(rank_scale) == dispatch.rank_scale.size() * sizeof(float));
-        GGML_ASSERT(ggml_nbytes(block_positions) == dispatch.block_positions.size() * sizeof(int32_t));
-
-        if (!uploaded) {
-            ggml_backend_tensor_set(u_q, dispatch.u_q.data(), 0, ggml_nbytes(u_q));
-            ggml_backend_tensor_set(vh_q, dispatch.vh_q.data(), 0, ggml_nbytes(vh_q));
-            ggml_backend_tensor_set(rank_scale, dispatch.rank_scale.data(), 0, ggml_nbytes(rank_scale));
-            ggml_backend_tensor_set(
-                block_positions, dispatch.block_positions.data(), 0, ggml_nbytes(block_positions));
-            LLAMA_LOG_DEBUG(
-                "%s: uploaded pool generation=%llu layer_group=[%d,%d) capacity=%d valid=%d bytes=%zu\n",
-                __func__, (unsigned long long) observed_generation, dispatch.layer_start,
-                dispatch.layer_start + dispatch.group_size, dispatch.n_blocks, dispatch.valid_blocks,
-                dispatch.u_q.size() * sizeof(int8_t) + dispatch.vh_q.size() * sizeof(int8_t) +
-                    dispatch.rank_scale.size() * sizeof(float) +
-                    dispatch.block_positions.size() * sizeof(int32_t));
-            uploaded = true;
-            update_consumers();
-            return;
+        std::string error;
+        if (!llama_kv_blocksvd_sync_int8_backend_pool(*bctx, view, &error)) {
+            GGML_ABORT("%s: could not synchronize EdgeKV backend pool: %s\n", __func__, error.c_str());
         }
-
-        if (observed_generation == bctx->xkv_generation) {
-            update_consumers();
-            return;
-        }
-
-        llama_kv_blocksvd_int8_reconstruct_dispatch next;
-        std::string                                    error;
-        if (!llama_kv_blocksvd_pack_int8_reconstruct_pool(
-                *bctx, dispatch.layer_start + dispatch.layer_index, dispatch.stream, dispatch.seq_id,
-                dispatch.n_blocks, next, &error)) {
-            GGML_ABORT("%s: could not refresh EdgeKV factor pool: %s\n", __func__, error.c_str());
-        }
-        GGML_ASSERT(same_static_layout(dispatch, next));
-
-        size_t first_dirty = static_cast<size_t>(dispatch.n_blocks);
-        size_t last_dirty  = 0;
-        for (size_t block = 0; block < static_cast<size_t>(dispatch.n_blocks); ++block) {
-            if (!same_block(dispatch, next, block)) {
-                first_dirty = std::min(first_dirty, block);
-                last_dirty  = block + 1;
-            }
-        }
-
-        const int32_t previous_valid = dispatch.valid_blocks;
-        size_t        dirty_bytes    = 0;
-        if (first_dirty < last_dirty) {
-            const size_t dirty_blocks = last_dirty - first_dirty;
-            const size_t k_u_stride = static_cast<size_t>(dispatch.block_size) * dispatch.rank_k;
-            const size_t v_u_stride = static_cast<size_t>(dispatch.block_size) * dispatch.rank_v;
-            const size_t k_vh_stride = static_cast<size_t>(dispatch.rank_k) * dispatch.group_size *
-                                       dispatch.n_head_kv * dispatch.head_dim_k;
-            const size_t v_vh_stride = static_cast<size_t>(dispatch.rank_v) * dispatch.group_size *
-                                       dispatch.n_head_kv * dispatch.head_dim_v;
-            const size_t k_scale_stride = static_cast<size_t>(dispatch.rank_k);
-            const size_t v_scale_stride = static_cast<size_t>(dispatch.rank_v);
-            const size_t position_stride = static_cast<size_t>(dispatch.block_size);
-
-            dirty_bytes += upload_blocks(u_q, next.u_q, 0, k_u_stride, first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(u_q, next.u_q, static_cast<size_t>(next.v_u_offset_bytes), v_u_stride,
-                                         first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(vh_q, next.vh_q, 0, k_vh_stride, first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(vh_q, next.vh_q, static_cast<size_t>(next.v_vh_offset_bytes), v_vh_stride,
-                                         first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(rank_scale, next.rank_scale, 0, k_scale_stride, first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(rank_scale, next.rank_scale,
-                                         static_cast<size_t>(next.v_rank_scale_offset_bytes) / sizeof(float),
-                                         v_scale_stride, first_dirty, dirty_blocks);
-            dirty_bytes += upload_blocks(
-                block_positions, next.block_positions, 0, position_stride, first_dirty, dirty_blocks);
-        }
-
         observed_generation = bctx->xkv_generation;
-        dispatch            = std::move(next);
         update_consumers();
-        LLAMA_LOG_DEBUG(
-            "%s: updated pool generation=%llu layer_group=[%d,%d) capacity=%d valid=%d->%d dirty=[%zu,%zu) "
-            "bytes=%zu\n",
-            __func__, (unsigned long long) observed_generation, dispatch.layer_start,
-            dispatch.layer_start + dispatch.group_size, dispatch.n_blocks, previous_valid, dispatch.valid_blocks,
-            first_dirty, last_dirty, dirty_bytes);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -234,6 +156,7 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
             return true;
         }
 
+        const auto & dispatch = storage();
         size_t matching_blocks = 0;
         for (const auto & chunk : bctx->xkv_chunks) {
             if (chunk.layer_start != dispatch.layer_start || chunk.stream != dispatch.stream ||
@@ -248,75 +171,25 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
         return matching_blocks > 0 && matching_blocks <= static_cast<size_t>(dispatch.n_blocks);
     }
 
-    bool matches(const llama_kv_blocksvd_context * candidate_bctx,
-                 int32_t                           layer,
-                 uint32_t                          stream,
-                 llama_seq_id                      seq_id) const {
-        return candidate_bctx == bctx && dispatch.stream == stream && dispatch.seq_id == seq_id &&
-               layer >= dispatch.layer_start &&
-               layer < dispatch.layer_start + dispatch.group_size;
+    bool matches(const llama_kv_blocksvd_context *           candidate_bctx,
+                 const llama_kv_blocksvd_int8_backend_view & candidate_view) const {
+        return candidate_bctx == bctx && candidate_view.owner == view.owner;
     }
 
-    ggml_tensor * u_q             = nullptr;
-    ggml_tensor * vh_q            = nullptr;
-    ggml_tensor * rank_scale      = nullptr;
-    ggml_tensor * block_positions = nullptr;
+    const llama_kv_blocksvd_int8_reconstruct_dispatch & storage() const {
+        GGML_ASSERT(view.storage);
+        return *view.storage;
+    }
 
-    const llama_kv_blocksvd_context *           bctx;
-    llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+    ggml_tensor * u_q() const { return view.u_q; }
+    ggml_tensor * vh_q() const { return view.vh_q; }
+    ggml_tensor * rank_scale() const { return view.rank_scale; }
+    ggml_tensor * block_positions() const { return view.block_positions; }
+    ggml_backend_t backend() const { return view.backend; }
 
   private:
-    template<typename T>
-    static bool same_component_block(
-            const std::vector<T> & lhs,
-            const std::vector<T> & rhs,
-            size_t                 base,
-            size_t                 stride,
-            size_t                 block) {
-        const size_t offset = base + block * stride;
-        GGML_ASSERT(offset + stride <= lhs.size() && offset + stride <= rhs.size());
-        return std::equal(lhs.begin() + offset, lhs.begin() + offset + stride, rhs.begin() + offset);
-    }
-
-    static bool same_block(const llama_kv_blocksvd_int8_reconstruct_dispatch & lhs,
-                           const llama_kv_blocksvd_int8_reconstruct_dispatch & rhs,
-                           size_t                                               block) {
-        const size_t k_u_stride = static_cast<size_t>(lhs.block_size) * lhs.rank_k;
-        const size_t v_u_stride = static_cast<size_t>(lhs.block_size) * lhs.rank_v;
-        const size_t k_vh_stride = static_cast<size_t>(lhs.rank_k) * lhs.group_size * lhs.n_head_kv * lhs.head_dim_k;
-        const size_t v_vh_stride = static_cast<size_t>(lhs.rank_v) * lhs.group_size * lhs.n_head_kv * lhs.head_dim_v;
-        const size_t k_scale_stride = static_cast<size_t>(lhs.rank_k);
-        const size_t v_scale_stride = static_cast<size_t>(lhs.rank_v);
-        const size_t position_stride = static_cast<size_t>(lhs.block_size);
-
-        return same_component_block(lhs.u_q, rhs.u_q, 0, k_u_stride, block) &&
-               same_component_block(lhs.u_q, rhs.u_q, static_cast<size_t>(lhs.v_u_offset_bytes), v_u_stride, block) &&
-               same_component_block(lhs.vh_q, rhs.vh_q, 0, k_vh_stride, block) &&
-               same_component_block(lhs.vh_q, rhs.vh_q, static_cast<size_t>(lhs.v_vh_offset_bytes), v_vh_stride,
-                                    block) &&
-               same_component_block(lhs.rank_scale, rhs.rank_scale, 0, k_scale_stride, block) &&
-               same_component_block(lhs.rank_scale, rhs.rank_scale,
-                                    static_cast<size_t>(lhs.v_rank_scale_offset_bytes) / sizeof(float),
-                                    v_scale_stride, block) &&
-               same_component_block(lhs.block_positions, rhs.block_positions, 0, position_stride, block);
-    }
-
-    static bool same_static_layout(const llama_kv_blocksvd_int8_reconstruct_dispatch & lhs,
-                                   const llama_kv_blocksvd_int8_reconstruct_dispatch & rhs) {
-        return lhs.n_blocks == rhs.n_blocks && lhs.block_size == rhs.block_size && lhs.rank_k == rhs.rank_k &&
-               lhs.rank_v == rhs.rank_v && lhs.group_size == rhs.group_size &&
-               lhs.layer_start == rhs.layer_start && lhs.layer_index == rhs.layer_index &&
-               lhs.n_head_kv == rhs.n_head_kv && lhs.head_dim_k == rhs.head_dim_k &&
-               lhs.head_dim_v == rhs.head_dim_v && lhs.stream == rhs.stream && lhs.seq_id == rhs.seq_id &&
-               lhs.v_u_offset_bytes == rhs.v_u_offset_bytes && lhs.v_vh_offset_bytes == rhs.v_vh_offset_bytes &&
-               lhs.v_rank_scale_offset_bytes == rhs.v_rank_scale_offset_bytes &&
-               lhs.dense_v_offset_bytes == rhs.dense_v_offset_bytes &&
-               lhs.dense_total_bytes == rhs.dense_total_bytes && lhs.u_q.size() == rhs.u_q.size() &&
-               lhs.vh_q.size() == rhs.vh_q.size() && lhs.rank_scale.size() == rhs.rank_scale.size() &&
-               lhs.block_positions.size() == rhs.block_positions.size();
-    }
-
     bool matches_static_shape(const llama_kv_blocksvd_xkv_chunk & chunk) const {
+        const auto & dispatch = storage();
         return chunk.group_size == dispatch.group_size && chunk.n_head_kv == dispatch.n_head_kv &&
                chunk.head_dim_k == dispatch.head_dim_k && chunk.head_dim_v == dispatch.head_dim_v &&
                chunk.k_factors.rank == dispatch.rank_k && chunk.v_factors.rank == dispatch.rank_v &&
@@ -325,30 +198,17 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
                chunk.pos.size() == static_cast<size_t>(dispatch.block_size);
     }
 
-    template<typename T>
-    static size_t upload_blocks(ggml_tensor *         tensor,
-                                const std::vector<T> & values,
-                                size_t                 base,
-                                size_t                 stride,
-                                size_t                 first_block,
-                                size_t                 block_count) {
-        const size_t element_offset = base + first_block * stride;
-        const size_t element_count  = block_count * stride;
-        GGML_ASSERT(element_offset + element_count <= values.size());
-        ggml_backend_tensor_set(tensor, values.data() + element_offset, element_offset * sizeof(T),
-                                element_count * sizeof(T));
-        return element_count * sizeof(T);
-    }
-
     void update_consumers() const {
+        const auto & dispatch = storage();
         for (auto * consumer : consumers) {
             consumer->edgekv_positions.assign(dispatch.block_positions.begin(), dispatch.block_positions.end());
         }
     }
 
+    const llama_kv_blocksvd_context *         bctx;
+    llama_kv_blocksvd_int8_backend_view       view;
     uint64_t                                  observed_generation;
     std::vector<llama_chunked_attn_params *> consumers;
-    bool                                      uploaded = false;
 };
 
 static int32_t blocksvd_pool_capacity(size_t valid_blocks) {
@@ -2753,70 +2613,54 @@ ggml_tensor * llm_graph_context::build_attn(
                     }
                 }
 
+                llama_kv_blocksvd_int8_backend_view backend_view;
+                std::string                         dispatch_error;
+                bool                                dispatch_available = false;
+                const size_t valid_blocks = blocksvd_matching_block_count(*bctx, il, 0, edgekv_seq_id);
+                if (valid_blocks == 0) {
+                    dispatch_error = "no xKV chunks match layer, stream, and sequence";
+                } else if (valid_blocks > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                    dispatch_error = "dispatch block count exceeds int32_t";
+                } else {
+                    dispatch_available = llama_kv_blocksvd_acquire_int8_backend_pool(
+                        *bctx, il, 0, edgekv_seq_id, blocksvd_pool_capacity(valid_blocks), sched, backend_cpu,
+                        backend_view, &dispatch_error);
+                }
+
                 llm_graph_input_blocksvd_dispatch * edgekv_input = nullptr;
-                for (const auto & input : res->inputs) {
-                    auto * candidate = dynamic_cast<llm_graph_input_blocksvd_dispatch *>(input.get());
-                    if (candidate && candidate->matches(bctx, il, 0, edgekv_seq_id)) {
-                        edgekv_input = candidate;
-                        break;
+                if (dispatch_available) {
+                    for (const auto & input : res->inputs) {
+                        auto * candidate = dynamic_cast<llm_graph_input_blocksvd_dispatch *>(input.get());
+                        if (candidate && candidate->matches(bctx, backend_view)) {
+                            edgekv_input = candidate;
+                            break;
+                        }
                     }
                 }
 
-                llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
-                std::string dispatch_error;
-                bool                                        dispatch_available = edgekv_input != nullptr;
-                if (!dispatch_available) {
-                    const size_t valid_blocks = blocksvd_matching_block_count(*bctx, il, 0, edgekv_seq_id);
-                    if (valid_blocks == 0) {
-                        dispatch_error = "no xKV chunks match layer, stream, and sequence";
-                    } else if (valid_blocks > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-                        dispatch_error = "dispatch block count exceeds int32_t";
-                    } else {
-                        dispatch_available = llama_kv_blocksvd_pack_int8_reconstruct_pool(
-                            *bctx, il, 0, edgekv_seq_id, blocksvd_pool_capacity(valid_blocks), dispatch,
-                            &dispatch_error);
-                    }
-                }
-
-                const auto * packed                 = edgekv_input ? &edgekv_input->dispatch : &dispatch;
+                const auto * packed = dispatch_available ? backend_view.storage : nullptr;
                 const bool   consumer_shape_matches = dispatch_available && packed->n_head_kv == params->n_head_kv &&
                                                     packed->head_dim_k == params->head_dim_k &&
                                                     packed->head_dim_v == params->head_dim_v;
                 if (consumer_shape_matches) {
                     if (!edgekv_input) {
-                        auto input   = std::make_unique<llm_graph_input_blocksvd_dispatch>(bctx, std::move(dispatch));
+                        auto input =
+                            std::make_unique<llm_graph_input_blocksvd_dispatch>(bctx, std::move(backend_view));
                         edgekv_input = input.get();
-                        const auto & storage = edgekv_input->dispatch;
-
-                        edgekv_input->u_q  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I8, (int64_t) storage.u_q.size());
-                        edgekv_input->vh_q = ggml_new_tensor_1d(ctx0, GGML_TYPE_I8, (int64_t) storage.vh_q.size());
-                        edgekv_input->rank_scale =
-                            ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) storage.rank_scale.size());
-                        edgekv_input->block_positions =
-                            ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) storage.block_positions.size());
-
-                        ggml_set_input(edgekv_input->u_q);
-                        ggml_set_input(edgekv_input->vh_q);
-                        ggml_set_input(edgekv_input->rank_scale);
-                        ggml_set_input(edgekv_input->block_positions);
-                        ggml_format_name(edgekv_input->u_q, "edgekv_u_q-%d", storage.layer_start);
-                        ggml_format_name(edgekv_input->vh_q, "edgekv_vh_q-%d", storage.layer_start);
-                        ggml_format_name(edgekv_input->rank_scale, "edgekv_scale-%d", storage.layer_start);
-                        ggml_format_name(edgekv_input->block_positions, "edgekv_pos-%d", storage.layer_start);
-
                         res->add_input(std::move(input));
                     }
 
-                    const auto & storage            = edgekv_input->dispatch;
+                    const auto & storage            = edgekv_input->storage();
                     auto         reconstruct_params = blocksvd_to_ggml_params(storage);
                     reconstruct_params.layer_index  = il - storage.layer_start;
                     ggml_tensor * dense_storage = ggml_edgekv_reconstruct(
                         ctx0,
-                        edgekv_input->u_q,
-                        edgekv_input->vh_q,
-                        edgekv_input->rank_scale,
-                        edgekv_input->block_positions,
+                        edgekv_input->u_q(),
+                        edgekv_input->vh_q(),
+                        edgekv_input->rank_scale(),
+                        edgekv_input->block_positions(),
                         &reconstruct_params);
+                    ggml_backend_sched_set_tensor_backend(sched, dense_storage, edgekv_input->backend());
                     ggml_format_name(dense_storage, "edgekv_reconstruct-%d", il);
                     cb(dense_storage, "edgekv_reconstruct", il);
 

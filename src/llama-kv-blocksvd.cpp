@@ -1203,6 +1203,7 @@ void llama_kv_blocksvd_clear(llama_kv_blocksvd_context * ctx) {
     if (!ctx->xkv_chunks.empty()) {
         ++ctx->xkv_generation;
     }
+    ctx->execution_pools.reset();
     ctx->xkv_chunks.clear();
     ctx->layers.clear();
     ctx->decode_cache.clear();

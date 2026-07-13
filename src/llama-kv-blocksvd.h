@@ -84,6 +84,8 @@ struct llama_kv_blocksvd_staging_t {
     std::vector<std::vector<int32_t>> slot_to_cell;
 };
 
+struct llama_kv_blocksvd_execution_pool_registry;
+
 struct llama_kv_blocksvd_context {
     llama_kv_blocksvd_params params;
     // layers -> chunks
@@ -94,6 +96,10 @@ struct llama_kv_blocksvd_context {
     // Incremented whenever the packed-factor set changes. Graph inputs use it
     // as a fast change signal before refreshing a fixed-capacity factor pool.
     uint64_t                                 xkv_generation = 0;
+    // Host factor pools and statically allocated per-backend replicas. This is
+    // mutable because graph construction refreshes execution state without
+    // changing the compressed xKV archive itself.
+    mutable std::shared_ptr<llama_kv_blocksvd_execution_pool_registry> execution_pools;
 
     // For reconstruct mode: accumulate tokens until a full block is ready
     struct pending_layer {

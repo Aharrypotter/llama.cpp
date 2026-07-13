@@ -2,9 +2,12 @@
 
 #include "llama-kv-blocksvd.h"
 
+#include "ggml-backend.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -82,6 +85,29 @@ struct llama_kv_blocksvd_int8_reconstruct_dispatch {
     }
 };
 
+struct llama_kv_blocksvd_int8_pool_update {
+    size_t first_dirty_block = 0;
+    size_t last_dirty_block  = 0;
+    bool   full_repack       = false;
+};
+
+struct llama_kv_blocksvd_int8_backend_pool;
+
+// A graph-stable view of one statically allocated backend factor pool. The
+// owner keeps both tensor metadata and the backend buffer alive across graph
+// topology rebuilds.
+struct llama_kv_blocksvd_int8_backend_view {
+    std::shared_ptr<llama_kv_blocksvd_int8_backend_pool> owner;
+
+    ggml_tensor * u_q             = nullptr;
+    ggml_tensor * vh_q            = nullptr;
+    ggml_tensor * rank_scale      = nullptr;
+    ggml_tensor * block_positions = nullptr;
+
+    const llama_kv_blocksvd_int8_reconstruct_dispatch * storage = nullptr;
+    ggml_backend_t                                       backend = nullptr;
+};
+
 bool llama_kv_blocksvd_pack_int8_execution_factors(
         const llama_kv_blocksvd_xkv_factors & factors,
         int32_t n_tokens,
@@ -103,3 +129,35 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_pool(const llama_kv_blocksvd_contex
                                                   int32_t                                       block_capacity,
                                                   llama_kv_blocksvd_int8_reconstruct_dispatch & out,
                                                   std::string *                                 err = nullptr);
+
+// Refresh an existing fixed-capacity host pool. The append-only fast path
+// packs only newly appended xKV chunks and reports their block range.
+bool llama_kv_blocksvd_refresh_int8_reconstruct_pool(
+        const llama_kv_blocksvd_context &             ctx,
+        int32_t                                       layer,
+        uint32_t                                      stream,
+        llama_seq_id                                  seq_id,
+        llama_kv_blocksvd_int8_reconstruct_dispatch & pool,
+        llama_kv_blocksvd_int8_pool_update &          update,
+        std::string *                                 err = nullptr);
+
+// Acquire a statically allocated backend replica. The selected backend is the
+// highest-priority scheduler backend that supports the reconstruct op for this
+// layer, with backend_cpu as the required fallback.
+bool llama_kv_blocksvd_acquire_int8_backend_pool(
+        const llama_kv_blocksvd_context &       ctx,
+        int32_t                                 layer,
+        uint32_t                                stream,
+        llama_seq_id                            seq_id,
+        int32_t                                 block_capacity,
+        ggml_backend_sched_t                    sched,
+        ggml_backend_t                          backend_cpu,
+        llama_kv_blocksvd_int8_backend_view &   out,
+        std::string *                           err = nullptr);
+
+// Synchronize host changes into an acquired backend replica. Append-only
+// growth uploads only blocks not yet present in that replica.
+bool llama_kv_blocksvd_sync_int8_backend_pool(
+        const llama_kv_blocksvd_context &     ctx,
+        llama_kv_blocksvd_int8_backend_view & view,
+        std::string *                         err = nullptr);
