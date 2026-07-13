@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -72,12 +73,13 @@ bool llama_kv_blocksvd_pack_int8_execution_factors(
     return true;
 }
 
-bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_context &             ctx,
-                                                      int32_t                                       layer,
-                                                      uint32_t                                      stream,
-                                                      llama_seq_id                                  seq_id,
-                                                      llama_kv_blocksvd_int8_reconstruct_dispatch & out,
-                                                      std::string *                                 err) {
+static bool llama_kv_blocksvd_pack_int8_reconstruct_impl(const llama_kv_blocksvd_context &             ctx,
+                                                         int32_t                                       layer,
+                                                         uint32_t                                      stream,
+                                                         llama_seq_id                                  seq_id,
+                                                         int32_t                                       block_capacity,
+                                                         llama_kv_blocksvd_int8_reconstruct_dispatch & out,
+                                                         std::string *                                 err) {
     auto fail = [err](std::string message) {
         if (err) {
             *err = std::move(message);
@@ -108,6 +110,17 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
         return fail("dispatch block count exceeds int32_t");
     }
 
+    const int32_t valid_blocks = static_cast<int32_t>(chunks.size());
+    if (block_capacity == 0) {
+        block_capacity = valid_blocks;
+    }
+    if (block_capacity < valid_blocks) {
+        return fail("dispatch block capacity is smaller than the matching block count");
+    }
+    if (block_capacity <= 0) {
+        return fail("dispatch block capacity must be positive");
+    }
+
     const auto & first = *chunks.front();
     if (first.group_size <= 0 || first.n_head_kv <= 0 || first.head_dim_k <= 0 || first.head_dim_v <= 0 ||
         first.k_factors.rank <= 0 || first.v_factors.rank <= 0) {
@@ -133,8 +146,9 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
     const int32_t combined_v_dim = static_cast<int32_t>(combined_v_dim64);
 
     llama_kv_blocksvd_int8_reconstruct_dispatch next;
-    next.n_blocks    = static_cast<int32_t>(chunks.size());
-    next.block_size  = block_size;
+    next.n_blocks     = block_capacity;
+    next.valid_blocks = valid_blocks;
+    next.block_size   = block_size;
     next.rank_k      = first.k_factors.rank;
     next.rank_v      = first.v_factors.rank;
     next.group_size  = first.group_size;
@@ -197,6 +211,61 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
         v_rank_scale.insert(v_rank_scale.end(), v_view.rank_scale.begin(), v_view.rank_scale.end());
     }
 
+    auto checked_mul = [&fail](size_t lhs, size_t rhs, size_t & product) {
+        if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+            return fail("dispatch size overflows size_t");
+        }
+        product = lhs * rhs;
+        return true;
+    };
+
+    auto checked_product = [&checked_mul](std::initializer_list<size_t> dimensions, size_t & product) {
+        product = 1;
+        for (size_t dimension : dimensions) {
+            if (!checked_mul(product, dimension, product)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    size_t k_u_capacity      = 0;
+    size_t v_u_capacity      = 0;
+    size_t k_vh_capacity     = 0;
+    size_t v_vh_capacity     = 0;
+    size_t k_scale_capacity  = 0;
+    size_t v_scale_capacity  = 0;
+    size_t position_capacity = 0;
+    const size_t capacity    = static_cast<size_t>(next.n_blocks);
+    if (!checked_product({ capacity, static_cast<size_t>(next.block_size), static_cast<size_t>(next.rank_k) },
+                         k_u_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.block_size), static_cast<size_t>(next.rank_v) },
+                         v_u_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.rank_k), static_cast<size_t>(next.group_size),
+                           static_cast<size_t>(next.n_head_kv), static_cast<size_t>(next.head_dim_k) },
+                         k_vh_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.rank_v), static_cast<size_t>(next.group_size),
+                           static_cast<size_t>(next.n_head_kv), static_cast<size_t>(next.head_dim_v) },
+                         v_vh_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.rank_k) }, k_scale_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.rank_v) }, v_scale_capacity) ||
+        !checked_product({ capacity, static_cast<size_t>(next.block_size) }, position_capacity)) {
+        return false;
+    }
+    if (k_u_q.size() > k_u_capacity || v_u_q.size() > v_u_capacity || k_vh_q.size() > k_vh_capacity ||
+        v_vh_q.size() > v_vh_capacity || k_rank_scale.size() > k_scale_capacity ||
+        v_rank_scale.size() > v_scale_capacity || next.block_positions.size() > position_capacity) {
+        return fail("dispatch active factors exceed the requested block capacity");
+    }
+
+    k_u_q.resize(k_u_capacity, 0);
+    v_u_q.resize(v_u_capacity, 0);
+    k_vh_q.resize(k_vh_capacity, 0);
+    v_vh_q.resize(v_vh_capacity, 0);
+    k_rank_scale.resize(k_scale_capacity, 0.0f);
+    v_rank_scale.resize(v_scale_capacity, 0.0f);
+    next.block_positions.resize(position_capacity, -1);
+
     auto align_bytes = [&fail](size_t bytes, size_t & aligned) {
         constexpr size_t alignment = llama_kv_blocksvd_int8_reconstruct_dispatch::buffer_alignment;
         if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1)) {
@@ -247,14 +316,6 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
         return false;
     }
 
-    auto checked_mul = [&fail](size_t lhs, size_t rhs, size_t & product) {
-        if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
-            return fail("dispatch dense output size overflows size_t");
-        }
-        product = lhs * rhs;
-        return true;
-    };
-
     size_t dense_k_elements = static_cast<size_t>(next.n_head_kv);
     size_t dense_v_elements = static_cast<size_t>(next.n_head_kv);
     for (size_t dimension : { static_cast<size_t>(next.n_blocks), static_cast<size_t>(next.block_size),
@@ -290,4 +351,24 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
 
     out = std::move(next);
     return true;
+}
+
+bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_context &             ctx,
+                                                      int32_t                                       layer,
+                                                      uint32_t                                      stream,
+                                                      llama_seq_id                                  seq_id,
+                                                      llama_kv_blocksvd_int8_reconstruct_dispatch & out,
+                                                      std::string *                                 err) {
+    return llama_kv_blocksvd_pack_int8_reconstruct_impl(ctx, layer, stream, seq_id, 0, out, err);
+}
+
+bool llama_kv_blocksvd_pack_int8_reconstruct_pool(const llama_kv_blocksvd_context &             ctx,
+                                                  int32_t                                       layer,
+                                                  uint32_t                                      stream,
+                                                  llama_seq_id                                  seq_id,
+                                                  int32_t                                       block_capacity,
+                                                  llama_kv_blocksvd_int8_reconstruct_dispatch & out,
+                                                  std::string *                                 err) {
+    return llama_kv_blocksvd_pack_int8_reconstruct_impl(
+        ctx, layer, stream, seq_id, block_capacity, out, err);
 }

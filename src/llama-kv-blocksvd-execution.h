@@ -28,8 +28,11 @@ struct llama_kv_blocksvd_int8_reconstruct_dispatch {
     static constexpr int32_t buffer_alignment   = 128;
     static constexpr size_t  htp_op_param_count = 14;
 
-    int32_t n_blocks    = 0;
-    int32_t block_size  = 0;
+    // n_blocks is the static pool capacity serialized into HTP op_params.
+    // valid_blocks is host-only state; unused tail blocks carry position -1.
+    int32_t n_blocks     = 0;
+    int32_t valid_blocks = 0;
+    int32_t block_size   = 0;
     int32_t rank_k      = 0;
     int32_t rank_v      = 0;
     int32_t group_size  = 0;
@@ -92,3 +95,11 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_dispatch(const llama_kv_blocksvd_co
                                                       llama_seq_id                                  seq_id,
                                                       llama_kv_blocksvd_int8_reconstruct_dispatch & out,
                                                       std::string *                                 err = nullptr);
+
+bool llama_kv_blocksvd_pack_int8_reconstruct_pool(const llama_kv_blocksvd_context &             ctx,
+                                                  int32_t                                       layer,
+                                                  uint32_t                                      stream,
+                                                  llama_seq_id                                  seq_id,
+                                                  int32_t                                       block_capacity,
+                                                  llama_kv_blocksvd_int8_reconstruct_dispatch & out,
+                                                  std::string *                                 err = nullptr);

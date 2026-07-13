@@ -120,6 +120,7 @@ static void test_int8_reconstruct_dispatch() {
     bool ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 1, 0, 0, dispatch, &err);
     assert(ok);
     assert(dispatch.n_blocks == 2);
+    assert(dispatch.valid_blocks == dispatch.n_blocks);
     assert(dispatch.block_size == 16);
     assert(dispatch.rank_k == 8);
     assert(dispatch.rank_v == 4);
@@ -412,6 +413,141 @@ static void test_int8_reconstruct_dispatch() {
 
     std::printf("test-kv-blocksvd: INT8 reconstruct dispatch OK\n");
     llama_kv_blocksvd_free(ctx);
+}
+
+static void test_int8_reconstruct_pool() {
+    std::string err;
+    auto *      ctx = make_int8_dispatch_context(err);
+    assert(ctx != nullptr);
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch exact;
+    bool ok = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(*ctx, 1, 0, 0, exact, &err);
+    assert(ok);
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch pool;
+    ok = llama_kv_blocksvd_pack_int8_reconstruct_pool(*ctx, 1, 0, 0, 4, pool, &err);
+    assert(ok);
+    assert(pool.n_blocks == 4);
+    assert(pool.valid_blocks == 2);
+    assert(pool.block_positions.size() == static_cast<size_t>(pool.n_blocks) * pool.block_size);
+
+    const auto assert_component_pool = [](const auto & exact_values,
+                                          size_t       exact_base,
+                                          const auto & pool_values,
+                                          size_t       pool_base,
+                                          size_t       stride,
+                                          size_t       valid_blocks,
+                                          size_t       capacity) {
+        using value_type = typename std::decay_t<decltype(pool_values)>::value_type;
+        for (size_t index = 0; index < valid_blocks * stride; ++index) {
+            assert(pool_values[pool_base + index] == exact_values[exact_base + index]);
+        }
+        for (size_t index = valid_blocks * stride; index < capacity * stride; ++index) {
+            assert(pool_values[pool_base + index] == value_type{});
+        }
+    };
+
+    const size_t valid_blocks = static_cast<size_t>(pool.valid_blocks);
+    const size_t capacity     = static_cast<size_t>(pool.n_blocks);
+    const size_t k_u_stride   = static_cast<size_t>(pool.block_size) * pool.rank_k;
+    const size_t v_u_stride   = static_cast<size_t>(pool.block_size) * pool.rank_v;
+    const size_t k_vh_stride  = static_cast<size_t>(pool.rank_k) * pool.group_size * pool.n_head_kv * pool.head_dim_k;
+    const size_t v_vh_stride  = static_cast<size_t>(pool.rank_v) * pool.group_size * pool.n_head_kv * pool.head_dim_v;
+
+    assert_component_pool(exact.u_q, 0, pool.u_q, 0, k_u_stride, valid_blocks, capacity);
+    assert_component_pool(exact.u_q, static_cast<size_t>(exact.v_u_offset_bytes), pool.u_q,
+                          static_cast<size_t>(pool.v_u_offset_bytes), v_u_stride, valid_blocks, capacity);
+    assert_component_pool(exact.vh_q, 0, pool.vh_q, 0, k_vh_stride, valid_blocks, capacity);
+    assert_component_pool(exact.vh_q, static_cast<size_t>(exact.v_vh_offset_bytes), pool.vh_q,
+                          static_cast<size_t>(pool.v_vh_offset_bytes), v_vh_stride, valid_blocks, capacity);
+    assert_component_pool(exact.rank_scale, 0, pool.rank_scale, 0, static_cast<size_t>(pool.rank_k), valid_blocks,
+                          capacity);
+    assert_component_pool(exact.rank_scale,
+                          static_cast<size_t>(exact.v_rank_scale_offset_bytes) / sizeof(float), pool.rank_scale,
+                          static_cast<size_t>(pool.v_rank_scale_offset_bytes) / sizeof(float),
+                          static_cast<size_t>(pool.rank_v), valid_blocks, capacity);
+
+    assert(std::equal(exact.block_positions.begin(), exact.block_positions.end(), pool.block_positions.begin()));
+    for (size_t index = exact.block_positions.size(); index < pool.block_positions.size(); ++index) {
+        assert(pool.block_positions[index] == -1);
+    }
+
+    const auto before_failure = pool;
+    ok = llama_kv_blocksvd_pack_int8_reconstruct_pool(*ctx, 1, 0, 0, 1, pool, &err);
+    assert(!ok);
+    assert(!err.empty());
+    assert(pool.n_blocks == before_failure.n_blocks);
+    assert(pool.valid_blocks == before_failure.valid_blocks);
+    assert(pool.u_q == before_failure.u_q);
+    pool = before_failure;
+
+    ggml_init_params ggml_params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ggml_ctx = ggml_init(ggml_params);
+    assert(ggml_ctx != nullptr);
+
+    ggml_tensor * t_u         = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, pool.u_q.size());
+    ggml_tensor * t_vh        = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, pool.vh_q.size());
+    ggml_tensor * t_scale     = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, pool.rank_scale.size());
+    ggml_tensor * t_positions = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I32, pool.block_positions.size());
+    std::memcpy(t_u->data, pool.u_q.data(), ggml_nbytes(t_u));
+    std::memcpy(t_vh->data, pool.vh_q.data(), ggml_nbytes(t_vh));
+    std::memcpy(t_scale->data, pool.rank_scale.data(), ggml_nbytes(t_scale));
+    std::memcpy(t_positions->data, pool.block_positions.data(), ggml_nbytes(t_positions));
+
+    const ggml_edgekv_reconstruct_params reconstruct_params = {
+        pool.n_blocks,
+        pool.block_size,
+        pool.rank_k,
+        pool.rank_v,
+        pool.group_size,
+        pool.layer_index,
+        pool.n_head_kv,
+        pool.head_dim_k,
+        pool.head_dim_v,
+        pool.v_u_offset_bytes,
+        pool.v_vh_offset_bytes,
+        pool.v_rank_scale_offset_bytes,
+        pool.dense_v_offset_bytes,
+        pool.dense_total_bytes,
+    };
+    ggml_tensor * t_dense =
+        ggml_edgekv_reconstruct(ggml_ctx, t_u, t_vh, t_scale, t_positions, &reconstruct_params);
+    ggml_cgraph * graph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(graph, t_dense);
+    ggml_cplan plan = ggml_graph_plan(graph, 4, nullptr);
+    std::vector<uint8_t> work_buffer(plan.work_size);
+    plan.work_data = work_buffer.empty() ? nullptr : work_buffer.data();
+    assert(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+
+    const auto * dense_k = static_cast<const ggml_fp16_t *>(t_dense->data);
+    const auto * dense_v = reinterpret_cast<const ggml_fp16_t *>(
+        static_cast<const char *>(t_dense->data) + pool.dense_v_offset_bytes);
+    for (int32_t head = 0; head < pool.n_head_kv; ++head) {
+        for (int32_t block = pool.valid_blocks; block < pool.n_blocks; ++block) {
+            for (int32_t token = 0; token < pool.block_size; ++token) {
+                for (int32_t dim = 0; dim < pool.head_dim_k; ++dim) {
+                    const size_t index =
+                        (((static_cast<size_t>(head) * pool.n_blocks + block) * pool.block_size + token) *
+                         pool.head_dim_k) + dim;
+                    assert(dense_k[index] == ggml_fp32_to_fp16(0.0f));
+                }
+                for (int32_t dim = 0; dim < pool.head_dim_v; ++dim) {
+                    const size_t index =
+                        (((static_cast<size_t>(head) * pool.n_blocks + block) * pool.block_size + token) *
+                         pool.head_dim_v) + dim;
+                    assert(dense_v[index] == ggml_fp32_to_fp16(0.0f));
+                }
+            }
+        }
+    }
+
+    ggml_free(ggml_ctx);
+    llama_kv_blocksvd_free(ctx);
+    std::printf("test-kv-blocksvd: INT8 reconstruct fixed-capacity pool OK\n");
 }
 
 static bool export_int8_dispatch_golden(const std::filesystem::path & output_dir) {
@@ -888,6 +1024,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     test_int8_reconstruct_dispatch();
+    test_int8_reconstruct_pool();
     if (dispatch_export_dir && !export_int8_dispatch_golden(dispatch_export_dir)) {
         llama_kv_blocksvd_free(ctx);
         return 1;
