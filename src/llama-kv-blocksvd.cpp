@@ -1227,6 +1227,8 @@ void llama_chunked_attn_compute(
     const struct ggml_tensor * c = dst->src[2]; // V (staged)
 
     auto * p = (llama_chunked_attn_params *) userdata;
+    const struct ggml_tensor * d = p->edgekv_reconstructed ? dst->src[3] : nullptr; // K (archive)
+    const struct ggml_tensor * e = p->edgekv_reconstructed ? dst->src[4] : nullptr; // V (archive)
     const auto * bctx    = p->bctx;
     const auto * staging = p->staging;
     const int32_t il         = p->il;
@@ -1239,6 +1241,16 @@ void llama_chunked_attn_compute(
     const uint32_t cache_size = p->cache_size;
 
     GGML_ASSERT(n_stream == 1 && "chunked_attn: multi-stream not supported in this milestone");
+    if (p->edgekv_reconstructed) {
+        GGML_ASSERT(d && d->type == GGML_TYPE_F16);
+        GGML_ASSERT(e && e->type == GGML_TYPE_F16);
+        GGML_ASSERT(d->ne[0] == head_dim_k && e->ne[0] == head_dim_v);
+        GGML_ASSERT(d->ne[1] == p->edgekv_block_size && e->ne[1] == p->edgekv_block_size);
+        GGML_ASSERT(d->ne[2] == p->edgekv_n_blocks && e->ne[2] == p->edgekv_n_blocks);
+        GGML_ASSERT(d->ne[3] == n_head_kv && e->ne[3] == n_head_kv);
+        GGML_ASSERT(p->edgekv_positions.size() ==
+                    (size_t) p->edgekv_n_blocks*p->edgekv_block_size);
+    }
 
     const int32_t n_tokens = (int32_t) a->ne[2];
     const int32_t d_k = n_head_kv * head_dim_k;
@@ -1268,42 +1280,44 @@ void llama_chunked_attn_compute(
         p->chunks_dense.clear();
         p->chunks_dense.reserve(bctx->xkv_chunks.size());
 
-        auto & decode_cache = bctx->decode_cache;
-        if (decode_cache.size() < bctx->xkv_chunks.size()) {
-            decode_cache.resize(bctx->xkv_chunks.size());
-        }
-
-        // n_stream == 1 (asserted above), so we only build refs for stream 0.
-        const uint32_t s = 0;
-        for (size_t ci = 0; ci < bctx->xkv_chunks.size(); ++ci) {
-            const auto & chunk = bctx->xkv_chunks[ci];
-            if (chunk.stream != s) {
-                continue;
-            }
-            if (il < chunk.layer_start || il >= chunk.layer_start + chunk.group_size) {
-                continue;
+        if (!p->edgekv_reconstructed) {
+            auto & decode_cache = bctx->decode_cache;
+            if (decode_cache.size() < bctx->xkv_chunks.size()) {
+                decode_cache.resize(bctx->xkv_chunks.size());
             }
 
-            if (!decode_cache[ci]) {
-                auto dc = std::make_unique<llama_kv_blocksvd_context::decoded_chunk>();
-                std::string err;
-                if (!llama_kv_blocksvd_decompress_xkv_chunk(chunk, dc->k, dc->v, &err)) {
-                    LLAMA_LOG_WARN("%s: decompress_xkv_chunk failed for chunk %zu layer_start=%d: %s\n",
-                            __func__, ci, chunk.layer_start, err.c_str());
+            // n_stream == 1 (asserted above), so we only build refs for stream 0.
+            const uint32_t s = 0;
+            for (size_t ci = 0; ci < bctx->xkv_chunks.size(); ++ci) {
+                const auto & chunk = bctx->xkv_chunks[ci];
+                if (chunk.stream != s) {
                     continue;
                 }
-                dc->n_tokens = (int32_t) chunk.slots.size();
-                decode_cache[ci] = std::move(dc);
-            }
+                if (il < chunk.layer_start || il >= chunk.layer_start + chunk.group_size) {
+                    continue;
+                }
 
-            const int32_t local_layer = il - chunk.layer_start;
-            const auto & dc = decode_cache[ci];
-            llama_chunked_attn_chunk_ref ref;
-            ref.k_data   = dc->k[local_layer].data();
-            ref.v_data   = dc->v[local_layer].data();
-            ref.n_tokens = dc->n_tokens;
-            ref.pos      = &chunk.pos;
-            p->chunks_dense.push_back(ref);
+                if (!decode_cache[ci]) {
+                    auto dc = std::make_unique<llama_kv_blocksvd_context::decoded_chunk>();
+                    std::string err;
+                    if (!llama_kv_blocksvd_decompress_xkv_chunk(chunk, dc->k, dc->v, &err)) {
+                        LLAMA_LOG_WARN("%s: decompress_xkv_chunk failed for chunk %zu layer_start=%d: %s\n",
+                                __func__, ci, chunk.layer_start, err.c_str());
+                        continue;
+                    }
+                    dc->n_tokens = (int32_t) chunk.slots.size();
+                    decode_cache[ci] = std::move(dc);
+                }
+
+                const int32_t local_layer = il - chunk.layer_start;
+                const auto & dc = decode_cache[ci];
+                llama_chunked_attn_chunk_ref ref;
+                ref.k_data   = dc->k[local_layer].data();
+                ref.v_data   = dc->v[local_layer].data();
+                ref.n_tokens = dc->n_tokens;
+                ref.pos      = &chunk.pos;
+                p->chunks_dense.push_back(ref);
+            }
         }
 
         // Release the barrier for worker threads.
@@ -1377,34 +1391,67 @@ void llama_chunked_attn_compute(
                     }
                 }
 
-                // --- Part 2: Compressed chunks (lazily decoded via decode_cache) ---
-                for (const auto & ref : chunks) {
-                    for (int32_t tc = 0; tc < ref.n_tokens; ++tc) {
-                        if (ref.pos && !ref.pos->empty() &&
-                            (*ref.pos)[tc] > q_position) {
-                            continue;
+                // --- Part 2: Compressed history ---
+                if (p->edgekv_reconstructed) {
+                    for (int32_t block = 0; block < p->edgekv_n_blocks; ++block) {
+                        for (int32_t token = 0; token < p->edgekv_block_size; ++token) {
+                            const size_t position_index = (size_t) block*p->edgekv_block_size + token;
+                            const llama_pos position = p->edgekv_positions[position_index];
+                            if (position < 0 || position > q_position) {
+                                continue;
+                            }
+
+                            const auto * k_vec = (const ggml_fp16_t *) ((const char *) d->data +
+                                hkv*d->nb[3] + block*d->nb[2] + token*d->nb[1]);
+                            float dot = 0.0f;
+                            for (int32_t dim = 0; dim < head_dim_k; ++dim) {
+                                dot += q_vec[dim] * ggml_fp16_to_fp32(k_vec[dim]);
+                            }
+                            dot *= scale;
+
+                            const auto * v_vec = (const ggml_fp16_t *) ((const char *) e->data +
+                                hkv*e->nb[3] + block*e->nb[2] + token*e->nb[1]);
+
+                            const float M_new = std::max(M_acc, dot);
+                            const float exp_old = expf(M_acc - M_new);
+                            const float exp_new = expf(dot - M_new);
+                            const float S_new = S_acc*exp_old + exp_new;
+
+                            for (int32_t dim = 0; dim < head_dim_v; ++dim) {
+                                VKQ_acc[dim] = VKQ_acc[dim]*exp_old + ggml_fp16_to_fp32(v_vec[dim])*exp_new;
+                            }
+                            M_acc = M_new;
+                            S_acc = S_new;
                         }
+                    }
+                } else {
+                    for (const auto & ref : chunks) {
+                        for (int32_t tc = 0; tc < ref.n_tokens; ++tc) {
+                            if (ref.pos && !ref.pos->empty() && (*ref.pos)[tc] > q_position) {
+                                continue;
+                            }
 
-                        const float * k_vec = ref.k_data + (size_t)tc * d_k + (size_t)hkv * head_dim_k;
+                            const float * k_vec = ref.k_data + (size_t) tc*d_k + (size_t) hkv*head_dim_k;
 
-                        float dot = 0.0f;
-                        for (int32_t d = 0; d < head_dim_k; ++d) {
-                            dot += q_vec[d] * k_vec[d];
+                            float dot = 0.0f;
+                            for (int32_t dim = 0; dim < head_dim_k; ++dim) {
+                                dot += q_vec[dim]*k_vec[dim];
+                            }
+                            dot *= scale;
+
+                            const float * v_vec = ref.v_data + (size_t) tc*d_v + (size_t) hkv*head_dim_v;
+
+                            const float M_new = std::max(M_acc, dot);
+                            const float exp_old = expf(M_acc - M_new);
+                            const float exp_new = expf(dot - M_new);
+                            const float S_new = S_acc*exp_old + exp_new;
+
+                            for (int32_t dim = 0; dim < head_dim_v; ++dim) {
+                                VKQ_acc[dim] = VKQ_acc[dim]*exp_old + v_vec[dim]*exp_new;
+                            }
+                            M_acc = M_new;
+                            S_acc = S_new;
                         }
-                        dot *= scale;
-
-                        const float * v_vec = ref.v_data + (size_t)tc * d_v + (size_t)hkv * head_dim_v;
-
-                        float M_new = std::max(M_acc, dot);
-                        float exp_old = expf(M_acc - M_new);
-                        float exp_new = expf(dot - M_new);
-                        float S_new = S_acc * exp_old + exp_new;
-
-                        for (int32_t d = 0; d < head_dim_v; ++d) {
-                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_vec[d] * exp_new;
-                        }
-                        M_acc = M_new;
-                        S_acc = S_new;
                     }
                 }
 

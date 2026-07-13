@@ -1,12 +1,15 @@
 #include "llama-kv-blocksvd.h"
 #include "llama-kv-blocksvd-execution.h"
 #include "llama.h"
+#include "ggml.h"
+#include "ggml-cpu.h"
 
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -175,6 +178,53 @@ static void test_int8_reconstruct_dispatch() {
     const auto * k_scale = dispatch.rank_scale.data();
     const auto * v_scale = dispatch.rank_scale.data() + dispatch.v_rank_scale_offset_bytes / sizeof(float);
 
+    ggml_init_params ggml_params = {
+        /* .mem_size   = */ 1024*1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ggml_ctx = ggml_init(ggml_params);
+    assert(ggml_ctx != nullptr);
+
+    ggml_tensor * t_u = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.u_q.size());
+    ggml_tensor * t_vh = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.vh_q.size());
+    ggml_tensor * t_scale = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_F32, dispatch.rank_scale.size());
+    ggml_tensor * t_positions = ggml_new_tensor_1d(
+        ggml_ctx, GGML_TYPE_I32, dispatch.block_positions.size());
+    std::memcpy(t_u->data, dispatch.u_q.data(), ggml_nbytes(t_u));
+    std::memcpy(t_vh->data, dispatch.vh_q.data(), ggml_nbytes(t_vh));
+    std::memcpy(t_scale->data, dispatch.rank_scale.data(), ggml_nbytes(t_scale));
+    std::memcpy(t_positions->data, dispatch.block_positions.data(), ggml_nbytes(t_positions));
+
+    const ggml_edgekv_reconstruct_params reconstruct_params = {
+        dispatch.n_blocks,
+        dispatch.block_size,
+        dispatch.rank_k,
+        dispatch.rank_v,
+        dispatch.group_size,
+        dispatch.layer_index,
+        dispatch.n_head_kv,
+        dispatch.head_dim_k,
+        dispatch.head_dim_v,
+        dispatch.v_u_offset_bytes,
+        dispatch.v_vh_offset_bytes,
+        dispatch.v_rank_scale_offset_bytes,
+        dispatch.dense_v_offset_bytes,
+        dispatch.dense_total_bytes,
+    };
+    ggml_tensor * t_dense = ggml_edgekv_reconstruct(
+        ggml_ctx, t_u, t_vh, t_scale, t_positions, &reconstruct_params);
+    ggml_cgraph * graph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(graph, t_dense);
+    ggml_cplan plan = ggml_graph_plan(graph, 4, nullptr);
+    std::vector<uint8_t> work_buffer(plan.work_size);
+    plan.work_data = work_buffer.empty() ? nullptr : work_buffer.data();
+    assert(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+
+    const auto * dense_k_fp16 = (const ggml_fp16_t *) t_dense->data;
+    const auto * dense_v_fp16 = (const ggml_fp16_t *) (
+        (const char *) t_dense->data + dispatch.dense_v_offset_bytes);
+
     std::vector<const llama_kv_blocksvd_xkv_chunk *> sorted_chunks;
     for (const auto & chunk : ctx->xkv_chunks) {
         sorted_chunks.push_back(&chunk);
@@ -208,6 +258,10 @@ static void test_int8_reconstruct_dispatch() {
                     const size_t reference_index =
                         (static_cast<size_t>(token) * dispatch.n_head_kv + head) * dispatch.head_dim_k + d;
                     assert(std::fabs(actual - dense_k[dispatch.layer_index][reference_index]) < 1e-5f);
+                    const size_t output_index =
+                        (((static_cast<size_t>(head) * dispatch.n_blocks + block) * dispatch.block_size + token) *
+                         dispatch.head_dim_k) + d;
+                    assert(ggml_fp16_to_fp32(dense_k_fp16[output_index]) == ggml_fp16_to_fp32(ggml_fp32_to_fp16(actual)));
                 }
                 for (int32_t d = 0; d < dispatch.head_dim_v; ++d) {
                     float actual = 0.0f;
@@ -228,10 +282,106 @@ static void test_int8_reconstruct_dispatch() {
                     const size_t reference_index =
                         (static_cast<size_t>(token) * dispatch.n_head_kv + head) * dispatch.head_dim_v + d;
                     assert(std::fabs(actual - dense_v[dispatch.layer_index][reference_index]) < 1e-5f);
+                    const size_t output_index =
+                        (((static_cast<size_t>(head) * dispatch.n_blocks + block) * dispatch.block_size + token) *
+                         dispatch.head_dim_v) + d;
+                    assert(ggml_fp16_to_fp32(dense_v_fp16[output_index]) == ggml_fp16_to_fp32(ggml_fp32_to_fp16(actual)));
                 }
             }
         }
     }
+
+    {
+        constexpr int32_t n_head_q = 4;
+        ggml_tensor * q = ggml_new_tensor_3d(
+            ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_k, n_head_q, 1);
+        ggml_tensor * active_k = ggml_new_tensor_4d(
+            ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_k, dispatch.n_head_kv, 1, 1);
+        ggml_tensor * active_v = ggml_new_tensor_4d(
+            ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_v, dispatch.n_head_kv, 1, 1);
+        ggml_tensor * archive_k = ggml_view_4d(
+            ggml_ctx, t_dense, dispatch.head_dim_k, dispatch.block_size,
+            dispatch.n_blocks, dispatch.n_head_kv,
+            (size_t) dispatch.head_dim_k*sizeof(ggml_fp16_t),
+            (size_t) dispatch.head_dim_k*dispatch.block_size*sizeof(ggml_fp16_t),
+            (size_t) dispatch.head_dim_k*dispatch.block_size*dispatch.n_blocks*sizeof(ggml_fp16_t), 0);
+        ggml_tensor * archive_v = ggml_view_4d(
+            ggml_ctx, t_dense, dispatch.head_dim_v, dispatch.block_size,
+            dispatch.n_blocks, dispatch.n_head_kv,
+            (size_t) dispatch.head_dim_v*sizeof(ggml_fp16_t),
+            (size_t) dispatch.head_dim_v*dispatch.block_size*sizeof(ggml_fp16_t),
+            (size_t) dispatch.head_dim_v*dispatch.block_size*dispatch.n_blocks*sizeof(ggml_fp16_t),
+            dispatch.dense_v_offset_bytes);
+
+        std::mt19937 consumer_generator(20260717);
+        std::uniform_real_distribution<float> consumer_distribution(-0.25f, 0.25f);
+        for (int64_t i = 0; i < ggml_nelements(q); ++i) {
+            ((float *) q->data)[i] = consumer_distribution(consumer_generator);
+        }
+        for (int64_t i = 0; i < ggml_nelements(active_k); ++i) {
+            ((float *) active_k->data)[i] = consumer_distribution(consumer_generator);
+        }
+        for (int64_t i = 0; i < ggml_nelements(active_v); ++i) {
+            ((float *) active_v->data)[i] = consumer_distribution(consumer_generator);
+        }
+
+        llama_kv_blocksvd_staging_t staging;
+        staging.capacity = 1;
+        staging.cell_to_slot = { std::vector<int32_t>(41, -1) };
+        staging.slot_to_cell = { std::vector<int32_t>{ 40 } };
+        staging.cell_to_slot[0][40] = 0;
+
+        const auto configure_consumer = [&](llama_chunked_attn_params & p) {
+            p.bctx         = ctx;
+            p.staging      = &staging;
+            p.il           = 1;
+            p.n_kv         = 41;
+            p.n_head_kv    = dispatch.n_head_kv;
+            p.n_head_q     = n_head_q;
+            p.head_dim_k   = dispatch.head_dim_k;
+            p.head_dim_v   = dispatch.head_dim_v;
+            p.scale        = 1.0f/std::sqrt((float) dispatch.head_dim_k);
+            p.n_stream     = 1;
+            p.cache_size   = 1;
+            p.q_pos        = { 40 };
+            p.slot_pos     = { 40 };
+        };
+
+        llama_chunked_attn_params baseline_params;
+        configure_consumer(baseline_params);
+        ggml_tensor * baseline_out = ggml_new_tensor_2d(
+            ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v*n_head_q, 1);
+        baseline_out->src[0] = q;
+        baseline_out->src[1] = active_k;
+        baseline_out->src[2] = active_v;
+        llama_chunked_attn_compute(baseline_out, 0, 1, &baseline_params);
+
+        llama_chunked_attn_params edgekv_params;
+        configure_consumer(edgekv_params);
+        edgekv_params.edgekv_reconstructed = true;
+        edgekv_params.edgekv_n_blocks       = dispatch.n_blocks;
+        edgekv_params.edgekv_block_size     = dispatch.block_size;
+        edgekv_params.edgekv_positions.assign(
+            dispatch.block_positions.begin(), dispatch.block_positions.end());
+        ggml_tensor * edgekv_out = ggml_new_tensor_2d(
+            ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v*n_head_q, 1);
+        edgekv_out->src[0] = q;
+        edgekv_out->src[1] = active_k;
+        edgekv_out->src[2] = active_v;
+        edgekv_out->src[3] = archive_k;
+        edgekv_out->src[4] = archive_v;
+        llama_chunked_attn_compute(edgekv_out, 0, 1, &edgekv_params);
+
+        for (int64_t i = 0; i < ggml_nelements(edgekv_out); ++i) {
+            const float baseline = ((const float *) baseline_out->data)[i];
+            const float edgekv   = ((const float *) edgekv_out->data)[i];
+            assert(std::isfinite(baseline));
+            assert(std::isfinite(edgekv));
+            assert(std::fabs(baseline - edgekv) < 2e-4f);
+        }
+    }
+
+    ggml_free(ggml_ctx);
 
     const auto  before_failure = dispatch;
     std::string failure_error;

@@ -325,6 +325,14 @@ struct llama_chunked_attn_params {
     std::vector<llama_pos> q_pos;
     std::vector<llama_pos> slot_pos;
 
+    // Optional GGML/HTP reconstruction input. When enabled, src[3]/src[4]
+    // contain dense FP16 compressed-history K/V in [H,N,B,D] storage order;
+    // the active staging window remains in src[1]/src[2].
+    bool edgekv_reconstructed = false;
+    int32_t edgekv_n_blocks   = 0;
+    int32_t edgekv_block_size = 0;
+    std::vector<llama_pos> edgekv_positions;
+
     // Per-invocation shared state populated by thread 0 in the hoist phase
     // and read by all worker threads after the spin-barrier.
     // Populated by whichever compute callback runs (chunked_attn or
@@ -346,6 +354,7 @@ struct llama_chunked_attn_params {
         size_t b = sizeof(*this);
         b += q_pos.capacity()    * sizeof(llama_pos);
         b += slot_pos.capacity() * sizeof(llama_pos);
+        b += edgekv_positions.capacity() * sizeof(llama_pos);
         b += (size_t) head_dim_v * sizeof(float);
         // chunk_ref inside compute: 2 pointers + int32 + pointer-to-vector.
         // Approximate with 4 pointers per chunk to stay portable.
@@ -361,6 +370,8 @@ struct llama_chunked_attn_params {
 // dst->src[0] (q):        [head_dim_k, n_head_q,  n_tokens] (F32, pre-stream-split)
 // dst->src[1] (k_active): [head_dim_k, n_head_kv, cache_size, n_stream] (F32)
 // dst->src[2] (v_active): [head_dim_v, n_head_kv, cache_size, n_stream] (F32, non-transposed)
+// dst->src[3] (k_archive, optional): [head_dim_k, block_size, n_blocks, n_head_kv] (F16)
+// dst->src[4] (v_archive, optional): [head_dim_v, block_size, n_blocks, n_head_kv] (F16)
 // n_stream must be 1 in this milestone.
 void llama_chunked_attn_compute(
         struct ggml_tensor * dst,

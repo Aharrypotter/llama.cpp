@@ -556,6 +556,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_EDGEKV_RECONSTRUCT,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2404,6 +2405,39 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // Packed INT8 xKV reconstruction. The four inputs are contiguous storage
+    // buffers containing packed U, packed Vh, folded rank scales, and block
+    // positions. The result is one FP16 storage buffer containing dense K and
+    // dense V at the byte offsets described by params.
+    enum {
+        GGML_EDGEKV_RECONSTRUCT_PARAM_COUNT = 14,
+    };
+
+    struct ggml_edgekv_reconstruct_params {
+        int32_t n_blocks;
+        int32_t block_size;
+        int32_t rank_k;
+        int32_t rank_v;
+        int32_t group_size;
+        int32_t layer_index;
+        int32_t n_head_kv;
+        int32_t head_dim_k;
+        int32_t head_dim_v;
+        int32_t v_u_offset_bytes;
+        int32_t v_vh_offset_bytes;
+        int32_t v_rank_scale_offset_bytes;
+        int32_t dense_v_offset_bytes;
+        int32_t dense_total_bytes;
+    };
+
+    GGML_API struct ggml_tensor * ggml_edgekv_reconstruct(
+            struct ggml_context                         * ctx,
+            struct ggml_tensor                          * u_q,
+            struct ggml_tensor                          * vh_q,
+            struct ggml_tensor                          * rank_scale,
+            struct ggml_tensor                          * block_positions,
+            const struct ggml_edgekv_reconstruct_params * params);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

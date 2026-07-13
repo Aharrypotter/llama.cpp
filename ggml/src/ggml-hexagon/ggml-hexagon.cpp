@@ -48,6 +48,12 @@ using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
 
+static_assert((int) HTP_TYPE_F32 == (int) GGML_TYPE_F32);
+static_assert((int) HTP_TYPE_F16 == (int) GGML_TYPE_F16);
+static_assert((int) HTP_TYPE_I8  == (int) GGML_TYPE_I8);
+static_assert((int) HTP_TYPE_I32 == (int) GGML_TYPE_I32);
+static_assert((int) HTP_EDGEKV_PARAM_COUNT == (int) GGML_EDGEKV_RECONSTRUCT_PARAM_COUNT);
+
 static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
@@ -2803,6 +2809,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_FILL:           return HTP_OP_FILL;
         case GGML_OP_DIAG:           return HTP_OP_DIAG;
         case GGML_OP_SOLVE_TRI:      return HTP_OP_SOLVE_TRI;
+        case GGML_OP_EDGEKV_RECONSTRUCT: return HTP_OP_EDGEKV_RECONSTRUCT;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
                 case GGML_UNARY_OP_SILU:     return HTP_OP_UNARY_SILU;
@@ -3210,6 +3217,38 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
     return true;
 }
 
+static bool ggml_hexagon_supported_edgekv_reconstruct(
+        const struct ggml_hexagon_session * sess,
+        const struct ggml_tensor          * op) {
+#ifndef GGML_HEXAGON_EDGEKV_RECONSTRUCT
+    GGML_UNUSED(sess);
+    GGML_UNUSED(op);
+    return false;
+#else
+    static const int32_t expected[HTP_EDGEKV_PARAM_COUNT] = {
+        2, 16, 8, 4, 2, 1, 2, 32, 16, 256, 2048, 128, 4096, 6144,
+    };
+
+    if (opt_arch != 79 || memcmp(op->op_params, expected, sizeof(expected)) != 0) {
+        return false;
+    }
+    if (!op->src[0] || op->src[0]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[0]) < 384 ||
+        !op->src[1] || op->src[1]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[1]) < 2560 ||
+        !op->src[2] || op->src[2]->type != GGML_TYPE_F32 || ggml_nbytes(op->src[2]) < 256 ||
+        !op->src[3] || op->src[3]->type != GGML_TYPE_I32 || ggml_nbytes(op->src[3]) < 128 ||
+        op->type != GGML_TYPE_F16 || ggml_nbytes(op) < 6144) {
+        return false;
+    }
+    if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) ||
+        !ggml_is_contiguous(op->src[2]) || !ggml_is_contiguous(op->src[3]) ||
+        !ggml_is_contiguous(op)) {
+        return false;
+    }
+    GGML_UNUSED(sess);
+    return true;
+#endif
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
@@ -3350,6 +3389,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SOLVE_TRI:
             supp = ggml_hexagon_supported_solve_tri(sess, op);
+            break;
+
+        case GGML_OP_EDGEKV_RECONSTRUCT:
+            supp = ggml_hexagon_supported_edgekv_reconstruct(sess, op);
             break;
 
         default:

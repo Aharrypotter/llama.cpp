@@ -14,6 +14,10 @@ include_directories(
 
 set(HTP_LIB ggml-htp-${DSP_VERSION})
 
+set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV reconstruct AOT object")
+set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
+option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV AOT adapter simulator test" OFF)
+
 add_library(${HTP_LIB} SHARED
     main.c
     htp_iface_skel.c
@@ -37,12 +41,39 @@ add_library(${HTP_LIB} SHARED
     fill-ops.c
     diag-ops.c
     solve-tri-ops.c
+    edgekv-reconstruct-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
     FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE})
+
+if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_AOT_OBJECT)
+    if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
+        message(FATAL_ERROR "EdgeKV AOT object does not exist: ${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
+    endif()
+    if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+        message(FATAL_ERROR "Hexagon-MLIR runtime does not exist: ${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+    endif()
+
+    message(STATUS "ggml-htp-v79: enabling EdgeKV C3 reconstruct AOT adapter")
+    target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_RECONSTRUCT_AOT=1)
+    target_link_libraries(${HTP_LIB} PRIVATE
+        "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}"
+        "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+
+    if (GGML_HEXAGON_EDGEKV_BUILD_TESTS)
+        set(EDGEKV_TEST_LIB test-edgekv-reconstruct-${DSP_VERSION})
+        add_library(${EDGEKV_TEST_LIB} SHARED
+            tests/test-edgekv-reconstruct.c
+            edgekv-reconstruct-ops.c)
+        target_compile_definitions(${EDGEKV_TEST_LIB} PRIVATE HTP_EDGEKV_RECONSTRUCT_AOT=1)
+        target_link_libraries(${EDGEKV_TEST_LIB} PRIVATE
+            "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}"
+            "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+    endif()
+endif()
 
 if (GGML_HEXAGON_FA_EXP2_HF)
     message(STATUS "ggml-htp: HMX_FA_USE_EXP2_HF=1 (use FP16 exp2 polynomial in FA softmax)")

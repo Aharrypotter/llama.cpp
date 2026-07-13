@@ -10426,6 +10426,85 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
     }
 }
 
+void ggml_compute_forward_edgekv_reconstruct(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor         * dst) {
+    const struct ggml_tensor * u_storage     = dst->src[0];
+    const struct ggml_tensor * vh_storage    = dst->src[1];
+    const struct ggml_tensor * scale_storage = dst->src[2];
+    const struct ggml_tensor * positions     = dst->src[3];
+
+    GGML_ASSERT(u_storage && u_storage->type == GGML_TYPE_I8);
+    GGML_ASSERT(vh_storage && vh_storage->type == GGML_TYPE_I8);
+    GGML_ASSERT(scale_storage && scale_storage->type == GGML_TYPE_F32);
+    GGML_ASSERT(positions && positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+
+    struct ggml_edgekv_reconstruct_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+
+    const int8_t * k_u = (const int8_t *) u_storage->data;
+    const int8_t * v_u = (const int8_t *) ((const char *) u_storage->data + p.v_u_offset_bytes);
+    const int8_t * k_vh = (const int8_t *) vh_storage->data;
+    const int8_t * v_vh = (const int8_t *) ((const char *) vh_storage->data + p.v_vh_offset_bytes);
+    const float * k_scale = (const float *) scale_storage->data;
+    const float * v_scale = (const float *) ((const char *) scale_storage->data + p.v_rank_scale_offset_bytes);
+    const int32_t * block_positions = (const int32_t *) positions->data;
+
+    ggml_fp16_t * dense_k = (ggml_fp16_t *) dst->data;
+    ggml_fp16_t * dense_v = (ggml_fp16_t *) ((char *) dst->data + p.dense_v_offset_bytes);
+
+    const size_t dense_k_bytes = (size_t) p.n_head_kv*p.n_blocks*p.block_size*p.head_dim_k*sizeof(ggml_fp16_t);
+    const size_t dense_v_bytes = (size_t) p.n_head_kv*p.n_blocks*p.block_size*p.head_dim_v*sizeof(ggml_fp16_t);
+    if (params->ith == 0) {
+        memset((char *) dst->data + dense_k_bytes, 0, (size_t) p.dense_v_offset_bytes - dense_k_bytes);
+        memset((char *) dst->data + p.dense_v_offset_bytes + dense_v_bytes, 0,
+               (size_t) p.dense_total_bytes - (size_t) p.dense_v_offset_bytes - dense_v_bytes);
+    }
+
+    const int64_t work_items = (int64_t) p.n_blocks*p.n_head_kv;
+    for (int64_t work = params->ith; work < work_items; work += params->nth) {
+        const int32_t block = (int32_t) (work/p.n_head_kv);
+        const int32_t head  = (int32_t) (work%p.n_head_kv);
+
+        for (int32_t token = 0; token < p.block_size; ++token) {
+            const bool valid = block_positions[(size_t) block*p.block_size + token] >= 0;
+
+            for (int32_t d = 0; d < p.head_dim_k; ++d) {
+                float acc = 0.0f;
+                if (valid) {
+                    for (int32_t rank = 0; rank < p.rank_k; ++rank) {
+                        const size_t u_index = ((size_t) block*p.block_size + token)*p.rank_k + rank;
+                        const size_t vh_index =
+                            ((((size_t) block*p.rank_k + rank)*p.group_size + p.layer_index)*p.n_head_kv + head)*
+                            p.head_dim_k + d;
+                        acc += (float) k_u[u_index] * k_scale[(size_t) block*p.rank_k + rank] *
+                               (float) k_vh[vh_index];
+                    }
+                }
+                const size_t out_index = (((size_t) head*p.n_blocks + block)*p.block_size + token)*p.head_dim_k + d;
+                dense_k[out_index] = ggml_fp32_to_fp16(acc);
+            }
+
+            for (int32_t d = 0; d < p.head_dim_v; ++d) {
+                float acc = 0.0f;
+                if (valid) {
+                    for (int32_t rank = 0; rank < p.rank_v; ++rank) {
+                        const size_t u_index = ((size_t) block*p.block_size + token)*p.rank_v + rank;
+                        const size_t vh_index =
+                            ((((size_t) block*p.rank_v + rank)*p.group_size + p.layer_index)*p.n_head_kv + head)*
+                            p.head_dim_v + d;
+                        acc += (float) v_u[u_index] * v_scale[(size_t) block*p.rank_v + rank] *
+                               (float) v_vh[vh_index];
+                    }
+                }
+                const size_t out_index = (((size_t) head*p.n_blocks + block)*p.block_size + token)*p.head_dim_v + d;
+                dense_v[out_index] = ggml_fp32_to_fp16(acc);
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_gated_delta_net
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,

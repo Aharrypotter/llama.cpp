@@ -24,8 +24,16 @@ include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
 option(GGML_HEXAGON_FA_EXP2_HF "ggml-hexagon: use FP16 exp2 polynomial in FA softmax instead of F32 exp round-trip" OFF)
+option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "ggml-hexagon: build the v79 EdgeKV AOT adapter simulator test" OFF)
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml-hexagon: quantize group size (32, 64, or 128)")
+set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "ggml-hexagon: v79 EdgeKV reconstruct AOT object")
+set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "ggml-hexagon: Hexagon-MLIR async runtime archive")
+
+if ((GGML_HEXAGON_EDGEKV_AOT_OBJECT AND NOT GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY) OR
+    (GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY AND NOT GGML_HEXAGON_EDGEKV_AOT_OBJECT))
+    message(FATAL_ERROR "GGML_HEXAGON_EDGEKV_AOT_OBJECT and GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY must be set together")
+endif()
 
 add_library(htp_iface OBJECT
     ${CMAKE_CURRENT_BINARY_DIR}/htp_iface_stub.c)
@@ -58,6 +66,9 @@ ggml_add_backend_library(${TARGET_NAME}
 
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
+if (GGML_HEXAGON_EDGEKV_AOT_OBJECT)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_EDGEKV_RECONSTRUCT=1)
+endif()
 
 # Build HTP skels
 set(HTP_SKELS)
@@ -73,6 +84,9 @@ function(build_htp_skel V)
             -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
             -DGGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE}
+            -DGGML_HEXAGON_EDGEKV_AOT_OBJECT:FILEPATH=${GGML_HEXAGON_EDGEKV_AOT_OBJECT}
+            -DGGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY:FILEPATH=${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}
+            -DGGML_HEXAGON_EDGEKV_BUILD_TESTS=${GGML_HEXAGON_EDGEKV_BUILD_TESTS}
             -DDSP_VERSION=${V}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)

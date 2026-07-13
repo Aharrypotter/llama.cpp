@@ -1052,6 +1052,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
+    "EDGEKV_RECONSTRUCT",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1080,7 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1162,6 +1163,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
+    "edgekv_reconstruct(u,vh,scale,pos)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1190,7 +1192,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5370,6 +5372,92 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+static size_t ggml_edgekv_checked_mul(size_t lhs, size_t rhs) {
+    GGML_ASSERT(lhs == 0 || rhs <= SIZE_MAX/lhs);
+    return lhs*rhs;
+}
+
+static size_t ggml_edgekv_checked_add(size_t lhs, size_t rhs) {
+    GGML_ASSERT(rhs <= SIZE_MAX - lhs);
+    return lhs + rhs;
+}
+
+struct ggml_tensor * ggml_edgekv_reconstruct(
+        struct ggml_context                         * ctx,
+        struct ggml_tensor                          * u_q,
+        struct ggml_tensor                          * vh_q,
+        struct ggml_tensor                          * rank_scale,
+        struct ggml_tensor                          * block_positions,
+        const struct ggml_edgekv_reconstruct_params * params) {
+    static_assert(sizeof(struct ggml_edgekv_reconstruct_params) ==
+                  GGML_EDGEKV_RECONSTRUCT_PARAM_COUNT*sizeof(int32_t),
+                  "EdgeKV params must match HTP op_params");
+
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(u_q != NULL && u_q->type == GGML_TYPE_I8 && ggml_is_contiguous(u_q));
+    GGML_ASSERT(vh_q != NULL && vh_q->type == GGML_TYPE_I8 && ggml_is_contiguous(vh_q));
+    GGML_ASSERT(rank_scale != NULL && rank_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(rank_scale));
+    GGML_ASSERT(block_positions != NULL && block_positions->type == GGML_TYPE_I32 && ggml_is_contiguous(block_positions));
+
+    GGML_ASSERT(params->n_blocks > 0 && params->block_size > 0);
+    GGML_ASSERT(params->rank_k > 0 && params->rank_v > 0);
+    GGML_ASSERT(params->group_size > 0);
+    GGML_ASSERT(params->layer_index >= 0 && params->layer_index < params->group_size);
+    GGML_ASSERT(params->n_head_kv > 0 && params->head_dim_k > 0 && params->head_dim_v > 0);
+    GGML_ASSERT(params->v_u_offset_bytes >= 0 && params->v_vh_offset_bytes >= 0);
+    GGML_ASSERT(params->v_rank_scale_offset_bytes >= 0 && params->dense_v_offset_bytes >= 0);
+    GGML_ASSERT(params->dense_total_bytes > 0 && params->dense_total_bytes % (int32_t) sizeof(ggml_fp16_t) == 0);
+
+    const size_t n = (size_t) params->n_blocks;
+    const size_t b = (size_t) params->block_size;
+    const size_t g = (size_t) params->group_size;
+    const size_t h = (size_t) params->n_head_kv;
+
+    const size_t k_u_bytes = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), (size_t) params->rank_k);
+    const size_t v_u_bytes = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), (size_t) params->rank_v);
+    const size_t k_vh_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_k), g),
+        ggml_edgekv_checked_mul(h, (size_t) params->head_dim_k));
+    const size_t v_vh_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_v), g),
+        ggml_edgekv_checked_mul(h, (size_t) params->head_dim_v));
+    const size_t k_scale_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(n, (size_t) params->rank_k), sizeof(float));
+    const size_t v_scale_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(n, (size_t) params->rank_v), sizeof(float));
+    const size_t positions_bytes = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), sizeof(int32_t));
+    const size_t dense_k_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(h, n), b),
+        ggml_edgekv_checked_mul((size_t) params->head_dim_k, sizeof(ggml_fp16_t)));
+    const size_t dense_v_bytes = ggml_edgekv_checked_mul(
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(h, n), b),
+        ggml_edgekv_checked_mul((size_t) params->head_dim_v, sizeof(ggml_fp16_t)));
+
+    GGML_ASSERT(k_u_bytes <= (size_t) params->v_u_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add((size_t) params->v_u_offset_bytes, v_u_bytes) <= ggml_nbytes(u_q));
+    GGML_ASSERT(k_vh_bytes <= (size_t) params->v_vh_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add((size_t) params->v_vh_offset_bytes, v_vh_bytes) <= ggml_nbytes(vh_q));
+    GGML_ASSERT(k_scale_bytes <= (size_t) params->v_rank_scale_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add((size_t) params->v_rank_scale_offset_bytes, v_scale_bytes) <=
+                ggml_nbytes(rank_scale));
+    GGML_ASSERT(positions_bytes <= ggml_nbytes(block_positions));
+    GGML_ASSERT(dense_k_bytes <= (size_t) params->dense_v_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add((size_t) params->dense_v_offset_bytes, dense_v_bytes) <=
+                (size_t) params->dense_total_bytes);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_F16, params->dense_total_bytes/(int32_t) sizeof(ggml_fp16_t));
+    ggml_set_op_params(result, params, sizeof(*params));
+
+    result->op     = GGML_OP_EDGEKV_RECONSTRUCT;
+    result->src[0] = u_q;
+    result->src[1] = vh_q;
+    result->src[2] = rank_scale;
+    result->src[3] = block_positions;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -6841,6 +6929,9 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_NONE: {
             // noop
+        } break;
+        case GGML_OP_EDGEKV_RECONSTRUCT: {
+            GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
         } break;
         case GGML_OP_COUNT:
         default: {

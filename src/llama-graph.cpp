@@ -9,6 +9,7 @@
 #include "llama-kv-cache-iswa.h"
 #ifdef LLAMA_KV_BLOCKSVD
 #include "llama-kv-blocksvd.h"
+#include "llama-kv-blocksvd-execution.h"
 #endif
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
@@ -21,6 +22,55 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+#ifdef LLAMA_KV_BLOCKSVD
+class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_blocksvd_dispatch(llama_kv_blocksvd_int8_reconstruct_dispatch dispatch)
+        : dispatch(std::move(dispatch)) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(u_q && vh_q && rank_scale && block_positions);
+        GGML_ASSERT(ggml_nbytes(u_q) == dispatch.u_q.size()*sizeof(int8_t));
+        GGML_ASSERT(ggml_nbytes(vh_q) == dispatch.vh_q.size()*sizeof(int8_t));
+        GGML_ASSERT(ggml_nbytes(rank_scale) == dispatch.rank_scale.size()*sizeof(float));
+        GGML_ASSERT(ggml_nbytes(block_positions) == dispatch.block_positions.size()*sizeof(int32_t));
+
+        ggml_backend_tensor_set(u_q, dispatch.u_q.data(), 0, ggml_nbytes(u_q));
+        ggml_backend_tensor_set(vh_q, dispatch.vh_q.data(), 0, ggml_nbytes(vh_q));
+        ggml_backend_tensor_set(rank_scale, dispatch.rank_scale.data(), 0, ggml_nbytes(rank_scale));
+        ggml_backend_tensor_set(block_positions, dispatch.block_positions.data(), 0, ggml_nbytes(block_positions));
+    }
+
+    ggml_tensor * u_q             = nullptr;
+    ggml_tensor * vh_q            = nullptr;
+    ggml_tensor * rank_scale      = nullptr;
+    ggml_tensor * block_positions = nullptr;
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+};
+
+static ggml_edgekv_reconstruct_params blocksvd_to_ggml_params(
+        const llama_kv_blocksvd_int8_reconstruct_dispatch & dispatch) {
+    return {
+        dispatch.n_blocks,
+        dispatch.block_size,
+        dispatch.rank_k,
+        dispatch.rank_v,
+        dispatch.group_size,
+        dispatch.layer_index,
+        dispatch.n_head_kv,
+        dispatch.head_dim_k,
+        dispatch.head_dim_v,
+        dispatch.v_u_offset_bytes,
+        dispatch.v_vh_offset_bytes,
+        dispatch.v_rank_scale_offset_bytes,
+        dispatch.dense_v_offset_bytes,
+        dispatch.dense_total_bytes,
+    };
+}
+#endif
 
 // dedup helpers
 
@@ -2346,6 +2396,95 @@ ggml_tensor * llm_graph_context::build_attn(
             }
             params->slot_pos = mctx_cur->get_slot_positions(0);
 
+            ggml_tensor * edgekv_dense_k = nullptr;
+            ggml_tensor * edgekv_dense_v = nullptr;
+            if (cparams.kv_lowrank_reconstruct && getenv("LLAMA_KV_BLOCKSVD_EDGEKV_RECONSTRUCT") &&
+                !bctx->xkv_chunks.empty()) {
+                llama_seq_id edgekv_seq_id = 0;
+                for (const auto & chunk : bctx->xkv_chunks) {
+                    if (chunk.stream == 0 && il >= chunk.layer_start && il < chunk.layer_start + chunk.group_size) {
+                        edgekv_seq_id = chunk.seq_id;
+                        break;
+                    }
+                }
+
+                llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+                std::string dispatch_error;
+                const bool packed = llama_kv_blocksvd_pack_int8_reconstruct_dispatch(
+                    *bctx, il, 0, edgekv_seq_id, dispatch, &dispatch_error);
+                const bool consumer_shape_matches = packed &&
+                    dispatch.n_head_kv == params->n_head_kv &&
+                    dispatch.head_dim_k == params->head_dim_k &&
+                    dispatch.head_dim_v == params->head_dim_v;
+                if (consumer_shape_matches) {
+                    auto edgekv_input = std::make_unique<llm_graph_input_blocksvd_dispatch>(std::move(dispatch));
+                    const auto & packed = edgekv_input->dispatch;
+
+                    edgekv_input->u_q = ggml_new_tensor_1d(
+                        ctx0, GGML_TYPE_I8, (int64_t) packed.u_q.size());
+                    edgekv_input->vh_q = ggml_new_tensor_1d(
+                        ctx0, GGML_TYPE_I8, (int64_t) packed.vh_q.size());
+                    edgekv_input->rank_scale = ggml_new_tensor_1d(
+                        ctx0, GGML_TYPE_F32, (int64_t) packed.rank_scale.size());
+                    edgekv_input->block_positions = ggml_new_tensor_1d(
+                        ctx0, GGML_TYPE_I32, (int64_t) packed.block_positions.size());
+
+                    ggml_set_input(edgekv_input->u_q);
+                    ggml_set_input(edgekv_input->vh_q);
+                    ggml_set_input(edgekv_input->rank_scale);
+                    ggml_set_input(edgekv_input->block_positions);
+                    ggml_format_name(edgekv_input->u_q, "edgekv_u_q-%d", il);
+                    ggml_format_name(edgekv_input->vh_q, "edgekv_vh_q-%d", il);
+                    ggml_format_name(edgekv_input->rank_scale, "edgekv_scale-%d", il);
+                    ggml_format_name(edgekv_input->block_positions, "edgekv_pos-%d", il);
+
+                    const ggml_edgekv_reconstruct_params reconstruct_params = blocksvd_to_ggml_params(packed);
+                    ggml_tensor * dense_storage = ggml_edgekv_reconstruct(
+                        ctx0,
+                        edgekv_input->u_q,
+                        edgekv_input->vh_q,
+                        edgekv_input->rank_scale,
+                        edgekv_input->block_positions,
+                        &reconstruct_params);
+                    ggml_format_name(dense_storage, "edgekv_reconstruct-%d", il);
+                    cb(dense_storage, "edgekv_reconstruct", il);
+
+                    const size_t k_nb1 = (size_t) packed.head_dim_k*sizeof(ggml_fp16_t);
+                    const size_t k_nb2 = k_nb1*(size_t) packed.block_size;
+                    const size_t k_nb3 = k_nb2*(size_t) packed.n_blocks;
+                    edgekv_dense_k = ggml_view_4d(
+                        ctx0, dense_storage, packed.head_dim_k, packed.block_size,
+                        packed.n_blocks, packed.n_head_kv, k_nb1, k_nb2, k_nb3, 0);
+
+                    const size_t v_nb1 = (size_t) packed.head_dim_v*sizeof(ggml_fp16_t);
+                    const size_t v_nb2 = v_nb1*(size_t) packed.block_size;
+                    const size_t v_nb3 = v_nb2*(size_t) packed.n_blocks;
+                    edgekv_dense_v = ggml_view_4d(
+                        ctx0, dense_storage, packed.head_dim_v, packed.block_size,
+                        packed.n_blocks, packed.n_head_kv, v_nb1, v_nb2, v_nb3,
+                        (size_t) packed.dense_v_offset_bytes);
+                    ggml_format_name(edgekv_dense_k, "edgekv_dense_k-%d", il);
+                    ggml_format_name(edgekv_dense_v, "edgekv_dense_v-%d", il);
+
+                    params->edgekv_reconstructed = true;
+                    params->edgekv_n_blocks       = packed.n_blocks;
+                    params->edgekv_block_size     = packed.block_size;
+                    params->edgekv_positions.assign(
+                        packed.block_positions.begin(), packed.block_positions.end());
+
+                    res->add_input(std::move(edgekv_input));
+                } else {
+                    if (packed) {
+                        dispatch_error = "packed K/V dimensions do not match the attention consumer";
+                    }
+                    static std::atomic<bool> warned_edgekv_dispatch{false};
+                    if (!dispatch_error.empty() && !warned_edgekv_dispatch.exchange(true)) {
+                        LLAMA_LOG_WARN("%s: EdgeKV reconstruct dispatch unavailable; using lazy CPU decode: %s\n",
+                                __func__, dispatch_error.c_str());
+                    }
+                }
+            }
+
             void * udata = params.get();
             res->chunked_attn_params.push_back(std::move(params));
 
@@ -2361,10 +2500,11 @@ ggml_tensor * llm_graph_context::build_attn(
                 : llama_chunked_attn_compute;
             const char * op_name = use_lowrank_direct ? "kv_lowrank_direct_attn" : "chunked_attn";
 
-            ggml_tensor * args[3] = { q, k, v };
+            ggml_tensor * args[5] = { q, k, v, edgekv_dense_k, edgekv_dense_v };
+            const int n_args = params->edgekv_reconstructed ? 5 : 3;
             ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
                 out_dim, n_tokens, 1, 1,
-                args, 3, compute_fn, GGML_N_TASKS_MAX, udata);
+                args, n_args, compute_fn, GGML_N_TASKS_MAX, udata);
             ggml_set_name(cur, op_name);
             cb(cur, "kqv_out", il);
 
