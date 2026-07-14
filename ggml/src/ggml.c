@@ -1053,6 +1053,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "EDGEKV_RECONSTRUCT",
+    "EDGEKV_ATTN_DECODE",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1081,7 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1164,6 +1165,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "edgekv_reconstruct(u,vh,scale,pos)",
+    "edgekv_attn_decode(q,u,vh,scale,pos,recent)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1192,7 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5382,6 +5384,11 @@ static size_t ggml_edgekv_checked_add(size_t lhs, size_t rhs) {
     return lhs + rhs;
 }
 
+static size_t ggml_edgekv_align_bytes(size_t bytes) {
+    const size_t alignment = 128;
+    return ggml_edgekv_checked_mul((ggml_edgekv_checked_add(bytes, alignment - 1)) / alignment, alignment);
+}
+
 struct ggml_tensor * ggml_edgekv_reconstruct(
         struct ggml_context                         * ctx,
         struct ggml_tensor                          * u_q,
@@ -5454,6 +5461,99 @@ struct ggml_tensor * ggml_edgekv_reconstruct(
     result->src[1] = vh_q;
     result->src[2] = rank_scale;
     result->src[3] = block_positions;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_edgekv_attn_decode(struct ggml_context *                         ctx,
+                                             struct ggml_tensor *                          q,
+                                             struct ggml_tensor *                          u_q,
+                                             struct ggml_tensor *                          vh_q,
+                                             struct ggml_tensor *                          rank_scale,
+                                             struct ggml_tensor *                          block_positions,
+                                             struct ggml_tensor *                          recent_storage,
+                                             const struct ggml_edgekv_attn_decode_params * params) {
+    static_assert(
+        sizeof(struct ggml_edgekv_attn_decode_params) == GGML_EDGEKV_ATTN_DECODE_PARAM_COUNT * sizeof(int32_t),
+        "EdgeKV direct-attention params must match HTP op_params");
+
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(q != NULL && q->type == GGML_TYPE_F16 && ggml_is_contiguous(q));
+    GGML_ASSERT(u_q != NULL && u_q->type == GGML_TYPE_I8 && ggml_is_contiguous(u_q));
+    GGML_ASSERT(vh_q != NULL && vh_q->type == GGML_TYPE_I8 && ggml_is_contiguous(vh_q));
+    GGML_ASSERT(rank_scale != NULL && rank_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(rank_scale));
+    GGML_ASSERT(block_positions != NULL && block_positions->type == GGML_TYPE_I32 &&
+                ggml_is_contiguous(block_positions));
+    GGML_ASSERT(recent_storage != NULL && recent_storage->type == GGML_TYPE_I8 && ggml_is_contiguous(recent_storage));
+
+    GGML_ASSERT(params->n_blocks > 0 && params->block_size > 0);
+    GGML_ASSERT(params->rank_k > 0 && params->rank_v > 0);
+    GGML_ASSERT(params->group_size > 0);
+    GGML_ASSERT(params->layer_index >= 0 && params->layer_index < params->group_size);
+    GGML_ASSERT(params->n_head_q > 0 && params->n_head_kv > 0);
+    GGML_ASSERT(params->n_head_q % params->n_head_kv == 0);
+    GGML_ASSERT(params->head_dim_k > 0 && params->head_dim_v > 0);
+    GGML_ASSERT(params->recent_size > 0);
+    GGML_ASSERT(params->recent_v_offset_bytes >= 0 && params->recent_v_offset_bytes % 128 == 0);
+    GGML_ASSERT(params->recent_positions_offset_bytes >= 0 && params->recent_positions_offset_bytes % 128 == 0);
+    GGML_ASSERT(params->recent_total_bytes > 0 && params->recent_total_bytes % 128 == 0);
+    GGML_ASSERT(isfinite(params->scale) && params->scale > 0.0f);
+
+    const size_t n  = (size_t) params->n_blocks;
+    const size_t b  = (size_t) params->block_size;
+    const size_t g  = (size_t) params->group_size;
+    const size_t hq = (size_t) params->n_head_q;
+    const size_t hk = (size_t) params->n_head_kv;
+    const size_t dk = (size_t) params->head_dim_k;
+    const size_t dv = (size_t) params->head_dim_v;
+    const size_t rs = (size_t) params->recent_size;
+
+    const size_t k_u_bytes  = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), (size_t) params->rank_k);
+    const size_t v_u_offset = ggml_edgekv_align_bytes(k_u_bytes);
+    const size_t v_u_bytes  = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), (size_t) params->rank_v);
+    const size_t k_vh_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_k), g),
+                                ggml_edgekv_checked_mul(hk, dk));
+    const size_t v_vh_offset = ggml_edgekv_align_bytes(k_vh_bytes);
+    const size_t v_vh_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_v), g),
+                                ggml_edgekv_checked_mul(hk, dv));
+    const size_t k_scale_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_k), sizeof(float));
+    const size_t v_scale_offset = ggml_edgekv_align_bytes(k_scale_bytes);
+    const size_t v_scale_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, (size_t) params->rank_v), sizeof(float));
+    const size_t positions_bytes = ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(n, b), sizeof(int32_t));
+
+    GGML_ASSERT(ggml_edgekv_checked_add(v_u_offset, v_u_bytes) <= ggml_nbytes(u_q));
+    GGML_ASSERT(ggml_edgekv_checked_add(v_vh_offset, v_vh_bytes) <= ggml_nbytes(vh_q));
+    GGML_ASSERT(ggml_edgekv_checked_add(v_scale_offset, v_scale_bytes) <= ggml_nbytes(rank_scale));
+    GGML_ASSERT(positions_bytes <= ggml_nbytes(block_positions));
+    GGML_ASSERT(ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(hq, dk), sizeof(ggml_fp16_t)) <= ggml_nbytes(q));
+
+    const size_t recent_k_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(rs, hk), dk), sizeof(ggml_fp16_t));
+    const size_t recent_v_bytes =
+        ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(ggml_edgekv_checked_mul(rs, hk), dv), sizeof(ggml_fp16_t));
+    const size_t recent_positions_bytes = ggml_edgekv_checked_mul(rs, sizeof(int32_t));
+    const size_t query_position_offset =
+        ggml_edgekv_checked_add((size_t) params->recent_positions_offset_bytes, recent_positions_bytes);
+    GGML_ASSERT(recent_k_bytes <= (size_t) params->recent_v_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add((size_t) params->recent_v_offset_bytes, recent_v_bytes) <=
+                (size_t) params->recent_positions_offset_bytes);
+    GGML_ASSERT(ggml_edgekv_checked_add(query_position_offset, sizeof(int32_t)) <= (size_t) params->recent_total_bytes);
+    GGML_ASSERT((size_t) params->recent_total_bytes <= ggml_nbytes(recent_storage));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, params->head_dim_v, params->n_head_q);
+    ggml_set_op_params(result, params, sizeof(*params));
+
+    result->op     = GGML_OP_EDGEKV_ATTN_DECODE;
+    result->src[0] = q;
+    result->src[1] = u_q;
+    result->src[2] = vh_q;
+    result->src[3] = rank_scale;
+    result->src[4] = block_positions;
+    result->src[5] = recent_storage;
 
     return result;
 }
@@ -6930,9 +7030,12 @@ static void ggml_compute_backward(
         case GGML_OP_NONE: {
             // noop
         } break;
-        case GGML_OP_EDGEKV_RECONSTRUCT: {
-            GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
-        } break;
+        case GGML_OP_EDGEKV_RECONSTRUCT:
+        case GGML_OP_EDGEKV_ATTN_DECODE:
+            {
+                GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
+            }
+            break;
         case GGML_OP_COUNT:
         default: {
             GGML_ABORT("%s: unsupported ggml op for backward pass: %s\n", __func__, ggml_op_name(tensor->op));

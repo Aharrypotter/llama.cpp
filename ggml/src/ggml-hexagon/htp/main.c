@@ -596,6 +596,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_EDGEKV_RECONSTRUCT:
             return op_edgekv_reconstruct(octx);
 
+        case HTP_OP_EDGEKV_ATTN_DECODE:
+            return op_edgekv_attn_decode(octx);
+
         case HTP_OP_INVALID:
             break;
 

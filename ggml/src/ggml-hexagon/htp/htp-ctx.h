@@ -107,5 +107,6 @@ int op_fill(struct htp_ops_context * octx);
 int op_diag(struct htp_ops_context * octx);
 int op_solve_tri(struct htp_ops_context * octx);
 int op_edgekv_reconstruct(struct htp_ops_context * octx);
+int op_edgekv_attn_decode(struct htp_ops_context * octx);
 
 #endif /* HTP_CTX_H */

@@ -15,8 +15,9 @@ include_directories(
 set(HTP_LIB ggml-htp-${DSP_VERSION})
 
 set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV reconstruct AOT object")
+set(GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV direct-attention AOT object")
 set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
-option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV AOT adapter simulator test" OFF)
+option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV AOT adapter simulator tests" OFF)
 
 add_library(${HTP_LIB} SHARED
     main.c
@@ -41,7 +42,9 @@ add_library(${HTP_LIB} SHARED
     fill-ops.c
     diag-ops.c
     solve-tri-ops.c
+    edgekv-aot-runtime.c
     edgekv-reconstruct-ops.c
+    edgekv-attn-decode-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE
@@ -49,28 +52,51 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
     FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE})
 
-if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_AOT_OBJECT)
-    if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
-        message(FATAL_ERROR "EdgeKV AOT object does not exist: ${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
-    endif()
+if (DSP_VERSION STREQUAL "v79" AND
+    (GGML_HEXAGON_EDGEKV_AOT_OBJECT OR GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT))
     if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
         message(FATAL_ERROR "Hexagon-MLIR runtime does not exist: ${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
     endif()
 
-    message(STATUS "ggml-htp-v79: enabling EdgeKV C3 reconstruct AOT adapter")
-    target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_RECONSTRUCT_AOT=1)
-    target_link_libraries(${HTP_LIB} PRIVATE
-        "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}"
-        "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+    set(EDGEKV_AOT_OBJECTS)
+    if (GGML_HEXAGON_EDGEKV_AOT_OBJECT)
+        if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
+            message(FATAL_ERROR "EdgeKV reconstruct AOT object does not exist: ${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
+        endif()
+        message(STATUS "ggml-htp-v79: enabling EdgeKV C3 reconstruct AOT adapter")
+        target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_RECONSTRUCT_AOT=1)
+        list(APPEND EDGEKV_AOT_OBJECTS "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}")
+    endif()
+    if (GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT)
+        if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
+            message(FATAL_ERROR "EdgeKV direct-attention AOT object does not exist: ${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
+        endif()
+        message(STATUS "ggml-htp-v79: enabling EdgeKV C4A direct-attention AOT adapter")
+        target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_DIRECT_AOT=1)
+        list(APPEND EDGEKV_AOT_OBJECTS "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
+    endif()
+    target_link_libraries(${HTP_LIB} PRIVATE ${EDGEKV_AOT_OBJECTS} "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
 
-    if (GGML_HEXAGON_EDGEKV_BUILD_TESTS)
+    if (GGML_HEXAGON_EDGEKV_BUILD_TESTS AND GGML_HEXAGON_EDGEKV_AOT_OBJECT)
         set(EDGEKV_TEST_LIB test-edgekv-reconstruct-${DSP_VERSION})
         add_library(${EDGEKV_TEST_LIB} SHARED
             tests/test-edgekv-reconstruct.c
+            edgekv-aot-runtime.c
             edgekv-reconstruct-ops.c)
         target_compile_definitions(${EDGEKV_TEST_LIB} PRIVATE HTP_EDGEKV_RECONSTRUCT_AOT=1)
         target_link_libraries(${EDGEKV_TEST_LIB} PRIVATE
             "${GGML_HEXAGON_EDGEKV_AOT_OBJECT}"
+            "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
+    endif()
+    if (GGML_HEXAGON_EDGEKV_BUILD_TESTS AND GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT)
+        set(EDGEKV_DIRECT_TEST_LIB test-edgekv-attn-decode-${DSP_VERSION})
+        add_library(${EDGEKV_DIRECT_TEST_LIB} SHARED
+            tests/test-edgekv-attn-decode.c
+            edgekv-aot-runtime.c
+            edgekv-attn-decode-ops.c)
+        target_compile_definitions(${EDGEKV_DIRECT_TEST_LIB} PRIVATE HTP_EDGEKV_DIRECT_AOT=1)
+        target_link_libraries(${EDGEKV_DIRECT_TEST_LIB} PRIVATE
+            "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}"
             "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")
     endif()
 endif()
