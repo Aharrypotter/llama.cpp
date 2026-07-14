@@ -17,7 +17,7 @@ set(HTP_LIB ggml-htp-${DSP_VERSION})
 set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV reconstruct AOT object")
 set(GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV direct-attention AOT object")
 set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
-option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV AOT adapter simulator tests" OFF)
+option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV simulator tests" OFF)
 
 add_library(${HTP_LIB} SHARED
     main.c
@@ -51,6 +51,28 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
     FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE})
+
+if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
+    set(EDGEKV_HVX_GQA_TEST_LIB test-edgekv-hvx-gqa-block-${DSP_VERSION})
+    add_library(${EDGEKV_HVX_GQA_TEST_LIB} SHARED
+        tests/test-edgekv-hvx-gqa-block.c
+        edgekv-hvx-gqa-block.c
+        edgekv-hvx-gqa-scalar.c)
+    # Keep fixture and scalar-reference work out of the hand-written HVX region.
+    set_source_files_properties(tests/test-edgekv-hvx-gqa-block.c PROPERTIES
+        COMPILE_OPTIONS "-fno-lto;-O0;-fno-vectorize;-fno-slp-vectorize")
+    set_source_files_properties(edgekv-hvx-gqa-scalar.c PROPERTIES
+        COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+
+    set(EDGEKV_HVX_GQA_MOBILE_TEST_LIB test-edgekv-hvx-gqa-mobile-${DSP_VERSION})
+    add_library(${EDGEKV_HVX_GQA_MOBILE_TEST_LIB} SHARED
+        tests/test-edgekv-hvx-gqa-mobile.c
+        edgekv-hvx-gqa-block.c
+        edgekv-hvx-gqa-scalar.c
+        worker-pool.c)
+    set_source_files_properties(tests/test-edgekv-hvx-gqa-mobile.c PROPERTIES
+        COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+endif()
 
 if (DSP_VERSION STREQUAL "v79" AND
     (GGML_HEXAGON_EDGEKV_AOT_OBJECT OR GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT))
