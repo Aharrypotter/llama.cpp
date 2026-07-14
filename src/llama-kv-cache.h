@@ -159,6 +159,10 @@ public:
     uint32_t get_phys_size() const;
     uint32_t get_n_stream() const;
 
+    // Always available so common KV-cache code does not depend on the
+    // LLAMA_KV_BLOCKSVD compile-time surface. Returns false when disabled.
+    bool memory_reduction_enabled() const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -332,7 +336,6 @@ public:
     // Per-stream staging buffer that holds only the current incomplete block.
     using blocksvd_staging_t = llama_kv_blocksvd_staging_t;
 
-    bool memory_reduction_enabled() const { return bctx_params.memory_reduction && bctx_params.backend; }
     const blocksvd_staging_t & get_blocksvd_staging() const { return m_blocksvd_staging; }
 
     bool cell_is_empty(uint32_t stream, uint32_t cell) const { return v_cells[stream].is_empty(cell); }
@@ -350,10 +353,11 @@ private:
 
     // Map newly assigned logical cells into staging slots.
     bool blocksvd_stage_cells(uint32_t stream, const std::vector<uint32_t> & slots);
-
-    // Translate logical cell indices to their current staging slots.
-    std::vector<uint32_t> blocksvd_logical_to_staging(uint32_t stream, const std::vector<uint32_t> & logical) const;
 #endif
+
+    // Translate logical cell indices to physical cache rows. This is an
+    // identity mapping unless BlockSVD memory reduction is active.
+    std::vector<uint32_t> map_logical_to_physical(uint32_t stream, const std::vector<uint32_t> & logical) const;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;

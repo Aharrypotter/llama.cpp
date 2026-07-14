@@ -147,6 +147,9 @@ llama_kv_cache::llama_kv_cache(
     const llama_kv_blocksvd_params & bctx_params) :
     model(model), hparams(model.hparams), bctx_params(bctx_params), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+#ifndef LLAMA_KV_BLOCKSVD
+    GGML_UNUSED(n_ubatch);
+#endif
 
 #ifdef LLAMA_KV_BLOCKSVD
     // Chunked attention reads K/V tensors as float* directly, so force F32.
@@ -463,6 +466,40 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+bool llama_kv_cache::memory_reduction_enabled() const {
+#ifdef LLAMA_KV_BLOCKSVD
+    return bctx_params.memory_reduction && bctx_params.backend;
+#else
+    GGML_UNUSED(bctx_params);
+    return false;
+#endif
+}
+
+std::vector<uint32_t> llama_kv_cache::map_logical_to_physical(uint32_t                      stream,
+                                                              const std::vector<uint32_t> & logical) const {
+#ifdef LLAMA_KV_BLOCKSVD
+    if (stream < n_stream && memory_reduction_enabled()) {
+        std::vector<uint32_t> result;
+        result.reserve(logical.size());
+
+        const auto & cell_to_slot = m_blocksvd_staging.cell_to_slot[stream];
+        for (uint32_t idx : logical) {
+            if (idx < cell_to_slot.size() && cell_to_slot[idx] >= 0) {
+                result.push_back((uint32_t) cell_to_slot[idx]);
+            } else {
+                // During graph reservation a logical cell may not be staged yet.
+                result.push_back(0);
+            }
+        }
+        return result;
+    }
+#else
+    GGML_UNUSED(stream);
+#endif
+
+    return logical;
+}
+
 #ifdef LLAMA_KV_BLOCKSVD
 void llama_kv_cache::mark_compressed(uint32_t stream, const std::vector<uint32_t> & slots) {
     if (stream >= n_stream) {
@@ -533,27 +570,6 @@ bool llama_kv_cache::blocksvd_stage_cells(uint32_t stream, const std::vector<uin
     return true;
 }
 
-std::vector<uint32_t> llama_kv_cache::blocksvd_logical_to_staging(uint32_t stream, const std::vector<uint32_t> & logical) const {
-    std::vector<uint32_t> res;
-    res.reserve(logical.size());
-
-    if (stream >= n_stream || !memory_reduction_enabled()) {
-        res = logical;
-        return res;
-    }
-
-    const auto & c2s = m_blocksvd_staging.cell_to_slot[stream];
-    for (uint32_t idx : logical) {
-        if (idx < c2s.size() && c2s[idx] >= 0) {
-            res.push_back((uint32_t)c2s[idx]);
-        } else {
-            // Cell not staged yet (e.g. during graph reservation) — use slot 0 as placeholder.
-            res.push_back(0);
-        }
-    }
-    return res;
-}
-
 void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
     if (!bctx || !bctx->params.backend) {
         return;
@@ -605,9 +621,8 @@ void llama_kv_cache::blocksvd_materialize(llama_kv_blocksvd_context * bctx) {
         }
 
         // In memory-reduction mode, write to physical staging slots.
-        const std::vector<uint32_t> & write_slots = memory_reduction_enabled()
-            ? blocksvd_logical_to_staging(chunk.stream, chunk.slots)
-            : chunk.slots;
+        const std::vector<uint32_t> & write_slots =
+            memory_reduction_enabled() ? map_logical_to_physical(chunk.stream, chunk.slots) : chunk.slots;
 
         for (int l = 0; l < chunk.group_size; ++l) {
             const int32_t il = chunk.layer_start + l;
@@ -1105,6 +1120,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
 
+#ifdef LLAMA_KV_BLOCKSVD
     // Snapshot blocksvd staging so we can roll it back after the dry-run.
     // apply_ubatch() below mutates m_blocksvd_staging.{cell_to_slot,slot_to_cell};
     // without this restore, staging fills up during prepare and real decode
@@ -1112,6 +1128,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     auto staging_c2s_snapshot = m_blocksvd_staging.cell_to_slot;
     auto staging_s2c_snapshot = m_blocksvd_staging.slot_to_cell;
     auto cell_state_snapshot  = cell_state_vec;
+#endif
 
     bool success = true;
 
@@ -1158,10 +1175,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
     }
 
+#ifdef LLAMA_KV_BLOCKSVD
     // Restore blocksvd staging to its pre-dry-run state.
     m_blocksvd_staging.cell_to_slot = std::move(staging_c2s_snapshot);
     m_blocksvd_staging.slot_to_cell = std::move(staging_s2c_snapshot);
     cell_state_vec                  = std::move(cell_state_snapshot);
+#endif
 
     if (!success) {
         return {};
@@ -2005,19 +2024,11 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
-#ifdef LLAMA_KV_BLOCKSVD
-    const bool use_staging = memory_reduction_enabled();
-#else
-    const bool use_staging = false;
-#endif
-
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const uint32_t stream = sinfo.strm[s];
         const int64_t offs = stream*(int64_t)cache_size;
 
-        std::vector<uint32_t> phys = use_staging
-            ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
-            : sinfo.idxs[s];
+        const std::vector<uint32_t> phys = map_logical_to_physical(stream, sinfo.idxs[s]);
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + phys[i];
@@ -2032,20 +2043,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
-#ifdef LLAMA_KV_BLOCKSVD
-    const bool use_staging = memory_reduction_enabled();
-#else
-    const bool use_staging = false;
-#endif
-
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const uint32_t stream = sinfo.strm[s];
             const int64_t offs = stream*(int64_t)cache_size;
 
-            std::vector<uint32_t> phys = use_staging
-                ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
-                : sinfo.idxs[s];
+            const std::vector<uint32_t> phys = map_logical_to_physical(stream, sinfo.idxs[s]);
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + phys[i];
@@ -2061,9 +2064,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const uint32_t stream = sinfo.strm[s];
             const int64_t offs = stream*phys_kv_size*n_embd_v_gqa;
 
-            std::vector<uint32_t> phys = use_staging
-                ? blocksvd_logical_to_staging(stream, sinfo.idxs[s])
-                : sinfo.idxs[s];
+            const std::vector<uint32_t> phys = map_logical_to_physical(stream, sinfo.idxs[s]);
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
