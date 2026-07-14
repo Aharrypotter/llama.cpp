@@ -71,7 +71,7 @@ if (DSP_VERSION STREQUAL "v79" AND
         if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
             message(FATAL_ERROR "EdgeKV direct-attention AOT object does not exist: ${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
         endif()
-        message(STATUS "ggml-htp-v79: enabling EdgeKV C4A direct-attention AOT adapter")
+        message(STATUS "ggml-htp-v79: enabling EdgeKV direct-attention AOT adapter")
         target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_DIRECT_AOT=1)
         list(APPEND EDGEKV_AOT_OBJECTS "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}")
     endif()
@@ -93,8 +93,16 @@ if (DSP_VERSION STREQUAL "v79" AND
         add_library(${EDGEKV_DIRECT_TEST_LIB} SHARED
             tests/test-edgekv-attn-decode.c
             edgekv-aot-runtime.c
-            edgekv-attn-decode-ops.c)
-        target_compile_definitions(${EDGEKV_DIRECT_TEST_LIB} PRIVATE HTP_EDGEKV_DIRECT_AOT=1)
+            edgekv-attn-decode-ops.c
+            flash-attn-ops.c
+            worker-pool.c
+            hex-dma.c)
+        # Fixture construction is outside every timed region; keep it out of Release LTO/vectorization.
+        set_source_files_properties(tests/test-edgekv-attn-decode.c PROPERTIES
+            COMPILE_OPTIONS "-fno-lto;-O0;-fno-vectorize;-fno-slp-vectorize")
+        target_compile_definitions(${EDGEKV_DIRECT_TEST_LIB} PRIVATE
+            HTP_EDGEKV_DIRECT_AOT=1
+            HTP_EDGEKV_PROFILE_AOT=1)
         target_link_libraries(${EDGEKV_DIRECT_TEST_LIB} PRIVATE
             "${GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT}"
             "${GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY}")

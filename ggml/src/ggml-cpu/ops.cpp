@@ -10507,19 +10507,19 @@ void ggml_compute_forward_edgekv_reconstruct(
 }
 
 void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    const struct ggml_tensor * q_storage         = dst->src[0];
-    const struct ggml_tensor * u_storage         = dst->src[1];
-    const struct ggml_tensor * vh_storage        = dst->src[2];
-    const struct ggml_tensor * scale_storage     = dst->src[3];
-    const struct ggml_tensor * positions_storage = dst->src[4];
-    const struct ggml_tensor * recent_storage    = dst->src[5];
+    const struct ggml_tensor * q_storage      = dst->src[0];
+    const struct ggml_tensor * u_storage      = dst->src[1];
+    const struct ggml_tensor * vh_storage     = dst->src[2];
+    const struct ggml_tensor * metadata       = dst->src[3];
+    const struct ggml_tensor * active_k       = dst->src[4];
+    const struct ggml_tensor * active_v       = dst->src[5];
 
-    GGML_ASSERT(q_storage && q_storage->type == GGML_TYPE_F16);
+    GGML_ASSERT(q_storage && q_storage->type == GGML_TYPE_F32);
     GGML_ASSERT(u_storage && u_storage->type == GGML_TYPE_I8);
     GGML_ASSERT(vh_storage && vh_storage->type == GGML_TYPE_I8);
-    GGML_ASSERT(scale_storage && scale_storage->type == GGML_TYPE_F32);
-    GGML_ASSERT(positions_storage && positions_storage->type == GGML_TYPE_I32);
-    GGML_ASSERT(recent_storage && recent_storage->type == GGML_TYPE_I8);
+    GGML_ASSERT(metadata && metadata->type == GGML_TYPE_I8);
+    GGML_ASSERT(active_k && (active_k->type == GGML_TYPE_F16 || active_k->type == GGML_TYPE_F32));
+    GGML_ASSERT(active_v && (active_v->type == GGML_TYPE_F16 || active_v->type == GGML_TYPE_F32));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     struct ggml_edgekv_attn_decode_params p;
@@ -10530,22 +10530,26 @@ void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * 
     };
     const size_t v_u_offset     = align_128((size_t) p.n_blocks * p.block_size * p.rank_k);
     const size_t v_vh_offset    = align_128((size_t) p.n_blocks * p.rank_k * p.group_size * p.n_head_kv * p.head_dim_k);
-    const size_t v_scale_offset = align_128((size_t) p.n_blocks * p.rank_k * sizeof(float));
-
-    const auto * q               = (const ggml_fp16_t *) q_storage->data;
+    const auto * q               = (const float *) q_storage->data;
     const auto * k_u             = (const int8_t *) u_storage->data;
     const auto * v_u             = (const int8_t *) ((const char *) u_storage->data + v_u_offset);
     const auto * k_vh            = (const int8_t *) vh_storage->data;
     const auto * v_vh            = (const int8_t *) ((const char *) vh_storage->data + v_vh_offset);
-    const auto * k_scale         = (const float *) scale_storage->data;
-    const auto * v_scale         = (const float *) ((const char *) scale_storage->data + v_scale_offset);
-    const auto * block_positions = (const int32_t *) positions_storage->data;
-
-    const auto * recent_k = (const ggml_fp16_t *) recent_storage->data;
-    const auto * recent_v = (const ggml_fp16_t *) ((const char *) recent_storage->data + p.recent_v_offset_bytes);
+    const auto * k_scale         = (const float *) metadata->data;
+    const auto * v_scale =
+        (const float *) ((const char *) metadata->data + p.metadata_v_scale_offset_bytes);
+    const auto * block_positions =
+        (const int32_t *) ((const char *) metadata->data + p.metadata_block_positions_offset_bytes);
     const auto * recent_positions =
-        (const int32_t *) ((const char *) recent_storage->data + p.recent_positions_offset_bytes);
+        (const int32_t *) ((const char *) metadata->data + p.metadata_recent_positions_offset_bytes);
     const auto * query_position = recent_positions + p.recent_size;
+
+    const auto load_active = [](const struct ggml_tensor * tensor, size_t index) {
+        if (tensor->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(((const ggml_fp16_t *) tensor->data)[index]);
+        }
+        return ((const float *) tensor->data)[index];
+    };
 
     float *       output = (float *) dst->data;
     const int32_t n_rep  = p.n_head_q / p.n_head_kv;
@@ -10557,7 +10561,7 @@ void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * 
 
     for (int32_t hq = params->ith; hq < p.n_head_q; hq += params->nth) {
         const int32_t       hkv       = hq / n_rep;
-        const ggml_fp16_t * q_head    = q + (size_t) hq * p.head_dim_k;
+        const float *       q_head    = q + (size_t) hq * p.head_dim_k;
         float               max_logit = -INFINITY;
         float               sum_exp   = 0.0f;
         std::fill(accumulator.begin(), accumulator.end(), 0.0f);
@@ -10580,7 +10584,7 @@ void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * 
                     ((((size_t) block * p.rank_k + rank) * p.group_size + p.layer_index) * p.n_head_kv + hkv) *
                     p.head_dim_k;
                 for (int32_t d = 0; d < p.head_dim_k; ++d) {
-                    dot += (float) k_vh[vh_base + d] * ggml_fp16_to_fp32(q_head[d]);
+                    dot += (float) k_vh[vh_base + d] * q_head[d];
                 }
                 q_rank[rank] = dot * k_scale[(size_t) block * p.rank_k + rank];
             }
@@ -10626,13 +10630,13 @@ void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * 
             const size_t k_base = ((size_t) token * p.n_head_kv + hkv) * p.head_dim_k;
             float        logit  = 0.0f;
             for (int32_t d = 0; d < p.head_dim_k; ++d) {
-                logit += ggml_fp16_to_fp32(recent_k[k_base + d]) * ggml_fp16_to_fp32(q_head[d]);
+                logit += load_active(active_k, k_base + d) * q_head[d];
             }
             logit *= p.scale;
 
             const size_t v_base = ((size_t) token * p.n_head_kv + hkv) * p.head_dim_v;
             for (int32_t d = 0; d < p.head_dim_v; ++d) {
-                value[d] = ggml_fp16_to_fp32(recent_v[v_base + d]);
+                value[d] = load_active(active_v, v_base + d);
             }
             consume(logit);
         }

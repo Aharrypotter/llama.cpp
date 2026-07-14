@@ -53,6 +53,7 @@ static_assert((int) HTP_TYPE_F16 == (int) GGML_TYPE_F16);
 static_assert((int) HTP_TYPE_I8  == (int) GGML_TYPE_I8);
 static_assert((int) HTP_TYPE_I32 == (int) GGML_TYPE_I32);
 static_assert((int) HTP_EDGEKV_PARAM_COUNT == (int) GGML_EDGEKV_RECONSTRUCT_PARAM_COUNT);
+static_assert((int) HTP_EDGEKV_ATTN_PARAM_COUNT == (int) GGML_EDGEKV_ATTN_DECODE_PARAM_COUNT);
 
 static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
@@ -3259,19 +3260,28 @@ static bool ggml_hexagon_supported_edgekv_attn_decode(const struct ggml_hexagon_
     return false;
 #else
     static const int32_t expected[HTP_EDGEKV_ATTN_PARAM_COUNT] = {
-        2, 16, 8, 4, 2, 1, 4, 2, 32, 16, 8, 1024, 1536, 1664, 0x3e3504f3,
+        16, 64, 32, 32, 4, 0, 16, 8, 128, 128, 128, 2048, 4096, 8192, 8832, 0x3db504f3,
     };
 
-    if (opt_arch != 79 || memcmp(op->op_params, expected, sizeof(expected)) != 0) {
+    if (opt_arch != 79) {
         return false;
     }
-    if (!op->src[0] || op->src[0]->type != GGML_TYPE_F16 || ggml_nbytes(op->src[0]) < 256 || !op->src[1] ||
-        op->src[1]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[1]) < 384 || !op->src[2] ||
-        op->src[2]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[2]) < 2560 || !op->src[3] ||
-        op->src[3]->type != GGML_TYPE_F32 || ggml_nbytes(op->src[3]) < 256 || !op->src[4] ||
-        op->src[4]->type != GGML_TYPE_I32 || ggml_nbytes(op->src[4]) < 128 || !op->src[5] ||
-        op->src[5]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[5]) < 1664 || op->type != GGML_TYPE_F32 ||
-        ggml_nbytes(op) < 256) {
+    for (int i = 0; i < HTP_EDGEKV_ATTN_PARAM_COUNT; ++i) {
+        if (i != HTP_EDGEKV_ATTN_LAYER_INDEX && op->op_params[i] != expected[i]) {
+            return false;
+        }
+    }
+    if (op->op_params[HTP_EDGEKV_ATTN_LAYER_INDEX] < 0 ||
+        op->op_params[HTP_EDGEKV_ATTN_LAYER_INDEX] >= expected[HTP_EDGEKV_ATTN_GROUP_SIZE]) {
+        return false;
+    }
+    if (!op->src[0] || op->src[0]->type != GGML_TYPE_F32 || ggml_nbytes(op->src[0]) < 8192 || !op->src[1] ||
+        op->src[1]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[1]) < 65536 || !op->src[2] ||
+        op->src[2]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[2]) < 4194304 || !op->src[3] ||
+        op->src[3]->type != GGML_TYPE_I8 || ggml_nbytes(op->src[3]) < 8832 || !op->src[4] ||
+        op->src[4]->type != GGML_TYPE_F16 || ggml_nbytes(op->src[4]) < 262144 || !op->src[5] ||
+        op->src[5]->type != GGML_TYPE_F16 || ggml_nbytes(op->src[5]) < 262144 || op->type != GGML_TYPE_F32 ||
+        ggml_nbytes(op) < 8192) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {

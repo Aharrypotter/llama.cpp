@@ -2440,13 +2440,14 @@ extern "C" {
             struct ggml_tensor                          * block_positions,
             const struct ggml_edgekv_reconstruct_params * params);
 
-    // Packed INT8 xKV direct decode attention. q is contiguous FP16 [Dk,Hq].
-    // The next four inputs reuse the reconstruction factor-pool ABI. The final
-    // I8 storage tensor contains FP16 recent K, FP16 recent V, I32 recent
+    // Packed INT8 xKV direct decode attention. q is contiguous F32 [Dk,Hq].
+    // U and Vh reuse the packed reconstruction factor-pool ABI. The I8 metadata
+    // tensor contains K/V F32 rank scales, compressed I32 positions, active I32
     // positions, and one trailing I32 query position at the described offsets.
-    // The result is contiguous F32 [Dv,Hq].
+    // active_k/active_v are contiguous F16 or F32 [D,Hkv,recent]. The result is
+    // contiguous F32 [Dv,Hq].
     enum {
-        GGML_EDGEKV_ATTN_DECODE_PARAM_COUNT = 15,
+        GGML_EDGEKV_ATTN_DECODE_PARAM_COUNT = 16,
     };
 
     struct ggml_edgekv_attn_decode_params {
@@ -2461,9 +2462,10 @@ extern "C" {
         int32_t head_dim_k;
         int32_t head_dim_v;
         int32_t recent_size;
-        int32_t recent_v_offset_bytes;
-        int32_t recent_positions_offset_bytes;
-        int32_t recent_total_bytes;
+        int32_t metadata_v_scale_offset_bytes;
+        int32_t metadata_block_positions_offset_bytes;
+        int32_t metadata_recent_positions_offset_bytes;
+        int32_t metadata_total_bytes;
         float   scale;
     };
 
@@ -2471,9 +2473,9 @@ extern "C" {
                                                           struct ggml_tensor *                          q,
                                                           struct ggml_tensor *                          u_q,
                                                           struct ggml_tensor *                          vh_q,
-                                                          struct ggml_tensor *                          rank_scale,
-                                                          struct ggml_tensor *                          block_positions,
-                                                          struct ggml_tensor *                          recent_storage,
+                                                          struct ggml_tensor *                          metadata,
+                                                          struct ggml_tensor *                          active_k,
+                                                          struct ggml_tensor *                          active_v,
                                                           const struct ggml_edgekv_attn_decode_params * params);
 
     GGML_API void ggml_flash_attn_ext_set_prec(

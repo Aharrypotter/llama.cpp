@@ -108,5 +108,6 @@ int op_diag(struct htp_ops_context * octx);
 int op_solve_tri(struct htp_ops_context * octx);
 int op_edgekv_reconstruct(struct htp_ops_context * octx);
 int op_edgekv_attn_decode(struct htp_ops_context * octx);
+uint64_t edgekv_attn_decode_last_aot_pcycles(void);
 
 #endif /* HTP_CTX_H */
