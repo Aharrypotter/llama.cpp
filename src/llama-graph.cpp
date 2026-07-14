@@ -85,9 +85,14 @@ class llm_graph_input_blocksvd_state final : public llm_graph_input_i {
             consumer->q_pos.assign(ubatch->pos, ubatch->pos + ubatch->n_tokens);
             consumer->slot_pos = mctx->get_slot_positions(0);
 
-            consumer->chunks_dense.clear();
-            consumer->chunks_rank.clear();
-            consumer->hoist_done.store(0, std::memory_order_release);
+            // Build the per-forward refs list here, on the main thread, before
+            // the parallel compute op runs. This is the single-threaded graph
+            // boundary (previous forward's compute has drained), so the compute
+            // op can stay strictly read-only over the refs; see the chunk_ref
+            // doc in llama-kv-blocksvd.h. build_refs clears the stale list
+            // internally and repopulates chunks_dense/chunks_rank per
+            // consumer->use_lowrank_direct.
+            llama_chunked_attn_build_refs(consumer);
         }
     }
 
@@ -2574,6 +2579,9 @@ ggml_tensor * llm_graph_context::build_attn(
             params->scale      = kq_scale;
             params->n_stream   = mctx_cur->get_n_stream();
             params->cache_size = mctx_cur->get_cache_size();
+            // Selects the compute path (and thus which refs list set_input builds).
+            // Mirrors the compute_fn / op_name selection below.
+            params->use_lowrank_direct = !cparams.kv_lowrank_reconstruct;
 
             // Causal masking: populate positions for every token unconditionally.
             // The compute op asserts q_pos.size() == n_tokens.

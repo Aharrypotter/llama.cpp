@@ -16,6 +16,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -364,12 +365,22 @@ static void test_int8_reconstruct_dispatch() {
 
         llama_chunked_attn_params baseline_params;
         configure_consumer(baseline_params);
+        llama_chunked_attn_build_refs(&baseline_params);
+
+        // Reproduce the original lifetime hazard directly: growing xkv_chunks
+        // after the hoist must not invalidate the per-forward position snapshot.
+        const size_t original_chunk_count    = ctx->xkv_chunks.size();
+        const size_t original_chunk_capacity = ctx->xkv_chunks.capacity();
+        do {
+            ctx->xkv_chunks.emplace_back();
+        } while (ctx->xkv_chunks.capacity() == original_chunk_capacity);
         ggml_tensor * baseline_out = ggml_new_tensor_2d(
             ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v*n_head_q, 1);
         baseline_out->src[0] = q;
         baseline_out->src[1] = active_k;
         baseline_out->src[2] = active_v;
         llama_chunked_attn_compute(baseline_out, 0, 1, &baseline_params);
+        ctx->xkv_chunks.resize(original_chunk_count);
 
         llama_chunked_attn_params edgekv_params;
         configure_consumer(edgekv_params);
@@ -378,6 +389,7 @@ static void test_int8_reconstruct_dispatch() {
         edgekv_params.edgekv_block_size     = dispatch.block_size;
         edgekv_params.edgekv_positions.assign(
             dispatch.block_positions.begin(), dispatch.block_positions.end());
+        llama_chunked_attn_build_refs(&edgekv_params);
         ggml_tensor * edgekv_out = ggml_new_tensor_2d(
             ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v*n_head_q, 1);
         edgekv_out->src[0] = q;
@@ -394,6 +406,51 @@ static void test_int8_reconstruct_dispatch() {
             assert(std::isfinite(edgekv));
             assert(std::fabs(baseline - edgekv) < 2e-4f);
         }
+
+        llama_chunked_attn_params direct_params;
+        configure_consumer(direct_params);
+        direct_params.use_lowrank_direct = true;
+        llama_chunked_attn_build_refs(&direct_params);
+        assert(direct_params.chunks_rank.size() == original_chunk_count);
+
+        const size_t direct_chunk_capacity = ctx->xkv_chunks.capacity();
+        do {
+            ctx->xkv_chunks.emplace_back();
+        } while (ctx->xkv_chunks.capacity() == direct_chunk_capacity);
+
+        ggml_tensor * direct_serial_out =
+            ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v * n_head_q, 1);
+        direct_serial_out->src[0] = q;
+        direct_serial_out->src[1] = active_k;
+        direct_serial_out->src[2] = active_v;
+        llama_kv_lowrank_direct_attn_compute(direct_serial_out, 0, 1, &direct_params);
+
+        ggml_tensor * direct_parallel_out =
+            ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, (int64_t) dispatch.head_dim_v * n_head_q, 1);
+        direct_parallel_out->src[0] = q;
+        direct_parallel_out->src[1] = active_k;
+        direct_parallel_out->src[2] = active_v;
+
+        constexpr int32_t        n_workers = 4;
+        std::vector<std::thread> workers;
+        workers.reserve(n_workers);
+        for (int32_t ith = 0; ith < n_workers; ++ith) {
+            workers.emplace_back([=, &direct_params]() {
+                llama_kv_lowrank_direct_attn_compute(direct_parallel_out, ith, n_workers, &direct_params);
+            });
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+
+        for (int64_t i = 0; i < ggml_nelements(direct_parallel_out); ++i) {
+            const float serial   = ((const float *) direct_serial_out->data)[i];
+            const float parallel = ((const float *) direct_parallel_out->data)[i];
+            assert(std::isfinite(serial));
+            assert(std::isfinite(parallel));
+            assert(std::fabs(serial - parallel) < 1e-6f);
+        }
+        ctx->xkv_chunks.resize(original_chunk_count);
     }
 
     ggml_free(ggml_ctx);
@@ -406,9 +463,13 @@ static void test_int8_reconstruct_dispatch() {
     assert(dispatch.n_blocks == before_failure.n_blocks);
     assert(dispatch.u_q == before_failure.u_q);
 
+    assert(!ctx->decode_cache.empty());
+    assert(!ctx->rank_cache.empty());
     const uint64_t generation_before_clear = ctx->xkv_generation;
     llama_kv_blocksvd_clear(ctx);
     assert(ctx->xkv_chunks.empty());
+    assert(ctx->decode_cache.empty());
+    assert(ctx->rank_cache.empty());
     assert(ctx->xkv_generation == generation_before_clear + 1);
 
     std::printf("test-kv-blocksvd: INT8 reconstruct dispatch OK\n");

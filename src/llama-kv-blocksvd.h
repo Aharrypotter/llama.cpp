@@ -2,7 +2,6 @@
 
 #include "llama.h"
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -124,10 +123,9 @@ struct llama_kv_blocksvd_context {
     };
     std::vector<pending_xkv_group> pending_xkv;
 
-    // Per-forward decode cache for chunked attention.
-    // Indexed by xkv_chunks index; each slot holds the group-decompressed K/V for
-    // that chunk so the compute op does not decode the same chunk N_layer times per forward.
-    // Reset at the start of each ubatch via llama_kv_blocksvd_reset_decode_cache.
+    // Lazy decode cache for chunked attention. Indexed by xkv_chunks index; each
+    // entry remains valid while the append-only archive is alive, so a chunk is
+    // not decompressed again on every graph reuse. Cleared with the archive.
     struct decoded_chunk {
         // Per-layer flat K rows: [group_size][n_tokens * n_head_kv * head_dim_k]
         std::vector<std::vector<float>> k;
@@ -137,8 +135,8 @@ struct llama_kv_blocksvd_context {
     };
     mutable std::vector<std::unique_ptr<decoded_chunk>> decode_cache;
 
-    // Per-forward rank-domain factor cache for direct low-rank attention.
-    // Populated lazily by llama_kv_lowrank_direct_attn_compute. All layers in
+    // Lazy rank-domain factor cache for direct low-rank attention. Populated by
+    // the single-threaded refs hoist. All layers in
     // an xKV chunk share the same U/S/Vh factors (that's the xKV cross-layer
     // property); only the layer offset into Vh's "combined_dim" varies. Cached
     // buffers are the fp32-dequant + US premultiply results.
@@ -302,18 +300,27 @@ void llama_kv_blocksvd_reset_decode_cache(llama_kv_blocksvd_context * ctx);
 
 struct ggml_tensor;
 
-// Per-invocation refs built by thread 0 during the hoist phase and
-// consumed read-only by all threads after the barrier.
+// Per-forward refs built single-threaded in set_input (llama_chunked_attn_build_refs)
+// and consumed read-only by all worker threads in the parallel compute op.
+//
+// `pos` is owned by value (a per-forward snapshot copied from the chunk during
+// the hoist) rather than a pointer into bctx->xkv_chunks. xkv_chunks is an
+// append-only but *growable* std::vector: a push_back during compression
+// reallocates its storage and would leave any &xkv_chunks[ci].pos captured in a
+// ref dangling, which caused the heap-buffer-overflow. Owning the positions here
+// keeps them valid for the whole forward regardless of xkv_chunks storage, and
+// the ref stays valid even if chunks_dense/chunks_rank itself reallocates
+// (vector move transfers the buffer), so correctness never relies on reserve().
 struct llama_chunked_attn_chunk_ref {
     const float * k_data;
     const float * v_data;
     int32_t n_tokens;
-    const std::vector<llama_pos> * pos;
+    std::vector<llama_pos> pos;
 };
 
 struct llama_kv_lowrank_direct_chunk_ref {
     const void * rc; // rank_chunk *, opaque here to avoid header exposing internals
-    const std::vector<llama_pos> * pos;
+    std::vector<llama_pos> pos;
     int32_t layer_offset_k;
     int32_t layer_offset_v;
 };
@@ -342,17 +349,26 @@ struct llama_chunked_attn_params {
     int32_t edgekv_block_size = 0;
     std::vector<llama_pos> edgekv_positions;
 
-    // Per-invocation shared state populated by thread 0 in the hoist phase
-    // and read by all worker threads after the spin-barrier.
-    // Populated by whichever compute callback runs (chunked_attn or
-    // lowrank_direct); only one is used per callback.
+    // Selects which compute path this node runs: true = kv_lowrank_direct
+    // (rank-domain, uses chunks_rank), false = chunked_attn (dense, uses
+    // chunks_dense). Set by build_attn; read by the set_input hoist to build
+    // the matching refs list.
+    bool use_lowrank_direct = false;
+
+    // Per-forward refs built by the single-threaded set_input hoist and consumed
+    // read-only by all worker threads during the parallel compute op. Only one
+    // list is populated per node, per use_lowrank_direct above.
+    //
+    // These are built at set_input (main thread, before the parallel region and
+    // strictly after the previous forward's compute has drained) rather than
+    // inside the compute op. Building inside the op required a hand-rolled
+    // spin-latch to gate workers behind thread 0's rebuild, which raced: a
+    // worker could still be reading the previous invocation's refs while thread
+    // 0 cleared and rebuilt this list (ASan: heap-use-after-free). A custom op
+    // has no access to ggml_barrier, so the op must stay strictly read-only and
+    // all mutation must happen at the single-threaded graph boundary.
     mutable std::vector<llama_chunked_attn_chunk_ref>        chunks_dense;
     mutable std::vector<llama_kv_lowrank_direct_chunk_ref>   chunks_rank;
-    // Atomic spin-barrier: 0 = thread 0 has not yet finished hoisting,
-    // 1 = hoist complete, worker threads may enter the compute phase.
-    // Fresh instance per graph node (per build_attn call), so no reuse
-    // hazards across ubatches.
-    mutable std::atomic<int> hoist_done{0};
 
     // Reservation-side workspace footprint of this op invocation.
     // Includes: the params struct itself, both position vectors (capacity),
@@ -365,11 +381,16 @@ struct llama_chunked_attn_params {
         b += slot_pos.capacity() * sizeof(llama_pos);
         b += edgekv_positions.capacity() * sizeof(llama_pos);
         b += (size_t) head_dim_v * sizeof(float);
-        // chunk_ref inside compute: 2 pointers + int32 + pointer-to-vector.
-        // Approximate with 4 pointers per chunk to stay portable.
-        const size_t chunk_ref_sz = 4 * sizeof(void *);
-        const size_t n_chunks = bctx ? bctx->xkv_chunks.size() : 0;
-        b += n_chunks * chunk_ref_sz;
+        if (bctx && !edgekv_reconstructed) {
+            for (const auto & chunk : bctx->xkv_chunks) {
+                if (chunk.stream != 0 || il < chunk.layer_start || il >= chunk.layer_start + chunk.group_size) {
+                    continue;
+                }
+                b += use_lowrank_direct ? sizeof(llama_kv_lowrank_direct_chunk_ref) :
+                                          sizeof(llama_chunked_attn_chunk_ref);
+                b += chunk.pos.size() * sizeof(llama_pos);
+            }
+        }
         return b;
     }
 };
@@ -390,9 +411,17 @@ void llama_chunked_attn_compute(
 // llama_chunked_attn_compute, but consumes compressed factors without
 // materializing dense per-token K/V for each block.
 //
-// Phase 2 status: stub — delegates to llama_chunked_attn_compute and prints a
-// one-shot marker. Phase 3 replaces the body with the rank-domain kernel
-// described in the direct-consumer plan (kv_lowrank_direct_reference.py).
+// The implementation evaluates K logits and V values directly in the rank
+// domain and partitions independent query-head/token work across ggml workers.
 void llama_kv_lowrank_direct_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata);
+
+// Single-threaded hoist: build the per-forward refs list (chunks_dense or
+// chunks_rank, per p->use_lowrank_direct) that the parallel compute op above
+// consumes read-only. Called from set_input on the main thread, before the
+// parallel region and after the previous forward's compute has drained, so the
+// compute op never mutates shared state. Decompresses / dequantizes chunk
+// factors into bctx->decode_cache / rank_cache as needed (both are
+// vector<unique_ptr<...>>, so their pointees are stable across the op).
+void llama_chunked_attn_build_refs(llama_chunked_attn_params * p);
