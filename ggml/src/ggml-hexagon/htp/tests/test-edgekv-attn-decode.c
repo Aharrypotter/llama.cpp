@@ -2,6 +2,10 @@
 
 #include "htp-ctx.h"
 
+#ifdef HTP_EDGEKV_HVX_GQA
+#include "edgekv-hvx-gqa-attn.h"
+#endif
+
 #include "HAP_compute_res.h"
 #include "HAP_perf.h"
 
@@ -41,6 +45,14 @@ enum {
     DENSE_V_BYTES                    = N_HEAD_KV * KV_SIZE * HEAD_DIM_V * 2,
     DENSE_MASK_BYTES                 = KV_SIZE * 2,
 };
+
+#ifdef HTP_EDGEKV_HVX_GQA
+#define EDGEKV_DIRECT_KERNEL_NAME "direct_hvx"
+#define EDGEKV_TEST_MILESTONE     "C4C3"
+#else
+#define EDGEKV_DIRECT_KERNEL_NAME "direct_aot"
+#define EDGEKV_TEST_MILESTONE     "C4B0"
+#endif
 
 static float    q[N_HEAD_Q * HEAD_DIM_K] __attribute__((aligned(128)));
 static float    output[N_HEAD_Q * HEAD_DIM_V] __attribute__((aligned(128)));
@@ -466,14 +478,35 @@ int main(void) {
 
     struct htp_ops_context octx;
     memset(&octx, 0, sizeof(octx));
-    octx.op     = HTP_OP_EDGEKV_ATTN_DECODE;
-    octx.src[0] = &q_tensor;
-    octx.src[1] = &u_tensor;
-    octx.src[2] = &vh_tensor;
-    octx.src[3] = &metadata_tensor;
-    octx.src[4] = &active_k_tensor;
-    octx.src[5] = &active_v_tensor;
-    octx.dst    = &output_tensor;
+    octx.ctx       = &dense_ctx;
+    octx.op        = HTP_OP_EDGEKV_ATTN_DECODE;
+    octx.src[0]    = &q_tensor;
+    octx.src[1]    = &u_tensor;
+    octx.src[2]    = &vh_tensor;
+    octx.src[3]    = &metadata_tensor;
+    octx.src[4]    = &active_k_tensor;
+    octx.src[5]    = &active_v_tensor;
+    octx.dst       = &output_tensor;
+    octx.n_threads = N_THREADS;
+
+#ifdef HTP_EDGEKV_HVX_GQA
+    memcpy(octx.op_params, params, sizeof(params));
+    struct htp_context undersized_ctx = dense_ctx;
+    undersized_ctx.vtcm_size = N_THREADS * EDGEKV_HVX_GQA_ATTN_WORKSPACE_BYTES - 1;
+    octx.ctx = &undersized_ctx;
+    const int undersized_status = op_edgekv_attn_decode(&octx);
+    octx.ctx = &dense_ctx;
+    if (undersized_status != HTP_STATUS_VTCM_TOO_SMALL) {
+        printf("FAIL: undersized VTCM returned status %d, expected %d\n", undersized_status,
+               HTP_STATUS_VTCM_TOO_SMALL);
+        release_dense_context(&dense_ctx);
+        release_input_buffers();
+        return 8;
+    }
+    printf("PASS: VTCM guard required_bytes=%u available_bytes=%u status=%d\n",
+           N_THREADS * EDGEKV_HVX_GQA_ATTN_WORKSPACE_BYTES, undersized_ctx.vtcm_size,
+           undersized_status);
+#endif
 
     int result = 0;
     for (int layer = 0; layer < GROUP_SIZE; ++layer) {
@@ -513,7 +546,7 @@ int main(void) {
             goto cleanup;
         }
 
-        printf("PASS: layer=%d direct_error=%g dense_error=%g direct_aot_pcycles=%llu "
+        printf("PASS: layer=%d direct_error=%g dense_error=%g direct_kernel_pcycles=%llu "
                "direct_op_pcycles=%llu dense_op_pcycles=%llu\n",
                layer, (double) direct_max_error, (double) dense_max_error,
                (unsigned long long) edgekv_attn_decode_last_aot_pcycles(),
@@ -524,7 +557,7 @@ int main(void) {
     memcpy(octx.op_params, params, sizeof(params));
     materialize_dense_kv(0);
 
-    uint64_t direct_aot_samples[PERFORMANCE_SAMPLES];
+    uint64_t direct_kernel_samples[PERFORMANCE_SAMPLES];
     uint64_t direct_op_samples[PERFORMANCE_SAMPLES];
     uint64_t dense_op_samples[PERFORMANCE_SAMPLES];
     for (int sample = 0; sample < PERFORMANCE_SAMPLES; ++sample) {
@@ -532,7 +565,7 @@ int main(void) {
         const uint64_t direct_start = HAP_perf_get_pcycles();
         const int      direct_status = op_edgekv_attn_decode(&octx);
         direct_op_samples[sample] = HAP_perf_get_pcycles() - direct_start;
-        direct_aot_samples[sample] = edgekv_attn_decode_last_aot_pcycles();
+        direct_kernel_samples[sample] = edgekv_attn_decode_last_aot_pcycles();
         if (direct_status != HTP_STATUS_OK) {
             printf("FAIL: direct performance sample %d returned status %d\n", sample, direct_status);
             result = 6;
@@ -549,19 +582,19 @@ int main(void) {
         }
     }
 
-    const uint64_t direct_aot_median =
-        median3(direct_aot_samples[0], direct_aot_samples[1], direct_aot_samples[2]);
+    const uint64_t direct_kernel_median =
+        median3(direct_kernel_samples[0], direct_kernel_samples[1], direct_kernel_samples[2]);
     const uint64_t direct_op_median =
         median3(direct_op_samples[0], direct_op_samples[1], direct_op_samples[2]);
     const uint64_t dense_op_median = median3(dense_op_samples[0], dense_op_samples[1], dense_op_samples[2]);
     const double ratio = (double) direct_op_median / (double) dense_op_median;
     const char * decision = ratio <= 1.0 ? "GO" : (ratio <= 1.25 ? "OPTIMIZE" : "STOP");
 
-    printf("PERF: direct_aot raw=[%llu,%llu,%llu] median=%llu min=%llu max=%llu\n",
-           (unsigned long long) direct_aot_samples[0], (unsigned long long) direct_aot_samples[1],
-           (unsigned long long) direct_aot_samples[2], (unsigned long long) direct_aot_median,
-           (unsigned long long) min3(direct_aot_samples[0], direct_aot_samples[1], direct_aot_samples[2]),
-           (unsigned long long) max3(direct_aot_samples[0], direct_aot_samples[1], direct_aot_samples[2]));
+    printf("PERF: %s raw=[%llu,%llu,%llu] median=%llu min=%llu max=%llu\n", EDGEKV_DIRECT_KERNEL_NAME,
+           (unsigned long long) direct_kernel_samples[0], (unsigned long long) direct_kernel_samples[1],
+           (unsigned long long) direct_kernel_samples[2], (unsigned long long) direct_kernel_median,
+           (unsigned long long) min3(direct_kernel_samples[0], direct_kernel_samples[1], direct_kernel_samples[2]),
+           (unsigned long long) max3(direct_kernel_samples[0], direct_kernel_samples[1], direct_kernel_samples[2]));
     printf("PERF: direct_op raw=[%llu,%llu,%llu] median=%llu min=%llu max=%llu\n",
            (unsigned long long) direct_op_samples[0], (unsigned long long) direct_op_samples[1],
            (unsigned long long) direct_op_samples[2], (unsigned long long) direct_op_median,
@@ -572,7 +605,8 @@ int main(void) {
            (unsigned long long) dense_op_samples[2], (unsigned long long) dense_op_median,
            (unsigned long long) min3(dense_op_samples[0], dense_op_samples[1], dense_op_samples[2]),
            (unsigned long long) max3(dense_op_samples[0], dense_op_samples[1], dense_op_samples[2]), N_THREADS);
-    printf("PASS: EdgeKV C4B0 ratio=%.6f decision=%s dynamic_metadata_bytes=516\n", ratio, decision);
+    printf("PASS: EdgeKV %s ratio=%.6f decision=%s dynamic_metadata_bytes=516\n",
+           EDGEKV_TEST_MILESTONE, ratio, decision);
 
 cleanup:
     release_dense_context(&dense_ctx);

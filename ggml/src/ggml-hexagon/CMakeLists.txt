@@ -24,7 +24,7 @@ include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
 option(GGML_HEXAGON_FA_EXP2_HF "ggml-hexagon: use FP16 exp2 polynomial in FA softmax instead of F32 exp round-trip" OFF)
-option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "ggml-hexagon: build the v79 EdgeKV AOT adapter simulator tests" OFF)
+option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "ggml-hexagon: build the v79 EdgeKV simulator tests" OFF)
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml-hexagon: quantize group size (32, 64, or 128)")
 set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "ggml-hexagon: v79 EdgeKV reconstruct AOT object")
@@ -74,7 +74,7 @@ target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ht
 if (GGML_HEXAGON_EDGEKV_AOT_OBJECT)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_EDGEKV_RECONSTRUCT=1)
 endif()
-if (GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT)
+if (LLAMA_KV_BLOCKSVD OR GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_EDGEKV_DIRECT=1)
 endif()
 

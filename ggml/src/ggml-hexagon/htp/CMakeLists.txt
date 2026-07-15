@@ -47,6 +47,13 @@ add_library(${HTP_LIB} SHARED
     edgekv-attn-decode-ops.c
 )
 
+if (DSP_VERSION STREQUAL "v79")
+    target_sources(${HTP_LIB} PRIVATE
+        edgekv-hvx-gqa-attn.c
+        edgekv-hvx-gqa-block.c)
+    target_compile_definitions(${HTP_LIB} PRIVATE HTP_EDGEKV_HVX_GQA=1)
+endif()
+
 target_compile_definitions(${HTP_LIB} PRIVATE
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
@@ -84,6 +91,21 @@ if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
         hex-dma.c)
     set_source_files_properties(tests/test-edgekv-hvx-gqa-attn-mobile.c PROPERTIES
         COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+
+    set(EDGEKV_HVX_GQA_ATTN_OP_TEST_LIB test-edgekv-attn-decode-hvx-${DSP_VERSION})
+    add_library(${EDGEKV_HVX_GQA_ATTN_OP_TEST_LIB} SHARED
+        tests/test-edgekv-attn-decode.c
+        edgekv-attn-decode-ops.c
+        edgekv-hvx-gqa-attn.c
+        edgekv-hvx-gqa-block.c
+        flash-attn-ops.c
+        worker-pool.c
+        hex-dma.c)
+    set_source_files_properties(tests/test-edgekv-attn-decode.c PROPERTIES
+        COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+    target_compile_definitions(${EDGEKV_HVX_GQA_ATTN_OP_TEST_LIB} PRIVATE
+        HTP_EDGEKV_HVX_GQA=1
+        HTP_EDGEKV_PROFILE_KERNEL=1)
 endif()
 
 if (DSP_VERSION STREQUAL "v79" AND
@@ -133,7 +155,7 @@ if (DSP_VERSION STREQUAL "v79" AND
             hex-dma.c)
         # Fixture construction is outside every timed region; keep it out of Release LTO/vectorization.
         set_source_files_properties(tests/test-edgekv-attn-decode.c PROPERTIES
-            COMPILE_OPTIONS "-fno-lto;-O0;-fno-vectorize;-fno-slp-vectorize")
+            COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
         target_compile_definitions(${EDGEKV_DIRECT_TEST_LIB} PRIVATE
             HTP_EDGEKV_DIRECT_AOT=1
             HTP_EDGEKV_PROFILE_AOT=1)

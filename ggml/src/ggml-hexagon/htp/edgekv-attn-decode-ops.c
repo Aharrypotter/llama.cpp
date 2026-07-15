@@ -3,9 +3,14 @@
 #include "hex-utils.h"
 #include "htp-ctx.h"
 
+#ifdef HTP_EDGEKV_HVX_GQA
+#include "edgekv-hvx-gqa-attn.h"
+#endif
+
 #include "HAP_perf.h"
 
 #include <stdint.h>
+#include <string.h>
 
 struct edgekv_memref_f32_2_direct {
     float * allocated;
@@ -91,13 +96,14 @@ extern void edgekv_attn_decode_direct_int8_kernel(int64_t,
                                                   int);
 #endif
 
-#ifdef HTP_EDGEKV_PROFILE_AOT
-static uint64_t edgekv_last_aot_pcycles;
+#if defined(HTP_EDGEKV_PROFILE_AOT) || defined(HTP_EDGEKV_PROFILE_KERNEL)
+#define HTP_EDGEKV_PROFILE_KERNEL_ENABLED 1
+static uint64_t edgekv_last_kernel_pcycles;
 #endif
 
 uint64_t edgekv_attn_decode_last_aot_pcycles(void) {
-#ifdef HTP_EDGEKV_PROFILE_AOT
-    return edgekv_last_aot_pcycles;
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    return edgekv_last_kernel_pcycles;
 #else
     return 0;
 #endif
@@ -117,6 +123,96 @@ static bool edgekv_is_direct_mobile_v79_profile(const int32_t * p) {
            p[HTP_EDGEKV_ATTN_LAYER_INDEX] < expected[HTP_EDGEKV_ATTN_GROUP_SIZE];
 }
 
+#ifdef HTP_EDGEKV_HVX_GQA
+enum {
+    EDGEKV_HVX_GQA_ATTN_U_HALF_BYTES =
+        EDGEKV_HVX_GQA_ATTN_N_BLOCKS * EDGEKV_HVX_GQA_ATTN_U_BLOCK_BYTES,
+    EDGEKV_HVX_GQA_ATTN_VH_HALF_BYTES =
+        EDGEKV_HVX_GQA_ATTN_N_BLOCKS * EDGEKV_HVX_GQA_ATTN_VH_BLOCK_BYTES,
+};
+
+struct edgekv_hvx_gqa_attn_run {
+    struct edgekv_hvx_gqa_attn_inputs inputs;
+    uint8_t *                         workspace;
+    float *                           output;
+    float                             attention_scale;
+    int                               layer_index;
+};
+
+static void edgekv_hvx_gqa_attn_worker(unsigned int n, unsigned int i, void * data) {
+    struct edgekv_hvx_gqa_attn_run * run = (struct edgekv_hvx_gqa_attn_run *) data;
+    void * workspace = run->workspace + i * EDGEKV_HVX_GQA_ATTN_WORKSPACE_BYTES;
+    for (int hkv = (int) i; hkv < EDGEKV_HVX_GQA_ATTN_N_HEAD_KV; hkv += (int) n) {
+        edgekv_hvx_gqa_attn_hkv(&run->inputs, run->layer_index, hkv, run->attention_scale,
+                                workspace, run->output, NULL);
+    }
+}
+
+static int edgekv_attn_decode_hvx(struct htp_ops_context * octx) {
+    struct htp_context * ctx = octx->ctx;
+    if (!ctx || !ctx->worker_pool || !ctx->vtcm_base) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    uint32_t n_workers = octx->n_threads ? octx->n_threads : ctx->n_threads;
+    if (n_workers > EDGEKV_HVX_GQA_ATTN_MAX_WORKERS) {
+        n_workers = EDGEKV_HVX_GQA_ATTN_MAX_WORKERS;
+    }
+    if (n_workers == 0) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    const size_t workspace_bytes = n_workers * EDGEKV_HVX_GQA_ATTN_WORKSPACE_BYTES;
+    if (ctx->vtcm_size < workspace_bytes) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+
+    const int32_t * p = octx->op_params;
+    const int8_t * u_base = (const int8_t *) (uintptr_t) octx->src[1]->data;
+    const int8_t * vh_base = (const int8_t *) (uintptr_t) octx->src[2]->data;
+    const uint8_t * metadata_base = (const uint8_t *) (uintptr_t) octx->src[3]->data;
+    const int32_t * active_positions =
+        (const int32_t *) (metadata_base + p[HTP_EDGEKV_ATTN_METADATA_RECENT_POSITIONS_OFFSET_BYTES]);
+
+    struct edgekv_hvx_gqa_attn_run run = {
+        .inputs = {
+            .query            = (const float *) (uintptr_t) octx->src[0]->data,
+            .k_u              = u_base,
+            .k_vh             = vh_base,
+            .k_scale          = (const float *) metadata_base,
+            .v_u              = u_base + EDGEKV_HVX_GQA_ATTN_U_HALF_BYTES,
+            .v_vh             = vh_base + EDGEKV_HVX_GQA_ATTN_VH_HALF_BYTES,
+            .v_scale          = (const float *) (metadata_base + p[HTP_EDGEKV_ATTN_METADATA_V_SCALE_OFFSET_BYTES]),
+            .block_positions  = (const int32_t *)
+                (metadata_base + p[HTP_EDGEKV_ATTN_METADATA_BLOCK_POSITIONS_OFFSET_BYTES]),
+            .active_k         = (const _Float16 *) (uintptr_t) octx->src[4]->data,
+            .active_v         = (const _Float16 *) (uintptr_t) octx->src[5]->data,
+            .active_positions = active_positions,
+            .query_position   = active_positions[p[HTP_EDGEKV_ATTN_RECENT_SIZE]],
+        },
+        .workspace   = ctx->vtcm_base,
+        .output      = (float *) (uintptr_t) octx->dst->data,
+        .layer_index = p[HTP_EDGEKV_ATTN_LAYER_INDEX],
+    };
+    memcpy(&run.attention_scale, p + HTP_EDGEKV_ATTN_SCALE_BITS, sizeof(run.attention_scale));
+
+    octx->dst_spad.src             = NULL;
+    octx->dst_spad.data            = ctx->vtcm_base;
+    octx->dst_spad.size_per_thread = EDGEKV_HVX_GQA_ATTN_WORKSPACE_BYTES;
+    octx->dst_spad.size            = workspace_bytes;
+
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    const uint64_t start = HAP_perf_get_pcycles();
+#endif
+    const AEEResult result =
+        worker_pool_run_func(ctx->worker_pool, edgekv_hvx_gqa_attn_worker, &run, n_workers);
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    edgekv_last_kernel_pcycles = HAP_perf_get_pcycles() - start;
+#endif
+    return result == AEE_SUCCESS ? HTP_STATUS_OK : HTP_STATUS_INTERNAL_ERR;
+}
+#endif
+
 int op_edgekv_attn_decode(struct htp_ops_context * octx) {
     const struct htp_tensor * q_storage        = octx->src[0];
     const struct htp_tensor * u_storage        = octx->src[1];
@@ -127,8 +223,8 @@ int op_edgekv_attn_decode(struct htp_ops_context * octx) {
     const struct htp_tensor * dst              = octx->dst;
     const int32_t *           p                = octx->op_params;
 
-#ifdef HTP_EDGEKV_PROFILE_AOT
-    edgekv_last_aot_pcycles = 0;
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    edgekv_last_kernel_pcycles = 0;
 #endif
     if (!q_storage || !u_storage || !vh_storage || !metadata_storage || !active_k_storage ||
         !active_v_storage || !dst) {
@@ -159,6 +255,23 @@ int op_edgekv_attn_decode(struct htp_ops_context * octx) {
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;
     }
+
+#ifdef HTP_EDGEKV_HVX_GQA
+    const int hvx_status = edgekv_attn_decode_hvx(octx);
+    if (hvx_status == HTP_STATUS_OK) {
+        return hvx_status;
+    }
+#ifndef HTP_EDGEKV_DIRECT_AOT
+    return hvx_status;
+#else
+    if (hvx_status != HTP_STATUS_NO_SUPPORT && hvx_status != HTP_STATUS_VTCM_TOO_SMALL) {
+        return hvx_status;
+    }
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    edgekv_last_kernel_pcycles = 0;
+#endif
+#endif
+#endif
 
 #ifndef HTP_EDGEKV_DIRECT_AOT
     return HTP_STATUS_NO_SUPPORT;
@@ -270,7 +383,7 @@ int op_edgekv_attn_decode(struct htp_ops_context * octx) {
         .strides   = { 128, 1 },
     };
 
-#ifdef HTP_EDGEKV_PROFILE_AOT
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
     const uint64_t start = HAP_perf_get_pcycles();
 #endif
     // The generated symbol executes one Triton program per call; reproduce the mobile grid explicitly.
@@ -280,8 +393,8 @@ int op_edgekv_attn_decode(struct htp_ops_context * octx) {
             &active_k, 0, &active_v, 0, &active_positions, 0, &query_position, 0, &output,
             p[HTP_EDGEKV_ATTN_LAYER_INDEX], 4, 1, 1, program_id, 0, 0);
     }
-#ifdef HTP_EDGEKV_PROFILE_AOT
-    edgekv_last_aot_pcycles = HAP_perf_get_pcycles() - start;
+#ifdef HTP_EDGEKV_PROFILE_KERNEL_ENABLED
+    edgekv_last_kernel_pcycles = HAP_perf_get_pcycles() - start;
 #endif
 
     return HTP_STATUS_OK;
