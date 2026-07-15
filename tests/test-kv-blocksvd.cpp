@@ -311,10 +311,10 @@ static void test_int8_reconstruct_dispatch() {
         constexpr int32_t n_head_q = 4;
         ggml_tensor * q = ggml_new_tensor_3d(
             ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_k, n_head_q, 1);
-        ggml_tensor * active_k = ggml_new_tensor_4d(
-            ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_k, dispatch.n_head_kv, 1, 1);
-        ggml_tensor * active_v = ggml_new_tensor_4d(
-            ggml_ctx, GGML_TYPE_F32, dispatch.head_dim_v, dispatch.n_head_kv, 1, 1);
+        ggml_tensor * active_k =
+            ggml_new_tensor_4d(ggml_ctx, GGML_TYPE_F16, dispatch.head_dim_k, dispatch.n_head_kv, 1, 1);
+        ggml_tensor * active_v =
+            ggml_new_tensor_4d(ggml_ctx, GGML_TYPE_F16, dispatch.head_dim_v, dispatch.n_head_kv, 1, 1);
         ggml_tensor * archive_k = ggml_view_4d(
             ggml_ctx, t_dense, dispatch.head_dim_k, dispatch.block_size,
             dispatch.n_blocks, dispatch.n_head_kv,
@@ -335,10 +335,10 @@ static void test_int8_reconstruct_dispatch() {
             ((float *) q->data)[i] = consumer_distribution(consumer_generator);
         }
         for (int64_t i = 0; i < ggml_nelements(active_k); ++i) {
-            ((float *) active_k->data)[i] = consumer_distribution(consumer_generator);
+            ((ggml_fp16_t *) active_k->data)[i] = ggml_fp32_to_fp16(consumer_distribution(consumer_generator));
         }
         for (int64_t i = 0; i < ggml_nelements(active_v); ++i) {
-            ((float *) active_v->data)[i] = consumer_distribution(consumer_generator);
+            ((ggml_fp16_t *) active_v->data)[i] = ggml_fp32_to_fp16(consumer_distribution(consumer_generator));
         }
 
         llama_kv_blocksvd_staging_t staging;
@@ -450,7 +450,46 @@ static void test_int8_reconstruct_dispatch() {
             assert(std::isfinite(parallel));
             assert(std::fabs(serial - parallel) < 1e-6f);
         }
+
         ctx->xkv_chunks.resize(original_chunk_count);
+        llama_kv_blocksvd_int8_reconstruct_dispatch pooled_dispatch;
+        ok = llama_kv_blocksvd_pack_int8_reconstruct_pool(*ctx, 1, 0, 0, 16, pooled_dispatch, &err);
+        assert(ok);
+        ggml_tensor * pooled_u  = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, pooled_dispatch.u_q.size());
+        ggml_tensor * pooled_vh = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, pooled_dispatch.vh_q.size());
+        std::memcpy(pooled_u->data, pooled_dispatch.u_q.data(), pooled_dispatch.u_q.size());
+        std::memcpy(pooled_vh->data, pooled_dispatch.vh_q.data(), pooled_dispatch.vh_q.size());
+
+        llama_kv_blocksvd_int8_direct_metadata_layout direct_layout;
+        ok = llama_kv_blocksvd_make_int8_direct_metadata_layout(pooled_dispatch, 1, direct_layout, &err);
+        assert(ok);
+        std::vector<int8_t> direct_metadata;
+        ok = llama_kv_blocksvd_pack_int8_direct_metadata(pooled_dispatch, direct_layout, std::vector<llama_pos>{ 40 },
+                                                         40, direct_metadata, &err);
+        assert(ok);
+        ggml_tensor * metadata_tensor = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, direct_metadata.size());
+        std::memcpy(metadata_tensor->data, direct_metadata.data(), direct_metadata.size());
+
+        ggml_edgekv_attn_decode_params packed_params;
+        ok = llama_kv_blocksvd_make_int8_direct_params(pooled_dispatch, 1, n_head_q, 1, direct_params.scale,
+                                                       packed_params, &err);
+        assert(ok);
+        ggml_tensor * packed_direct_out   = ggml_edgekv_attn_decode(ggml_ctx, q, pooled_u, pooled_vh, metadata_tensor,
+                                                                    active_k, active_v, &packed_params);
+        ggml_cgraph * packed_direct_graph = ggml_new_graph(ggml_ctx);
+        ggml_build_forward_expand(packed_direct_graph, packed_direct_out);
+        ggml_cplan           packed_direct_plan = ggml_graph_plan(packed_direct_graph, 4, nullptr);
+        std::vector<uint8_t> packed_direct_work(packed_direct_plan.work_size);
+        packed_direct_plan.work_data = packed_direct_work.empty() ? nullptr : packed_direct_work.data();
+        assert(ggml_graph_compute(packed_direct_graph, &packed_direct_plan) == GGML_STATUS_SUCCESS);
+
+        float packed_max_error = 0.0f;
+        for (int64_t i = 0; i < ggml_nelements(packed_direct_out); ++i) {
+            const float portable = ((const float *) direct_serial_out->data)[i];
+            const float packed   = ((const float *) packed_direct_out->data)[i];
+            packed_max_error     = std::max(packed_max_error, std::fabs(portable - packed));
+        }
+        assert(packed_max_error < 1e-5f);
     }
 
     ggml_free(ggml_ctx);
@@ -681,6 +720,225 @@ static void test_int8_reconstruct_pool() {
     ggml_free(ggml_ctx);
     llama_kv_blocksvd_free(ctx);
     std::printf("test-kv-blocksvd: INT8 reconstruct fixed-capacity pool OK\n");
+}
+
+static void test_int8_direct_backend_pool() {
+    std::string err;
+    auto *      ctx = make_int8_dispatch_context(err);
+    assert(ctx != nullptr);
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    assert(backend != nullptr);
+    ggml_backend_t       backends[] = { backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    assert(sched != nullptr);
+
+    constexpr int32_t                   n_head_q    = 4;
+    constexpr int32_t                   recent_size = 3;
+    const float                         scale       = 1.0f / std::sqrt(32.0f);
+    llama_kv_blocksvd_int8_backend_view view;
+    bool ok = llama_kv_blocksvd_acquire_int8_direct_backend_pool(*ctx, 1, 0, 0, 4, n_head_q, recent_size, scale, sched,
+                                                                 backend, view, &err);
+    assert(ok);
+    assert(view.backend == backend);
+    assert(view.storage != nullptr);
+    assert(view.metadata != nullptr);
+    assert(view.direct_metadata.recent_size == recent_size);
+    assert(view.direct_metadata.v_scale_offset_bytes == 128);
+    assert(view.direct_metadata.block_positions_offset_bytes == 256);
+    assert(view.direct_metadata.recent_positions_offset_bytes == 512);
+    assert(view.direct_metadata.total_bytes == 640);
+
+    ggml_edgekv_attn_decode_params direct_params;
+    ok = llama_kv_blocksvd_make_int8_direct_params(*view.storage, 1, n_head_q, recent_size, scale, direct_params, &err);
+    assert(ok);
+    assert(direct_params.n_blocks == 4);
+    assert(direct_params.layer_index == 1);
+    assert(direct_params.metadata_total_bytes == view.direct_metadata.total_bytes);
+
+    const std::vector<llama_pos> recent_positions = { 31, -1, 33 };
+    ok = llama_kv_blocksvd_update_int8_direct_metadata(view, recent_positions, 33, &err);
+    assert(ok);
+
+    std::vector<int8_t> expected;
+    ok = llama_kv_blocksvd_pack_int8_direct_metadata(*view.storage, view.direct_metadata, recent_positions, 33,
+                                                     expected, &err);
+    assert(ok);
+    std::vector<int8_t> actual(expected.size());
+    ggml_backend_tensor_get(view.metadata, actual.data(), 0, actual.size());
+    assert(actual == expected);
+
+    const size_t dynamic_bytes =
+        expected.size() - static_cast<size_t>(view.direct_metadata.recent_positions_offset_bytes);
+    assert(dynamic_bytes == 128);
+    assert((recent_positions.size() + 1) * sizeof(int32_t) == 16);
+
+    view = {};
+    llama_kv_blocksvd_free(ctx);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+    std::printf("test-kv-blocksvd: INT8 direct backend pool and metadata OK\n");
+}
+
+static void test_mobile_direct_parity() {
+    constexpr int32_t n_blocks_pool = 16;
+    constexpr int32_t block_size    = 64;
+    constexpr int32_t rank          = 32;
+    constexpr int32_t group_size    = 4;
+    constexpr int32_t n_head_q      = 16;
+    constexpr int32_t n_head_kv     = 8;
+    constexpr int32_t head_dim      = 128;
+    constexpr int32_t recent_size   = 128;
+    constexpr int32_t layer         = 2;
+    constexpr int32_t combined_dim  = group_size * n_head_kv * head_dim;
+
+    llama_kv_blocksvd_params init_params{};
+    init_params.block_size       = block_size;
+    init_params.rank             = rank;
+    init_params.rank_v           = rank;
+    init_params.quant_bits       = 8;
+    init_params.cross_layer      = true;
+    init_params.layer_group_size = group_size;
+    auto * bctx                  = llama_kv_blocksvd_init(init_params);
+    assert(bctx != nullptr);
+
+    llama_kv_blocksvd_xkv_chunk chunk;
+    chunk.layer_start = 0;
+    chunk.group_size  = group_size;
+    chunk.stream      = 0;
+    chunk.seq_id      = 0;
+    chunk.n_head_kv   = n_head_kv;
+    chunk.head_dim_k  = head_dim;
+    chunk.head_dim_v  = head_dim;
+    chunk.slots.resize(block_size);
+    chunk.pos.resize(block_size);
+    for (int32_t token = 0; token < block_size; ++token) {
+        chunk.slots[token] = static_cast<uint32_t>(token);
+        chunk.pos[token]   = token;
+    }
+
+    const auto initialize_factors = [](llama_kv_blocksvd_xkv_factors & factors, int seed) {
+        factors.rank       = rank;
+        factors.quant_bits = 8;
+        factors.u_scale    = 0.0078125f;
+        factors.s_scale    = 0.03125f;
+        factors.vh_scale   = 0.0078125f;
+        factors.u_q.resize(static_cast<size_t>(block_size) * rank);
+        factors.s_q.resize(rank);
+        factors.vh_q.resize(static_cast<size_t>(rank) * combined_dim);
+        for (size_t index = 0; index < factors.u_q.size(); ++index) {
+            factors.u_q[index] = static_cast<int8_t>((index * (seed + 3) + seed) % 31 - 15);
+        }
+        for (size_t index = 0; index < factors.s_q.size(); ++index) {
+            factors.s_q[index] = static_cast<int8_t>((index * (seed + 5) + 7) % 23 - 11);
+        }
+        for (size_t index = 0; index < factors.vh_q.size(); ++index) {
+            factors.vh_q[index] = static_cast<int8_t>((index * (seed + 7) + 3) % 29 - 14);
+        }
+    };
+    initialize_factors(chunk.k_factors, 1);
+    initialize_factors(chunk.v_factors, 2);
+    bctx->xkv_chunks.push_back(std::move(chunk));
+    bctx->xkv_generation = 1;
+
+    llama_kv_blocksvd_int8_reconstruct_dispatch dispatch;
+    std::string                                 err;
+    bool ok = llama_kv_blocksvd_pack_int8_reconstruct_pool(*bctx, layer, 0, 0, n_blocks_pool, dispatch, &err);
+    assert(ok);
+
+    ggml_init_params ggml_params = {
+        /* .mem_size   = */ 16 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ggml_ctx = ggml_init(ggml_params);
+    assert(ggml_ctx != nullptr);
+    ggml_tensor * q        = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F32, head_dim, n_head_q, 1);
+    ggml_tensor * active_k = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F16, head_dim, n_head_kv, recent_size);
+    ggml_tensor * active_v = ggml_new_tensor_3d(ggml_ctx, GGML_TYPE_F16, head_dim, n_head_kv, recent_size);
+    for (int64_t index = 0; index < ggml_nelements(q); ++index) {
+        ((float *) q->data)[index] = static_cast<float>((index * 5 + 3) % 37 - 18) * 0.00390625f;
+    }
+    for (int64_t index = 0; index < ggml_nelements(active_k); ++index) {
+        ((ggml_fp16_t *) active_k->data)[index] =
+            ggml_fp32_to_fp16(static_cast<float>((index * 3 + 1) % 31 - 15) * 0.0078125f);
+        ((ggml_fp16_t *) active_v->data)[index] =
+            ggml_fp32_to_fp16(static_cast<float>((index * 7 + 2) % 29 - 14) * 0.0078125f);
+    }
+
+    llama_kv_blocksvd_staging_t staging;
+    staging.capacity                    = recent_size;
+    staging.cell_to_slot                = { std::vector<int32_t>(block_size + 1, -1) };
+    staging.slot_to_cell                = { std::vector<int32_t>(recent_size, -1) };
+    staging.cell_to_slot[0][block_size] = 0;
+    staging.slot_to_cell[0][0]          = block_size;
+
+    llama_chunked_attn_params portable_params;
+    portable_params.bctx       = bctx;
+    portable_params.staging    = &staging;
+    portable_params.il         = layer;
+    portable_params.n_kv       = block_size + 1;
+    portable_params.n_head_kv  = n_head_kv;
+    portable_params.n_head_q   = n_head_q;
+    portable_params.head_dim_k = head_dim;
+    portable_params.head_dim_v = head_dim;
+    portable_params.scale      = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    portable_params.n_stream   = 1;
+    portable_params.cache_size = recent_size;
+    portable_params.q_pos      = { block_size };
+    portable_params.slot_pos.assign(recent_size, -1);
+    portable_params.slot_pos[0]        = block_size;
+    portable_params.use_lowrank_direct = true;
+    llama_chunked_attn_build_refs(&portable_params);
+
+    ggml_tensor * portable_out =
+        ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, static_cast<int64_t>(head_dim) * n_head_q, 1);
+    portable_out->src[0] = q;
+    portable_out->src[1] = active_k;
+    portable_out->src[2] = active_v;
+    llama_kv_lowrank_direct_attn_compute(portable_out, 0, 1, &portable_params);
+
+    ggml_tensor * packed_u  = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.u_q.size());
+    ggml_tensor * packed_vh = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.vh_q.size());
+    std::memcpy(packed_u->data, dispatch.u_q.data(), dispatch.u_q.size());
+    std::memcpy(packed_vh->data, dispatch.vh_q.data(), dispatch.vh_q.size());
+    llama_kv_blocksvd_int8_direct_metadata_layout layout;
+    ok = llama_kv_blocksvd_make_int8_direct_metadata_layout(dispatch, recent_size, layout, &err);
+    assert(ok);
+    assert(layout.v_scale_offset_bytes == 2048);
+    assert(layout.block_positions_offset_bytes == 4096);
+    assert(layout.recent_positions_offset_bytes == 8192);
+    assert(layout.total_bytes == 8832);
+    std::vector<llama_pos> recent_positions(recent_size, -1);
+    recent_positions[0] = block_size;
+    std::vector<int8_t> metadata;
+    ok = llama_kv_blocksvd_pack_int8_direct_metadata(dispatch, layout, recent_positions, block_size, metadata, &err);
+    assert(ok);
+    ggml_tensor * packed_metadata = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, metadata.size());
+    std::memcpy(packed_metadata->data, metadata.data(), metadata.size());
+    ggml_edgekv_attn_decode_params direct_params;
+    ok = llama_kv_blocksvd_make_int8_direct_params(dispatch, layer, n_head_q, recent_size, portable_params.scale,
+                                                   direct_params, &err);
+    assert(ok);
+    ggml_tensor * direct_out =
+        ggml_edgekv_attn_decode(ggml_ctx, q, packed_u, packed_vh, packed_metadata, active_k, active_v, &direct_params);
+    ggml_cgraph * graph = ggml_new_graph(ggml_ctx);
+    ggml_build_forward_expand(graph, direct_out);
+    ggml_cplan           plan = ggml_graph_plan(graph, 4, nullptr);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.empty() ? nullptr : work.data();
+    assert(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
+
+    float max_error = 0.0f;
+    for (int64_t index = 0; index < ggml_nelements(direct_out); ++index) {
+        max_error = std::max(max_error, std::fabs(((const float *) portable_out->data)[index] -
+                                                  ((const float *) direct_out->data)[index]));
+    }
+    assert(max_error < 1e-5f);
+    std::printf("test-kv-blocksvd: mobile direct parity max_error=%g OK\n", (double) max_error);
+
+    ggml_free(ggml_ctx);
+    llama_kv_blocksvd_free(bctx);
 }
 
 static bool export_int8_dispatch_golden(const std::filesystem::path & output_dir) {
@@ -1158,6 +1416,8 @@ int main(int argc, char ** argv) {
     }
     test_int8_reconstruct_dispatch();
     test_int8_reconstruct_pool();
+    test_int8_direct_backend_pool();
+    test_mobile_direct_parity();
     if (dispatch_export_dir && !export_int8_dispatch_golden(dispatch_export_dir)) {
         llama_kv_blocksvd_free(ctx);
         return 1;

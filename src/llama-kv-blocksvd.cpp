@@ -1220,6 +1220,14 @@ void llama_kv_blocksvd_reset_decode_cache(llama_kv_blocksvd_context * ctx) {
 
 // --- Chunked Attention Compute ---
 
+static float llama_blocksvd_load_active(const ggml_tensor * tensor, const char * row, int32_t index) {
+    GGML_ASSERT(tensor && (tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32));
+    if (tensor->type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(row)[index]);
+    }
+    return reinterpret_cast<const float *>(row)[index];
+}
+
 void llama_chunked_attn_compute(
         struct ggml_tensor * dst,
         int ith, int nth, void * userdata) {
@@ -1242,6 +1250,8 @@ void llama_chunked_attn_compute(
     const uint32_t cache_size = p->cache_size;
 
     GGML_ASSERT(n_stream == 1 && "chunked_attn: multi-stream not supported in this milestone");
+    GGML_ASSERT(b && (b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F32));
+    GGML_ASSERT(c && (c->type == GGML_TYPE_F16 || c->type == GGML_TYPE_F32));
     if (p->edgekv_reconstructed) {
         GGML_ASSERT(d && d->type == GGML_TYPE_F16);
         GGML_ASSERT(e && e->type == GGML_TYPE_F16);
@@ -1318,17 +1328,15 @@ void llama_chunked_attn_compute(
                             continue;
                         }
 
-                        const float * k_vec = (const float *)((const char *)b->data +
-                            s * b->nb[3] + slot * b->nb[2] + hkv * b->nb[1]);
+                        const char * k_vec = (const char *) b->data + s * b->nb[3] + slot * b->nb[2] + hkv * b->nb[1];
 
                         float dot = 0.0f;
                         for (int32_t d = 0; d < head_dim_k; ++d) {
-                            dot += q_vec[d] * k_vec[d];
+                            dot += q_vec[d] * llama_blocksvd_load_active(b, k_vec, d);
                         }
                         dot *= scale;
 
-                        const float * v_vec = (const float *)((const char *)c->data +
-                            s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1]);
+                        const char * v_vec = (const char *) c->data + s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1];
 
                         float M_new = std::max(M_acc, dot);
                         float exp_old = expf(M_acc - M_new);
@@ -1336,7 +1344,7 @@ void llama_chunked_attn_compute(
                         float S_new = S_acc * exp_old + exp_new;
 
                         for (int32_t d = 0; d < head_dim_v; ++d) {
-                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_vec[d] * exp_new;
+                            VKQ_acc[d] = VKQ_acc[d] * exp_old + llama_blocksvd_load_active(c, v_vec, d) * exp_new;
                         }
                         M_acc = M_new;
                         S_acc = S_new;
@@ -1597,6 +1605,8 @@ void llama_kv_lowrank_direct_attn_compute(
     const uint32_t cache_size = p->cache_size;
 
     GGML_ASSERT(n_stream == 1 && "kv_lowrank_direct: multi-stream not supported in this milestone");
+    GGML_ASSERT(b && (b->type == GGML_TYPE_F16 || b->type == GGML_TYPE_F32));
+    GGML_ASSERT(c && (c->type == GGML_TYPE_F16 || c->type == GGML_TYPE_F32));
 
     const int32_t n_tokens = (int32_t) a->ne[2];
 
@@ -1662,17 +1672,15 @@ void llama_kv_lowrank_direct_attn_compute(
                             continue;
                         }
 
-                        const float * k_vec = (const float *)((const char *) b->data +
-                            s * b->nb[3] + slot * b->nb[2] + hkv * b->nb[1]);
+                        const char * k_vec = (const char *) b->data + s * b->nb[3] + slot * b->nb[2] + hkv * b->nb[1];
 
                         float dot = 0.0f;
                         for (int32_t d = 0; d < head_dim_k; ++d) {
-                            dot += q_vec[d] * k_vec[d];
+                            dot += q_vec[d] * llama_blocksvd_load_active(b, k_vec, d);
                         }
                         dot *= scale;
 
-                        const float * v_vec = (const float *)((const char *) c->data +
-                            s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1]);
+                        const char * v_vec = (const char *) c->data + s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1];
 
                         float M_new = std::max(M_acc, dot);
                         float exp_old = expf(M_acc - M_new);
@@ -1680,7 +1688,7 @@ void llama_kv_lowrank_direct_attn_compute(
                         float S_new = S_acc * exp_old + exp_new;
 
                         for (int32_t d = 0; d < head_dim_v; ++d) {
-                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_vec[d] * exp_new;
+                            VKQ_acc[d] = VKQ_acc[d] * exp_old + llama_blocksvd_load_active(c, v_vec, d) * exp_new;
                         }
                         M_acc = M_new;
                         S_acc = S_new;

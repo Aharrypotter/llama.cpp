@@ -152,11 +152,12 @@ llama_kv_cache::llama_kv_cache(
 #endif
 
 #ifdef LLAMA_KV_BLOCKSVD
-    // Chunked attention reads K/V tensors as float* directly, so force F32.
-    // Also disable V transposition since the compute function assumes non-transposed layout.
+    // Keep the active staging window in the direct-consumer FP16 ABI. The
+    // chunked/direct CPU fallbacks decode either F16 or F32, and disabling V
+    // transposition preserves the token-major [D,H,slot] layout.
     if (bctx_params.memory_reduction && bctx_params.backend) {
-        type_k = GGML_TYPE_F32;
-        type_v = GGML_TYPE_F32;
+        type_k        = GGML_TYPE_F16;
+        type_v        = GGML_TYPE_F16;
         this->v_trans = false;
     }
 #endif

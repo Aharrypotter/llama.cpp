@@ -1,12 +1,12 @@
 #include "llama-kv-blocksvd-execution.h"
 
-#include "llama-impl.h"
-
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "llama-impl.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -381,6 +381,207 @@ bool llama_kv_blocksvd_pack_int8_reconstruct_pool(const llama_kv_blocksvd_contex
         ctx, layer, stream, seq_id, block_capacity, out, err);
 }
 
+bool llama_kv_blocksvd_make_int8_direct_metadata_layout(const llama_kv_blocksvd_int8_reconstruct_dispatch & dispatch,
+                                                        int32_t                                             recent_size,
+                                                        llama_kv_blocksvd_int8_direct_metadata_layout &     out,
+                                                        std::string *                                       err) {
+    auto fail = [err](std::string message) {
+        if (err) {
+            *err = std::move(message);
+        }
+        return false;
+    };
+    if (dispatch.n_blocks <= 0 || dispatch.block_size <= 0 || dispatch.rank_k <= 0 || dispatch.rank_v <= 0 ||
+        recent_size <= 0) {
+        return fail("direct-attention metadata dimensions must be positive");
+    }
+
+    const auto checked_mul = [&fail](size_t lhs, size_t rhs, size_t & result) {
+        if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+            return fail("direct-attention metadata size overflows size_t");
+        }
+        result = lhs * rhs;
+        return true;
+    };
+    const auto checked_add = [&fail](size_t lhs, size_t rhs, size_t & result) {
+        if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+            return fail("direct-attention metadata size overflows size_t");
+        }
+        result = lhs + rhs;
+        return true;
+    };
+    const auto align_bytes = [&fail](size_t bytes, size_t & result) {
+        constexpr size_t alignment = llama_kv_blocksvd_int8_reconstruct_dispatch::buffer_alignment;
+        if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+            return fail("direct-attention metadata alignment overflows size_t");
+        }
+        result = ((bytes + alignment - 1) / alignment) * alignment;
+        if (result > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+            return fail("direct-attention metadata exceeds signed HTP op-param range");
+        }
+        return true;
+    };
+
+    size_t k_scale_count  = 0;
+    size_t v_scale_count  = 0;
+    size_t position_count = 0;
+    if (!checked_mul(static_cast<size_t>(dispatch.n_blocks), static_cast<size_t>(dispatch.rank_k), k_scale_count) ||
+        !checked_mul(static_cast<size_t>(dispatch.n_blocks), static_cast<size_t>(dispatch.rank_v), v_scale_count) ||
+        !checked_mul(static_cast<size_t>(dispatch.n_blocks), static_cast<size_t>(dispatch.block_size),
+                     position_count)) {
+        return false;
+    }
+
+    size_t k_scale_bytes  = 0;
+    size_t v_scale_bytes  = 0;
+    size_t position_bytes = 0;
+    size_t recent_bytes   = 0;
+    if (!checked_mul(k_scale_count, sizeof(float), k_scale_bytes) ||
+        !checked_mul(v_scale_count, sizeof(float), v_scale_bytes) ||
+        !checked_mul(position_count, sizeof(int32_t), position_bytes) ||
+        !checked_mul(static_cast<size_t>(recent_size) + 1, sizeof(int32_t), recent_bytes)) {
+        return false;
+    }
+
+    size_t v_scale_offset          = 0;
+    size_t block_positions_offset  = 0;
+    size_t recent_positions_offset = 0;
+    size_t total_bytes             = 0;
+    size_t section_end             = 0;
+    if (!align_bytes(k_scale_bytes, v_scale_offset) || !checked_add(v_scale_offset, v_scale_bytes, section_end) ||
+        !align_bytes(section_end, block_positions_offset) ||
+        !checked_add(block_positions_offset, position_bytes, section_end) ||
+        !align_bytes(section_end, recent_positions_offset) ||
+        !checked_add(recent_positions_offset, recent_bytes, section_end) || !align_bytes(section_end, total_bytes)) {
+        return false;
+    }
+
+    if (dispatch.v_rank_scale_offset_bytes < 0) {
+        return fail("direct-attention V scale offset must be non-negative");
+    }
+    const size_t v_scale_source_offset = static_cast<size_t>(dispatch.v_rank_scale_offset_bytes);
+    if (k_scale_bytes > dispatch.rank_scale.size() * sizeof(float) ||
+        v_scale_source_offset > dispatch.rank_scale.size() * sizeof(float) ||
+        v_scale_bytes > dispatch.rank_scale.size() * sizeof(float) - v_scale_source_offset ||
+        position_bytes > dispatch.block_positions.size() * sizeof(int32_t)) {
+        return fail("direct-attention metadata sources are smaller than their packed layout");
+    }
+
+    out = {
+        recent_size,
+        static_cast<int32_t>(v_scale_offset),
+        static_cast<int32_t>(block_positions_offset),
+        static_cast<int32_t>(recent_positions_offset),
+        static_cast<int32_t>(total_bytes),
+    };
+    return true;
+}
+
+bool llama_kv_blocksvd_pack_int8_direct_metadata(const llama_kv_blocksvd_int8_reconstruct_dispatch &   dispatch,
+                                                 const llama_kv_blocksvd_int8_direct_metadata_layout & layout,
+                                                 const std::vector<llama_pos> &                        recent_positions,
+                                                 llama_pos                                             query_position,
+                                                 std::vector<int8_t> &                                 out,
+                                                 std::string *                                         err) {
+    auto fail = [err](std::string message) {
+        if (err) {
+            *err = std::move(message);
+        }
+        return false;
+    };
+
+    llama_kv_blocksvd_int8_direct_metadata_layout expected;
+    if (!llama_kv_blocksvd_make_int8_direct_metadata_layout(dispatch, layout.recent_size, expected, err)) {
+        return false;
+    }
+    if (layout.v_scale_offset_bytes != expected.v_scale_offset_bytes ||
+        layout.block_positions_offset_bytes != expected.block_positions_offset_bytes ||
+        layout.recent_positions_offset_bytes != expected.recent_positions_offset_bytes ||
+        layout.total_bytes != expected.total_bytes) {
+        return fail("direct-attention metadata layout does not match the factor pool");
+    }
+    if (recent_positions.size() != static_cast<size_t>(layout.recent_size)) {
+        return fail("direct-attention recent positions do not match recent_size");
+    }
+
+    std::vector<int32_t> recent_i32(recent_positions.size() + 1, -1);
+    for (size_t index = 0; index < recent_positions.size(); ++index) {
+        const llama_pos position = recent_positions[index];
+        if (position < -1 || position > std::numeric_limits<int32_t>::max()) {
+            return fail("direct-attention recent position is outside int32_t range");
+        }
+        recent_i32[index] = static_cast<int32_t>(position);
+    }
+    if (query_position < -1 || query_position > std::numeric_limits<int32_t>::max()) {
+        return fail("direct-attention query position is outside int32_t range");
+    }
+    recent_i32.back() = static_cast<int32_t>(query_position);
+
+    const size_t k_scale_bytes         = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_k * sizeof(float);
+    const size_t v_scale_bytes         = static_cast<size_t>(dispatch.n_blocks) * dispatch.rank_v * sizeof(float);
+    const size_t position_bytes        = static_cast<size_t>(dispatch.n_blocks) * dispatch.block_size * sizeof(int32_t);
+    const size_t v_scale_source_offset = static_cast<size_t>(dispatch.v_rank_scale_offset_bytes);
+
+    std::vector<int8_t> next(static_cast<size_t>(layout.total_bytes), 0);
+    std::memcpy(next.data(), dispatch.rank_scale.data(), k_scale_bytes);
+    std::memcpy(next.data() + layout.v_scale_offset_bytes,
+                reinterpret_cast<const int8_t *>(dispatch.rank_scale.data()) + v_scale_source_offset, v_scale_bytes);
+    std::memcpy(next.data() + layout.block_positions_offset_bytes, dispatch.block_positions.data(), position_bytes);
+    std::memcpy(next.data() + layout.recent_positions_offset_bytes, recent_i32.data(),
+                recent_i32.size() * sizeof(int32_t));
+    out = std::move(next);
+    return true;
+}
+
+bool llama_kv_blocksvd_make_int8_direct_params(const llama_kv_blocksvd_int8_reconstruct_dispatch & dispatch,
+                                               int32_t                                             layer,
+                                               int32_t                                             n_head_q,
+                                               int32_t                                             recent_size,
+                                               float                                               scale,
+                                               ggml_edgekv_attn_decode_params &                    out,
+                                               std::string *                                       err) {
+    auto fail = [err](std::string message) {
+        if (err) {
+            *err = std::move(message);
+        }
+        return false;
+    };
+    const int32_t layer_index = layer - dispatch.layer_start;
+    if (layer_index < 0 || layer_index >= dispatch.group_size) {
+        return fail("direct-attention layer is outside the factor group");
+    }
+    if (dispatch.n_head_kv <= 0 || n_head_q <= 0 || n_head_q % dispatch.n_head_kv != 0) {
+        return fail("direct-attention query heads must be a positive multiple of KV heads");
+    }
+    if (!std::isfinite(scale) || scale <= 0.0f) {
+        return fail("direct-attention scale must be finite and positive");
+    }
+
+    llama_kv_blocksvd_int8_direct_metadata_layout layout;
+    if (!llama_kv_blocksvd_make_int8_direct_metadata_layout(dispatch, recent_size, layout, err)) {
+        return false;
+    }
+    out = {
+        dispatch.n_blocks,
+        dispatch.block_size,
+        dispatch.rank_k,
+        dispatch.rank_v,
+        dispatch.group_size,
+        layer_index,
+        n_head_q,
+        dispatch.n_head_kv,
+        dispatch.head_dim_k,
+        dispatch.head_dim_v,
+        recent_size,
+        layout.v_scale_offset_bytes,
+        layout.block_positions_offset_bytes,
+        layout.recent_positions_offset_bytes,
+        layout.total_bytes,
+        scale,
+    };
+    return true;
+}
+
 namespace {
 
 struct blocksvd_execution_pool_key {
@@ -409,6 +610,7 @@ struct blocksvd_backend_pool_key {
     const llama_kv_blocksvd_int8_host_pool * host;
     ggml_backend_t                            backend;
     ggml_backend_buffer_type_t                buft;
+    int32_t                                   direct_recent_size;
 
     bool operator<(const blocksvd_backend_pool_key & other) const {
         const auto less_pointer = [](const void * lhs, const void * rhs) {
@@ -420,7 +622,10 @@ struct blocksvd_backend_pool_key {
         if (backend != other.backend) {
             return less_pointer(backend, other.backend);
         }
-        return less_pointer(buft, other.buft);
+        if (buft != other.buft) {
+            return less_pointer(buft, other.buft);
+        }
+        return direct_recent_size < other.direct_recent_size;
     }
 };
 
@@ -597,6 +802,10 @@ struct llama_kv_blocksvd_int8_backend_pool {
     ggml_tensor * vh_q            = nullptr;
     ggml_tensor * rank_scale      = nullptr;
     ggml_tensor * block_positions = nullptr;
+    ggml_tensor * metadata        = nullptr;
+
+    llama_kv_blocksvd_int8_direct_metadata_layout direct_metadata;
+    std::vector<int32_t>                          direct_dynamic_metadata;
 
     uint64_t host_epoch     = 0;
     int32_t  uploaded_valid = 0;
@@ -617,8 +826,10 @@ static void blocksvd_set_backend_view(
     view.vh_q            = pool->vh_q;
     view.rank_scale      = pool->rank_scale;
     view.block_positions = pool->block_positions;
+    view.metadata        = pool->metadata;
     view.storage         = &pool->host->dispatch;
     view.backend         = pool->backend;
+    view.direct_metadata = pool->direct_metadata;
 }
 
 static bool blocksvd_upload_full_backend_pool(llama_kv_blocksvd_int8_backend_pool & pool) {
@@ -634,16 +845,27 @@ static bool blocksvd_upload_full_backend_pool(llama_kv_blocksvd_int8_backend_poo
     ggml_backend_tensor_set(pool.rank_scale, dispatch.rank_scale.data(), 0, ggml_nbytes(pool.rank_scale));
     ggml_backend_tensor_set(
         pool.block_positions, dispatch.block_positions.data(), 0, ggml_nbytes(pool.block_positions));
+    if (pool.metadata) {
+        std::vector<llama_pos> initial_positions(static_cast<size_t>(pool.direct_metadata.recent_size), -1);
+        std::vector<int8_t>    packed_metadata;
+        if (!llama_kv_blocksvd_pack_int8_direct_metadata(dispatch, pool.direct_metadata, initial_positions, -1,
+                                                         packed_metadata) ||
+            packed_metadata.size() != ggml_nbytes(pool.metadata)) {
+            return false;
+        }
+        ggml_backend_tensor_set(pool.metadata, packed_metadata.data(), 0, packed_metadata.size());
+    }
     pool.host_epoch     = pool.host->epoch;
     pool.uploaded_valid = dispatch.valid_blocks;
     return true;
 }
 
 static std::shared_ptr<llama_kv_blocksvd_int8_backend_pool> blocksvd_create_backend_pool(
-        const std::shared_ptr<llama_kv_blocksvd_int8_host_pool> & host,
-        ggml_backend_t                                            backend,
-        ggml_backend_buffer_type_t                                buft,
-        std::string *                                             err) {
+    const std::shared_ptr<llama_kv_blocksvd_int8_host_pool> & host,
+    ggml_backend_t                                            backend,
+    ggml_backend_buffer_type_t                                buft,
+    const llama_kv_blocksvd_int8_direct_metadata_layout *     direct_metadata,
+    std::string *                                             err) {
     auto fail = [err](std::string message) {
         if (err) {
             *err = std::move(message);
@@ -673,11 +895,19 @@ static std::shared_ptr<llama_kv_blocksvd_int8_backend_pool> blocksvd_create_back
         ggml_new_tensor_1d(pool->tensor_ctx.get(), GGML_TYPE_F32, dispatch.rank_scale.size());
     pool->block_positions =
         ggml_new_tensor_1d(pool->tensor_ctx.get(), GGML_TYPE_I32, dispatch.block_positions.size());
+    if (direct_metadata) {
+        pool->direct_metadata = *direct_metadata;
+        pool->direct_dynamic_metadata.assign(static_cast<size_t>(pool->direct_metadata.recent_size) + 1, -1);
+        pool->metadata = ggml_new_tensor_1d(pool->tensor_ctx.get(), GGML_TYPE_I8, pool->direct_metadata.total_bytes);
+    }
 
     ggml_format_name(pool->u_q, "edgekv_u_q-%d", dispatch.layer_start);
     ggml_format_name(pool->vh_q, "edgekv_vh_q-%d", dispatch.layer_start);
     ggml_format_name(pool->rank_scale, "edgekv_scale-%d", dispatch.layer_start);
     ggml_format_name(pool->block_positions, "edgekv_pos-%d", dispatch.layer_start);
+    if (pool->metadata) {
+        ggml_format_name(pool->metadata, "edgekv_metadata-%d", dispatch.layer_start);
+    }
 
     pool->buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool->tensor_ctx.get(), buft));
     if (!pool->buffer) {
@@ -689,11 +919,11 @@ static std::shared_ptr<llama_kv_blocksvd_int8_backend_pool> blocksvd_create_back
         return fail("EdgeKV backend-pool tensor sizes do not match host storage");
     }
 
-    LLAMA_LOG_DEBUG(
-        "%s: allocated pool=%p backend=%s buft=%s layer_group=[%d,%d) capacity=%d valid=%d bytes=%zu\n",
-        __func__, static_cast<void *>(pool.get()), ggml_backend_name(backend), ggml_backend_buft_name(buft),
-        dispatch.layer_start, dispatch.layer_start + dispatch.group_size, dispatch.n_blocks,
-        dispatch.valid_blocks, blocksvd_dispatch_bytes(dispatch));
+    LLAMA_LOG_DEBUG("%s: allocated pool=%p backend=%s buft=%s layer_group=[%d,%d) capacity=%d valid=%d bytes=%zu\n",
+                    __func__, static_cast<void *>(pool.get()), ggml_backend_name(backend), ggml_backend_buft_name(buft),
+                    dispatch.layer_start, dispatch.layer_start + dispatch.group_size, dispatch.n_blocks,
+                    dispatch.valid_blocks,
+                    blocksvd_dispatch_bytes(dispatch) + (pool->metadata ? ggml_nbytes(pool->metadata) : 0));
     return pool;
 }
 
@@ -832,16 +1062,24 @@ bool llama_kv_blocksvd_refresh_int8_reconstruct_pool(
     return true;
 }
 
-bool llama_kv_blocksvd_acquire_int8_backend_pool(
-        const llama_kv_blocksvd_context &     ctx,
-        int32_t                               layer,
-        uint32_t                              stream,
-        llama_seq_id                          seq_id,
-        int32_t                               block_capacity,
-        ggml_backend_sched_t                  sched,
-        ggml_backend_t                        backend_cpu,
-        llama_kv_blocksvd_int8_backend_view & out,
-        std::string *                         err) {
+namespace {
+
+struct blocksvd_direct_probe {
+    int32_t n_head_q;
+    int32_t recent_size;
+    float   scale;
+};
+
+static bool blocksvd_acquire_int8_backend_pool_impl(const llama_kv_blocksvd_context &     ctx,
+                                                    int32_t                               layer,
+                                                    uint32_t                              stream,
+                                                    llama_seq_id                          seq_id,
+                                                    int32_t                               block_capacity,
+                                                    ggml_backend_sched_t                  sched,
+                                                    ggml_backend_t                        backend_cpu,
+                                                    const blocksvd_direct_probe *         direct_probe,
+                                                    llama_kv_blocksvd_int8_backend_view & out,
+                                                    std::string *                         err) {
     auto fail = [err](std::string message) {
         if (err) {
             *err = std::move(message);
@@ -912,7 +1150,7 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
     }
 
     ggml_init_params prototype_params = {
-        /* .mem_size   = */ 8 * ggml_tensor_overhead(),
+        /* .mem_size   = */ 16 * ggml_tensor_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -925,14 +1163,37 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
         ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_I8, static_cast<int64_t>(dispatch.u_q.size()));
     ggml_tensor * prototype_vh =
         ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_I8, static_cast<int64_t>(dispatch.vh_q.size()));
-    ggml_tensor * prototype_scale =
-        ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_F32, static_cast<int64_t>(dispatch.rank_scale.size()));
-    ggml_tensor * prototype_positions = ggml_new_tensor_1d(
-        prototype_ctx.get(), GGML_TYPE_I32, static_cast<int64_t>(dispatch.block_positions.size()));
-    const auto prototype_op_params = blocksvd_ggml_params(dispatch, layer - dispatch.layer_start);
-    ggml_tensor * prototype_op = ggml_edgekv_reconstruct(
-        prototype_ctx.get(), prototype_u, prototype_vh, prototype_scale, prototype_positions,
-        &prototype_op_params);
+    ggml_tensor *                                 prototype_op = nullptr;
+    llama_kv_blocksvd_int8_direct_metadata_layout direct_metadata;
+    if (direct_probe) {
+        ggml_edgekv_attn_decode_params direct_params;
+        if (!llama_kv_blocksvd_make_int8_direct_params(dispatch, layer, direct_probe->n_head_q,
+                                                       direct_probe->recent_size, direct_probe->scale, direct_params,
+                                                       err) ||
+            !llama_kv_blocksvd_make_int8_direct_metadata_layout(dispatch, direct_probe->recent_size, direct_metadata,
+                                                                err)) {
+            return false;
+        }
+        ggml_tensor * prototype_q =
+            ggml_new_tensor_2d(prototype_ctx.get(), GGML_TYPE_F32, dispatch.head_dim_k, direct_probe->n_head_q);
+        ggml_tensor * prototype_metadata =
+            ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_I8, direct_metadata.total_bytes);
+        ggml_tensor * prototype_active_k = ggml_new_tensor_3d(prototype_ctx.get(), GGML_TYPE_F16, dispatch.head_dim_k,
+                                                              dispatch.n_head_kv, direct_probe->recent_size);
+        ggml_tensor * prototype_active_v = ggml_new_tensor_3d(prototype_ctx.get(), GGML_TYPE_F16, dispatch.head_dim_v,
+                                                              dispatch.n_head_kv, direct_probe->recent_size);
+        prototype_op =
+            ggml_edgekv_attn_decode(prototype_ctx.get(), prototype_q, prototype_u, prototype_vh, prototype_metadata,
+                                    prototype_active_k, prototype_active_v, &direct_params);
+    } else {
+        ggml_tensor * prototype_scale =
+            ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_F32, static_cast<int64_t>(dispatch.rank_scale.size()));
+        ggml_tensor * prototype_positions = ggml_new_tensor_1d(prototype_ctx.get(), GGML_TYPE_I32,
+                                                               static_cast<int64_t>(dispatch.block_positions.size()));
+        const auto    prototype_op_params = blocksvd_ggml_params(dispatch, layer - dispatch.layer_start);
+        prototype_op = ggml_edgekv_reconstruct(prototype_ctx.get(), prototype_u, prototype_vh, prototype_scale,
+                                               prototype_positions, &prototype_op_params);
+    }
 
     std::vector<ggml_backend_t> candidates;
     const int n_backends = ggml_backend_sched_get_n_backends(sched);
@@ -946,13 +1207,19 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
         candidates.push_back(backend_cpu);
     }
     if (candidates.empty()) {
-        return fail("no scheduler backend supports the EdgeKV reconstruct shape");
+        return fail(direct_probe ? "no scheduler backend supports the EdgeKV direct-attention shape" :
+                                   "no scheduler backend supports the EdgeKV reconstruct shape");
     }
 
     std::string allocation_errors;
     for (ggml_backend_t backend : candidates) {
         ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, backend);
-        const blocksvd_backend_pool_key replica_key = { host.get(), backend, buft };
+        const blocksvd_backend_pool_key replica_key = {
+            host.get(),
+            backend,
+            buft,
+            direct_probe ? direct_probe->recent_size : 0,
+        };
         auto replica_it = registry.replicas.find(replica_key);
         if (replica_it != registry.replicas.end()) {
             blocksvd_set_backend_view(replica_it->second, out);
@@ -960,7 +1227,8 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
         }
 
         std::string create_error;
-        auto replica = blocksvd_create_backend_pool(host, backend, buft, &create_error);
+        auto        replica =
+            blocksvd_create_backend_pool(host, backend, buft, direct_probe ? &direct_metadata : nullptr, &create_error);
         if (replica) {
             registry.replicas.emplace(replica_key, replica);
             blocksvd_set_backend_view(replica, out);
@@ -973,6 +1241,38 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
     }
 
     return fail("could not allocate an EdgeKV backend replica: " + allocation_errors);
+}
+
+}  // namespace
+
+bool llama_kv_blocksvd_acquire_int8_backend_pool(const llama_kv_blocksvd_context &     ctx,
+                                                 int32_t                               layer,
+                                                 uint32_t                              stream,
+                                                 llama_seq_id                          seq_id,
+                                                 int32_t                               block_capacity,
+                                                 ggml_backend_sched_t                  sched,
+                                                 ggml_backend_t                        backend_cpu,
+                                                 llama_kv_blocksvd_int8_backend_view & out,
+                                                 std::string *                         err) {
+    return blocksvd_acquire_int8_backend_pool_impl(ctx, layer, stream, seq_id, block_capacity, sched, backend_cpu,
+                                                   nullptr, out, err);
+}
+
+bool llama_kv_blocksvd_acquire_int8_direct_backend_pool(const llama_kv_blocksvd_context &     ctx,
+                                                        int32_t                               layer,
+                                                        uint32_t                              stream,
+                                                        llama_seq_id                          seq_id,
+                                                        int32_t                               block_capacity,
+                                                        int32_t                               n_head_q,
+                                                        int32_t                               recent_size,
+                                                        float                                 scale,
+                                                        ggml_backend_sched_t                  sched,
+                                                        ggml_backend_t                        backend_cpu,
+                                                        llama_kv_blocksvd_int8_backend_view & out,
+                                                        std::string *                         err) {
+    const blocksvd_direct_probe probe = { n_head_q, recent_size, scale };
+    return blocksvd_acquire_int8_backend_pool_impl(ctx, layer, stream, seq_id, block_capacity, sched, backend_cpu,
+                                                   &probe, out, err);
 }
 
 bool llama_kv_blocksvd_sync_int8_backend_pool(
@@ -1009,7 +1309,7 @@ bool llama_kv_blocksvd_sync_int8_backend_pool(
         }
         first_dirty = 0;
         last_dirty  = static_cast<size_t>(dispatch.n_blocks);
-        dirty_bytes = blocksvd_dispatch_bytes(dispatch);
+        dirty_bytes = blocksvd_dispatch_bytes(dispatch) + (pool.metadata ? ggml_nbytes(pool.metadata) : 0);
     } else if (pool.uploaded_valid < dispatch.valid_blocks) {
         first_dirty = static_cast<size_t>(pool.uploaded_valid);
         last_dirty  = static_cast<size_t>(dispatch.valid_blocks);
@@ -1042,6 +1342,17 @@ bool llama_kv_blocksvd_sync_int8_backend_pool(
             first_dirty, block_count);
         dirty_bytes += blocksvd_upload_component_blocks(
             pool.block_positions, dispatch.block_positions, 0, position_stride, first_dirty, block_count);
+        if (pool.metadata) {
+            std::vector<llama_pos> initial_positions(static_cast<size_t>(pool.direct_metadata.recent_size), -1);
+            std::vector<int8_t>    packed_metadata;
+            if (!llama_kv_blocksvd_pack_int8_direct_metadata(dispatch, pool.direct_metadata, initial_positions, -1,
+                                                             packed_metadata, err)) {
+                return false;
+            }
+            const size_t static_bytes = static_cast<size_t>(pool.direct_metadata.recent_positions_offset_bytes);
+            ggml_backend_tensor_set(pool.metadata, packed_metadata.data(), 0, static_bytes);
+            dirty_bytes += static_bytes;
+        }
         pool.uploaded_valid = dispatch.valid_blocks;
     }
     pool.host_epoch = host.epoch;
@@ -1056,5 +1367,47 @@ bool llama_kv_blocksvd_sync_int8_backend_pool(
             dispatch.n_blocks, previous_valid, dispatch.valid_blocks, first_dirty, last_dirty, dirty_bytes,
             full_upload ? 1 : 0);
     }
+    return true;
+}
+
+bool llama_kv_blocksvd_update_int8_direct_metadata(llama_kv_blocksvd_int8_backend_view & view,
+                                                   const std::vector<llama_pos> &        recent_positions,
+                                                   llama_pos                             query_position,
+                                                   std::string *                         err) {
+    auto fail = [err](std::string message) {
+        if (err) {
+            *err = std::move(message);
+        }
+        return false;
+    };
+    if (!view.owner || !view.storage || !view.metadata) {
+        return fail("EdgeKV direct metadata view is incomplete");
+    }
+    if (view.direct_metadata.recent_size <= 0 ||
+        recent_positions.size() != static_cast<size_t>(view.direct_metadata.recent_size)) {
+        return fail("EdgeKV direct metadata positions do not match the static recent window");
+    }
+
+    auto & dynamic_metadata = view.owner->direct_dynamic_metadata;
+    if (dynamic_metadata.size() != recent_positions.size() + 1) {
+        return fail("EdgeKV direct metadata scratch does not match the static recent window");
+    }
+    for (size_t index = 0; index < recent_positions.size(); ++index) {
+        if (recent_positions[index] < -1) {
+            return fail("EdgeKV direct recent position is outside the supported range");
+        }
+        dynamic_metadata[index] = static_cast<int32_t>(recent_positions[index]);
+    }
+    if (query_position < -1) {
+        return fail("EdgeKV direct query position is outside the supported range");
+    }
+    dynamic_metadata.back() = static_cast<int32_t>(query_position);
+
+    const size_t offset = static_cast<size_t>(view.direct_metadata.recent_positions_offset_bytes);
+    const size_t bytes  = dynamic_metadata.size() * sizeof(int32_t);
+    if (offset + bytes > ggml_nbytes(view.metadata)) {
+        return fail("EdgeKV direct metadata dynamic suffix exceeds the backend tensor");
+    }
+    ggml_backend_tensor_set(view.metadata, dynamic_metadata.data(), offset, bytes);
     return true;
 }

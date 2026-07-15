@@ -85,6 +85,7 @@ def parse_markers(text: str) -> Dict[str, bool]:
     return {
         "chunked_attn_active": "chunked_attn active" in text,
         "kv_lowrank_direct_active": "kv_lowrank_direct active" in text,
+        "edgekv_direct_decode_active": "EdgeKV direct decode active" in text,
     }
 
 
@@ -153,7 +154,8 @@ def main() -> int:
                 print(f"  PPL = {run['ppl']:.4f} +/- {run['unc']:.4f}  "
                       f"(elapsed={run['elapsed_sec']:.1f}s, compress_events={comp['events']}, "
                       f"chunked={'Y' if mk['chunked_attn_active'] else 'N'}, "
-                      f"direct={'Y' if mk['kv_lowrank_direct_active'] else 'N'})")
+                      f"direct={'Y' if mk['kv_lowrank_direct_active'] else 'N'}, "
+                      f"edgekv={'Y' if mk['edgekv_direct_decode_active'] else 'N'})")
 
         recon = cell["runs"].get("reconstruct")
         direct = cell["runs"].get("direct")
@@ -182,17 +184,18 @@ def main() -> int:
     with csv_path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["ctx", "rank", "block", "mode", "ppl", "uncertainty",
-                    "compress_events", "chunked_marker", "direct_marker", "elapsed_sec"])
+                    "compress_events", "chunked_marker", "direct_marker", "edgekv_marker", "elapsed_sec"])
         for cell in results:
             for mode, run in cell["runs"].items():
                 if "ppl" not in run:
                     w.writerow([cell["ctx"], cell["rank"], cell["block"], mode,
-                                "ERR", "ERR", "", "", "", run.get("elapsed_sec", "")])
+                                "ERR", "ERR", "", "", "", "", run.get("elapsed_sec", "")])
                     continue
                 mk = run["markers"]
                 w.writerow([cell["ctx"], cell["rank"], cell["block"], mode,
                             run["ppl"], run["unc"], run["compress"]["events"],
                             int(mk["chunked_attn_active"]), int(mk["kv_lowrank_direct_active"]),
+                            int(mk["edgekv_direct_decode_active"]),
                             run["elapsed_sec"]])
 
     all_pass = all(cell.get("pass", True) for cell in results if "delta_direct_vs_reconstruct" in cell)

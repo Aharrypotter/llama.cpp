@@ -91,6 +91,17 @@ struct llama_kv_blocksvd_int8_pool_update {
     bool   full_repack       = false;
 };
 
+// Packed six-input direct-attention metadata. Static K/V scales and compressed
+// positions are followed by the per-forward active positions and query
+// position. Every section starts at a 128-byte boundary for the HTP ABI.
+struct llama_kv_blocksvd_int8_direct_metadata_layout {
+    int32_t recent_size                   = 0;
+    int32_t v_scale_offset_bytes          = 0;
+    int32_t block_positions_offset_bytes  = 0;
+    int32_t recent_positions_offset_bytes = 0;
+    int32_t total_bytes                   = 0;
+};
+
 struct llama_kv_blocksvd_int8_backend_pool;
 
 // A graph-stable view of one statically allocated backend factor pool. The
@@ -103,9 +114,11 @@ struct llama_kv_blocksvd_int8_backend_view {
     ggml_tensor * vh_q            = nullptr;
     ggml_tensor * rank_scale      = nullptr;
     ggml_tensor * block_positions = nullptr;
+    ggml_tensor * metadata        = nullptr;
 
     const llama_kv_blocksvd_int8_reconstruct_dispatch * storage = nullptr;
     ggml_backend_t                                       backend = nullptr;
+    llama_kv_blocksvd_int8_direct_metadata_layout        direct_metadata;
 };
 
 bool llama_kv_blocksvd_pack_int8_execution_factors(
@@ -141,6 +154,26 @@ bool llama_kv_blocksvd_refresh_int8_reconstruct_pool(
         llama_kv_blocksvd_int8_pool_update &          update,
         std::string *                                 err = nullptr);
 
+bool llama_kv_blocksvd_make_int8_direct_metadata_layout(const llama_kv_blocksvd_int8_reconstruct_dispatch & dispatch,
+                                                        int32_t                                             recent_size,
+                                                        llama_kv_blocksvd_int8_direct_metadata_layout &     out,
+                                                        std::string * err = nullptr);
+
+bool llama_kv_blocksvd_pack_int8_direct_metadata(const llama_kv_blocksvd_int8_reconstruct_dispatch &   dispatch,
+                                                 const llama_kv_blocksvd_int8_direct_metadata_layout & layout,
+                                                 const std::vector<llama_pos> &                        recent_positions,
+                                                 llama_pos                                             query_position,
+                                                 std::vector<int8_t> &                                 out,
+                                                 std::string *                                         err = nullptr);
+
+bool llama_kv_blocksvd_make_int8_direct_params(const llama_kv_blocksvd_int8_reconstruct_dispatch & dispatch,
+                                               int32_t                                             layer,
+                                               int32_t                                             n_head_q,
+                                               int32_t                                             recent_size,
+                                               float                                               scale,
+                                               ggml_edgekv_attn_decode_params &                    out,
+                                               std::string *                                       err = nullptr);
+
 // Acquire a statically allocated backend replica. The selected backend is the
 // highest-priority scheduler backend that supports the reconstruct op for this
 // layer, with backend_cpu as the required fallback.
@@ -155,9 +188,32 @@ bool llama_kv_blocksvd_acquire_int8_backend_pool(
         llama_kv_blocksvd_int8_backend_view &   out,
         std::string *                           err = nullptr);
 
+// Acquire a replica by probing the direct-attention consumer itself. This
+// prevents a supported HTP direct op from falling back to CPU merely because
+// the same backend does not support the reconstruct prototype.
+bool llama_kv_blocksvd_acquire_int8_direct_backend_pool(const llama_kv_blocksvd_context &     ctx,
+                                                        int32_t                               layer,
+                                                        uint32_t                              stream,
+                                                        llama_seq_id                          seq_id,
+                                                        int32_t                               block_capacity,
+                                                        int32_t                               n_head_q,
+                                                        int32_t                               recent_size,
+                                                        float                                 scale,
+                                                        ggml_backend_sched_t                  sched,
+                                                        ggml_backend_t                        backend_cpu,
+                                                        llama_kv_blocksvd_int8_backend_view & out,
+                                                        std::string *                         err = nullptr);
+
 // Synchronize host changes into an acquired backend replica. Append-only
 // growth uploads only blocks not yet present in that replica.
 bool llama_kv_blocksvd_sync_int8_backend_pool(
         const llama_kv_blocksvd_context &     ctx,
         llama_kv_blocksvd_int8_backend_view & view,
         std::string *                         err = nullptr);
+
+// Update only the dynamic metadata suffix (recent positions plus query
+// position). For the mobile profile this is 516 bytes per forward.
+bool llama_kv_blocksvd_update_int8_direct_metadata(llama_kv_blocksvd_int8_backend_view & view,
+                                                   const std::vector<llama_pos> &        recent_positions,
+                                                   llama_pos                             query_position,
+                                                   std::string *                         err = nullptr);

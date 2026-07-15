@@ -132,9 +132,11 @@ class llm_graph_input_blocksvd_state final : public llm_graph_input_i {
 class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
   public:
     llm_graph_input_blocksvd_dispatch(const llama_kv_blocksvd_context *   bctx,
-                                      llama_kv_blocksvd_int8_backend_view view) :
+                                      llama_kv_blocksvd_int8_backend_view view,
+                                      const llama_kv_cache_context *      mctx = nullptr) :
         bctx(bctx),
         view(std::move(view)),
+        mctx(mctx),
         observed_generation(bctx->xkv_generation) {}
 
     void add_consumer(llama_chunked_attn_params * consumer) {
@@ -143,10 +145,16 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
     }
 
     void set_input(const llama_ubatch * ubatch) override {
-        GGML_UNUSED(ubatch);
         std::string error;
         if (!llama_kv_blocksvd_sync_int8_backend_pool(*bctx, view, &error)) {
             GGML_ABORT("%s: could not synchronize EdgeKV backend pool: %s\n", __func__, error.c_str());
+        }
+        if (view.metadata) {
+            GGML_ASSERT(ubatch && ubatch->pos && ubatch->n_tokens == 1 && mctx);
+            if (!llama_kv_blocksvd_update_int8_direct_metadata(view, mctx->get_slot_positions(0), ubatch->pos[0],
+                                                               &error)) {
+                GGML_ABORT("%s: could not update EdgeKV direct metadata: %s\n", __func__, error.c_str());
+            }
         }
         observed_generation = bctx->xkv_generation;
         update_consumers();
@@ -157,6 +165,10 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
         if (!next_mctx || !next_mctx->is_memory_reduction_enabled() || next_mctx->get_blocksvd_ctx() != bctx) {
             return false;
         }
+        if (view.metadata && next_mctx->get_cache_size() != static_cast<uint32_t>(view.direct_metadata.recent_size)) {
+            return false;
+        }
+        mctx = next_mctx;
         if (observed_generation == bctx->xkv_generation) {
             return true;
         }
@@ -190,6 +202,8 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
     ggml_tensor * vh_q() const { return view.vh_q; }
     ggml_tensor * rank_scale() const { return view.rank_scale; }
     ggml_tensor * block_positions() const { return view.block_positions; }
+
+    ggml_tensor *  metadata() const { return view.metadata; }
     ggml_backend_t backend() const { return view.backend; }
 
   private:
@@ -212,6 +226,7 @@ class llm_graph_input_blocksvd_dispatch final : public llm_graph_input_i {
 
     const llama_kv_blocksvd_context *         bctx;
     llama_kv_blocksvd_int8_backend_view       view;
+    const llama_kv_cache_context *            mctx;
     uint64_t                                  observed_generation;
     std::vector<llama_chunked_attn_params *> consumers;
 };
@@ -259,6 +274,7 @@ static ggml_edgekv_reconstruct_params blocksvd_to_ggml_params(
         dispatch.dense_total_bytes,
     };
 }
+
 #endif
 
 // dedup helpers
@@ -2593,6 +2609,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
             const bool edgekv_reconstruct_enabled =
                 cparams.kv_lowrank_reconstruct && getenv("LLAMA_KV_BLOCKSVD_EDGEKV_RECONSTRUCT") != nullptr;
+            const bool edgekv_direct_enabled =
+                !cparams.kv_lowrank_reconstruct && getenv("LLAMA_KV_BLOCKSVD_EDGEKV_DIRECT") != nullptr;
 
             llm_graph_input_blocksvd_state * blocksvd_state_input = nullptr;
             for (const auto & input : res->inputs) {
@@ -2603,15 +2621,15 @@ ggml_tensor * llm_graph_context::build_attn(
                 }
             }
             if (!blocksvd_state_input) {
-                auto input =
-                    std::make_unique<llm_graph_input_blocksvd_state>(bctx, mctx_cur, edgekv_reconstruct_enabled);
+                auto input = std::make_unique<llm_graph_input_blocksvd_state>(
+                    bctx, mctx_cur, edgekv_reconstruct_enabled || edgekv_direct_enabled);
                 blocksvd_state_input = input.get();
                 res->add_input(std::move(input));
             }
-            blocksvd_state_input->add_consumer(params.get());
 
             ggml_tensor * edgekv_dense_k = nullptr;
             ggml_tensor * edgekv_dense_v = nullptr;
+            ggml_tensor * edgekv_direct_output = nullptr;
             if (edgekv_reconstruct_enabled && !bctx->xkv_chunks.empty()) {
                 llama_seq_id edgekv_seq_id = 0;
                 for (const auto & chunk : bctx->xkv_chunks) {
@@ -2704,6 +2722,114 @@ ggml_tensor * llm_graph_context::build_attn(
                 }
             }
 
+            if (edgekv_direct_enabled && !bctx->xkv_chunks.empty()) {
+                llama_kv_blocksvd_int8_backend_view backend_view;
+                std::string                         dispatch_error;
+                bool                                dispatch_available = false;
+
+                const bool active_shape_matches =
+                    n_tokens == 1 && params->n_stream == 1 &&
+                    params->cache_size <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) &&
+                    q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                    q->ne[0] == params->head_dim_k && q->ne[1] == params->n_head_q && q->ne[2] == 1 &&
+                    k->ne[0] == params->head_dim_k && k->ne[1] == params->n_head_kv && k->ne[2] == params->cache_size &&
+                    k->ne[3] == 1 && v->ne[0] == params->head_dim_v && v->ne[1] == params->n_head_kv &&
+                    v->ne[2] == params->cache_size && v->ne[3] == 1 && ggml_is_contiguous(q) && ggml_is_contiguous(k) &&
+                    ggml_is_contiguous(v);
+
+                llama_seq_id edgekv_seq_id = 0;
+                if (!active_shape_matches) {
+                    dispatch_error = "decode query or active F16 staging does not match the zero-copy ABI";
+                } else {
+                    for (const auto & chunk : bctx->xkv_chunks) {
+                        if (chunk.stream == 0 && il >= chunk.layer_start && il < chunk.layer_start + chunk.group_size) {
+                            edgekv_seq_id = chunk.seq_id;
+                            break;
+                        }
+                    }
+
+                    const size_t valid_blocks = blocksvd_matching_block_count(*bctx, il, 0, edgekv_seq_id);
+                    if (valid_blocks == 0) {
+                        dispatch_error = "no xKV chunks match layer, stream, and sequence";
+                    } else if (valid_blocks > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                        dispatch_error = "dispatch block count exceeds int32_t";
+                    } else {
+                        // The v79 AOT object has a static N=16 profile. Reserve
+                        // that capacity from the first compressed block so graph
+                        // reuse can append factors without changing topology.
+                        const int32_t block_capacity = std::max<int32_t>(16, blocksvd_pool_capacity(valid_blocks));
+                        dispatch_available           = llama_kv_blocksvd_acquire_int8_direct_backend_pool(
+                            *bctx, il, 0, edgekv_seq_id, block_capacity, params->n_head_q,
+                            static_cast<int32_t>(params->cache_size), params->scale, sched, backend_cpu, backend_view,
+                            &dispatch_error);
+                    }
+                }
+
+                llm_graph_input_blocksvd_dispatch * edgekv_input = nullptr;
+                if (dispatch_available) {
+                    for (const auto & input : res->inputs) {
+                        auto * candidate = dynamic_cast<llm_graph_input_blocksvd_dispatch *>(input.get());
+                        if (candidate && candidate->matches(bctx, backend_view)) {
+                            edgekv_input = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                const auto * packed = dispatch_available ? backend_view.storage : nullptr;
+                const bool   consumer_shape_matches =
+                    dispatch_available && backend_view.metadata && packed->n_head_kv == params->n_head_kv &&
+                    packed->head_dim_k == params->head_dim_k && packed->head_dim_v == params->head_dim_v &&
+                    backend_view.direct_metadata.recent_size == static_cast<int32_t>(params->cache_size);
+                if (consumer_shape_matches) {
+                    if (!edgekv_input) {
+                        auto input = std::make_unique<llm_graph_input_blocksvd_dispatch>(bctx, std::move(backend_view),
+                                                                                         mctx_cur);
+                        edgekv_input = input.get();
+                        res->add_input(std::move(input));
+                    }
+
+                    ggml_edgekv_attn_decode_params direct_params;
+                    if (llama_kv_blocksvd_make_int8_direct_params(edgekv_input->storage(), il, params->n_head_q,
+                                                                  static_cast<int32_t>(params->cache_size),
+                                                                  params->scale, direct_params, &dispatch_error)) {
+                        edgekv_direct_output =
+                            ggml_edgekv_attn_decode(ctx0, q, edgekv_input->u_q(), edgekv_input->vh_q(),
+                                                    edgekv_input->metadata(), k, v, &direct_params);
+                        ggml_backend_sched_set_tensor_backend(sched, edgekv_direct_output, edgekv_input->backend());
+                        ggml_format_name(edgekv_direct_output, "edgekv_attn_decode-%d", il);
+                        cb(edgekv_direct_output, "edgekv_attn_decode", il);
+
+                        static std::atomic<bool> logged_edgekv_direct{ false };
+                        if (!logged_edgekv_direct.exchange(true)) {
+                            LLAMA_LOG_INFO(
+                                "%s: EdgeKV direct decode active (backend=%s N=%d B=%d Rk=%d Rv=%d G=%d "
+                                "Hq=%d Hkv=%d Dk=%d Dv=%d recent=%u metadata=%d bytes)\n",
+                                __func__, ggml_backend_name(edgekv_input->backend()), direct_params.n_blocks,
+                                direct_params.block_size, direct_params.rank_k, direct_params.rank_v,
+                                direct_params.group_size, direct_params.n_head_q, direct_params.n_head_kv,
+                                direct_params.head_dim_k, direct_params.head_dim_v, params->cache_size,
+                                direct_params.metadata_total_bytes);
+                        }
+                    }
+                } else if (dispatch_available) {
+                    dispatch_error = "packed factors or metadata do not match the direct attention consumer";
+                }
+
+                if (!edgekv_direct_output) {
+                    static std::atomic<bool> warned_edgekv_direct{ false };
+                    if (!dispatch_error.empty() && !warned_edgekv_direct.exchange(true)) {
+                        LLAMA_LOG_WARN(
+                            "%s: EdgeKV direct dispatch unavailable; using portable rank-domain fallback: %s\n",
+                            __func__, dispatch_error.c_str());
+                    }
+                }
+            }
+
+            if (!edgekv_direct_output) {
+                blocksvd_state_input->add_consumer(params.get());
+            }
+
             const bool edgekv_reconstructed = params->edgekv_reconstructed;
             void * udata = params.get();
             res->chunked_attn_params.push_back(std::move(params));
@@ -2720,13 +2846,15 @@ ggml_tensor * llm_graph_context::build_attn(
                 : llama_chunked_attn_compute;
             const char * op_name = use_lowrank_direct ? "kv_lowrank_direct_attn" : "chunked_attn";
 
-            ggml_tensor * args[5] = { q, k, v, edgekv_dense_k, edgekv_dense_v };
-            const int     n_args  = edgekv_reconstructed ? 5 : 3;
-            ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32,
-                out_dim, n_tokens, 1, 1,
-                args, n_args, compute_fn, GGML_N_TASKS_MAX, udata);
-            ggml_set_name(cur, op_name);
-            cb(cur, "kqv_out", il);
+            ggml_tensor * cur = edgekv_direct_output;
+            if (!cur) {
+                ggml_tensor * args[5] = { q, k, v, edgekv_dense_k, edgekv_dense_v };
+                const int     n_args  = edgekv_reconstructed ? 5 : 3;
+                cur = ggml_custom_4d(ctx0, GGML_TYPE_F32, out_dim, n_tokens, 1, 1, args, n_args, compute_fn,
+                                     GGML_N_TASKS_MAX, udata);
+                ggml_set_name(cur, op_name);
+                cb(cur, "kqv_out", il);
+            }
 
             cur = ggml_reshape_2d(ctx0, cur, out_dim, n_tokens);
 
