@@ -157,6 +157,12 @@ kv_blocksvd_shadow_compress_current: cross-layer stored n_tokens=64 layers=28
         self.assertEqual(failed["status"], "FAIL")
         self.assertEqual(len(failed["quality_violations"]), 1)
 
+    def test_csv_uses_lf_line_endings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "summary.csv"
+            QUALITY.write_csv(output, [{"mode": "dense", "status": "ok"}])
+            self.assertEqual(output.read_bytes(), b"mode,status\ndense,ok\n")
+
     def test_resume_requires_matching_signature(self):
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "portable.json"
