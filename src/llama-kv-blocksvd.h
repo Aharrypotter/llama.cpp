@@ -154,6 +154,17 @@ struct llama_kv_blocksvd_context {
         std::vector<float> vh_k;
         // Vh_v dequantized: (r_v, combined_v_dim) row-major
         std::vector<float> vh_v;
+
+        // Optional packed-arithmetic reference data. Built lazily only for the
+        // C4C5 diagnostic mode so the default portable path does not duplicate
+        // the compressed INT8 archive.
+        bool                folded_ready = false;
+        std::vector<int8_t> u_k_q;
+        std::vector<int8_t> u_v_q;
+        std::vector<int8_t> vh_k_q;
+        std::vector<int8_t> vh_v_q;
+        std::vector<float>  rank_scale_k;
+        std::vector<float>  rank_scale_v;
     };
     mutable std::vector<std::unique_ptr<rank_chunk>> rank_cache;
 };
@@ -354,6 +365,12 @@ struct llama_chunked_attn_params {
     // chunks_dense). Set by build_attn; read by the set_input hoist to build
     // the matching refs list.
     bool use_lowrank_direct = false;
+
+    // C4C5 CPU-reference diagnostics. Defaults preserve the historical
+    // portable path: split dequantization and active-window-first traversal.
+    // These flags do not alter the packed GGML/HTP operation.
+    bool direct_folded_scale     = false;
+    bool direct_compressed_first = false;
 
     // Per-forward refs built by the single-threaded set_input hoist and consumed
     // read-only by all worker threads during the parallel compute op. Only one

@@ -820,9 +820,9 @@ static void test_mobile_direct_parity() {
     const auto initialize_factors = [](llama_kv_blocksvd_xkv_factors & factors, int seed) {
         factors.rank       = rank;
         factors.quant_bits = 8;
-        factors.u_scale    = 0.0078125f;
-        factors.s_scale    = 0.03125f;
-        factors.vh_scale   = 0.0078125f;
+        factors.u_scale    = 0.01073f + seed * 0.00019f;
+        factors.s_scale    = 0.03461f + seed * 0.00023f;
+        factors.vh_scale   = 0.00817f + seed * 0.00029f;
         factors.u_q.resize(static_cast<size_t>(block_size) * rank);
         factors.s_q.resize(rank);
         factors.vh_q.resize(static_cast<size_t>(rank) * combined_dim);
@@ -889,14 +889,26 @@ static void test_mobile_direct_parity() {
     portable_params.slot_pos.assign(recent_size, -1);
     portable_params.slot_pos[0]        = block_size;
     portable_params.use_lowrank_direct = true;
-    llama_chunked_attn_build_refs(&portable_params);
 
-    ggml_tensor * portable_out =
-        ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, static_cast<int64_t>(head_dim) * n_head_q, 1);
-    portable_out->src[0] = q;
-    portable_out->src[1] = active_k;
-    portable_out->src[2] = active_v;
-    llama_kv_lowrank_direct_attn_compute(portable_out, 0, 1, &portable_params);
+    const auto run_portable = [&](bool folded_scale, bool compressed_first) {
+        portable_params.direct_folded_scale     = folded_scale;
+        portable_params.direct_compressed_first = compressed_first;
+        llama_chunked_attn_build_refs(&portable_params);
+
+        ggml_tensor * portable_out =
+            ggml_new_tensor_2d(ggml_ctx, GGML_TYPE_F32, static_cast<int64_t>(head_dim) * n_head_q, 1);
+        portable_out->src[0] = q;
+        portable_out->src[1] = active_k;
+        portable_out->src[2] = active_v;
+        llama_kv_lowrank_direct_attn_compute(portable_out, 0, 1, &portable_params);
+        const float * output = (const float *) portable_out->data;
+        return std::vector<float>(output, output + ggml_nelements(portable_out));
+    };
+
+    const std::vector<float> split_active      = run_portable(false, false);
+    const std::vector<float> split_compressed  = run_portable(false, true);
+    const std::vector<float> folded_active     = run_portable(true, false);
+    const std::vector<float> folded_compressed = run_portable(true, true);
 
     ggml_tensor * packed_u  = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.u_q.size());
     ggml_tensor * packed_vh = ggml_new_tensor_1d(ggml_ctx, GGML_TYPE_I8, dispatch.vh_q.size());
@@ -929,13 +941,26 @@ static void test_mobile_direct_parity() {
     plan.work_data = work.empty() ? nullptr : work.data();
     assert(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS);
 
-    float max_error = 0.0f;
-    for (int64_t index = 0; index < ggml_nelements(direct_out); ++index) {
-        max_error = std::max(max_error, std::fabs(((const float *) portable_out->data)[index] -
-                                                  ((const float *) direct_out->data)[index]));
-    }
-    assert(max_error < 1e-5f);
-    std::printf("test-kv-blocksvd: mobile direct parity max_error=%g OK\n", (double) max_error);
+    const auto max_difference = [](const std::vector<float> & lhs, const std::vector<float> & rhs) {
+        assert(lhs.size() == rhs.size());
+        float error = 0.0f;
+        for (size_t index = 0; index < lhs.size(); ++index) {
+            error = std::max(error, std::fabs(lhs[index] - rhs[index]));
+        }
+        return error;
+    };
+
+    const float *            packed_output = (const float *) direct_out->data;
+    const std::vector<float> packed(packed_output, packed_output + ggml_nelements(direct_out));
+    const float              traversal_error        = max_difference(split_active, split_compressed);
+    const float              folded_error           = max_difference(split_compressed, folded_compressed);
+    const float              interaction_error      = max_difference(folded_active, folded_compressed);
+    const float              packed_reference_error = max_difference(folded_compressed, packed);
+    assert(packed_reference_error < 1e-5f);
+    std::printf(
+        "test-kv-blocksvd: mobile direct diagnostic traversal=%g folded=%g folded_traversal=%g packed_reference=%g "
+        "OK\n",
+        (double) traversal_error, (double) folded_error, (double) interaction_error, (double) packed_reference_error);
 
     ggml_free(ggml_ctx);
     llama_kv_blocksvd_free(bctx);

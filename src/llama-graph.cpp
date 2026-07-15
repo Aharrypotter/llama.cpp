@@ -2598,6 +2598,19 @@ ggml_tensor * llm_graph_context::build_attn(
             // Selects the compute path (and thus which refs list set_input builds).
             // Mirrors the compute_fn / op_name selection below.
             params->use_lowrank_direct = !cparams.kv_lowrank_reconstruct;
+            params->direct_folded_scale =
+                params->use_lowrank_direct && getenv("LLAMA_KV_BLOCKSVD_DIRECT_DIAG_FOLDED") != nullptr;
+            params->direct_compressed_first =
+                params->use_lowrank_direct && getenv("LLAMA_KV_BLOCKSVD_DIRECT_DIAG_COMPRESSED_FIRST") != nullptr;
+
+            if (params->direct_folded_scale || params->direct_compressed_first) {
+                static std::atomic<bool> logged_direct_diagnostic{ false };
+                if (!logged_direct_diagnostic.exchange(true)) {
+                    LLAMA_LOG_INFO("%s: portable direct diagnostic active (scale=%s order=%s)\n", __func__,
+                                   params->direct_folded_scale ? "folded" : "split",
+                                   params->direct_compressed_first ? "compressed-first" : "active-first");
+                }
+            }
 
             // Causal masking: populate positions for every token unconditionally.
             // The compute op asserts q_pos.size() == n_tokens.

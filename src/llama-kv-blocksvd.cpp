@@ -1439,14 +1439,11 @@ void llama_chunked_attn_compute(
 // Ensure the rank-domain factor cache for xkv_chunk[ci] is populated on bctx.
 // Returns pointer to the rank_chunk (never null on success), or nullptr on failure.
 // All layers in the group share this cache — call once per (chunk, forward).
-static const llama_kv_blocksvd_context::rank_chunk * lowrank_direct_ensure_rank_cache(
-        const llama_kv_blocksvd_context * bctx, size_t ci) {
+static const llama_kv_blocksvd_context::rank_chunk *
+lowrank_direct_ensure_rank_cache(const llama_kv_blocksvd_context * bctx, size_t ci, bool need_folded) {
     auto & cache = bctx->rank_cache;
     if (cache.size() < bctx->xkv_chunks.size()) {
         cache.resize(bctx->xkv_chunks.size());
-    }
-    if (cache[ci]) {
-        return cache[ci].get();
     }
 
     const auto & chunk = bctx->xkv_chunks[ci];
@@ -1479,20 +1476,53 @@ static const llama_kv_blocksvd_context::rank_chunk * lowrank_direct_ensure_rank_
         return true;
     };
 
-    auto rc = std::make_unique<llama_kv_blocksvd_context::rank_chunk>();
-    rc->n_tokens = n_tokens;
-    rc->r_k = chunk.k_factors.rank;
-    rc->r_v = chunk.v_factors.rank;
-    rc->combined_k_dim = combined_k_dim;
-    rc->combined_v_dim = combined_v_dim;
-    if (!dequant_factor(chunk.k_factors, combined_k_dim, rc->us_k, rc->vh_k)) {
-        return nullptr;
+    if (!cache[ci]) {
+        auto rc            = std::make_unique<llama_kv_blocksvd_context::rank_chunk>();
+        rc->n_tokens       = n_tokens;
+        rc->r_k            = chunk.k_factors.rank;
+        rc->r_v            = chunk.v_factors.rank;
+        rc->combined_k_dim = combined_k_dim;
+        rc->combined_v_dim = combined_v_dim;
+        if (!dequant_factor(chunk.k_factors, combined_k_dim, rc->us_k, rc->vh_k)) {
+            return nullptr;
+        }
+        if (!dequant_factor(chunk.v_factors, combined_v_dim, rc->us_v, rc->vh_v)) {
+            return nullptr;
+        }
+        cache[ci] = std::move(rc);
     }
-    if (!dequant_factor(chunk.v_factors, combined_v_dim, rc->us_v, rc->vh_v)) {
-        return nullptr;
+
+    auto * rc = cache[ci].get();
+    if (need_folded && !rc->folded_ready) {
+        const auto copy_folded_factor = [n_tokens](const llama_kv_blocksvd_xkv_factors & factors, int32_t n_dim,
+                                                   std::vector<int8_t> & u_q, std::vector<int8_t> & vh_q,
+                                                   std::vector<float> & rank_scale) {
+            const int32_t rank = factors.rank;
+            if (rank <= 0 || factors.u_q.size() != (size_t) n_tokens * rank || factors.s_q.size() != (size_t) rank ||
+                factors.vh_q.size() != (size_t) rank * n_dim || !std::isfinite(factors.u_scale) ||
+                !std::isfinite(factors.s_scale) || !std::isfinite(factors.vh_scale)) {
+                return false;
+            }
+            u_q  = factors.u_q;
+            vh_q = factors.vh_q;
+            rank_scale.resize((size_t) rank);
+            for (int32_t i = 0; i < rank; ++i) {
+                float scale = (float) factors.s_q[i];
+                scale *= factors.u_scale;
+                scale *= factors.s_scale;
+                scale *= factors.vh_scale;
+                rank_scale[(size_t) i] = scale;
+            }
+            return true;
+        };
+
+        if (!copy_folded_factor(chunk.k_factors, combined_k_dim, rc->u_k_q, rc->vh_k_q, rc->rank_scale_k) ||
+            !copy_folded_factor(chunk.v_factors, combined_v_dim, rc->u_v_q, rc->vh_v_q, rc->rank_scale_v)) {
+            return nullptr;
+        }
+        rc->folded_ready = true;
     }
-    cache[ci] = std::move(rc);
-    return cache[ci].get();
+    return rc;
 }
 
 void llama_chunked_attn_build_refs(llama_chunked_attn_params * p) {
@@ -1523,7 +1553,7 @@ void llama_chunked_attn_build_refs(llama_chunked_attn_params * p) {
             if (il < chunk.layer_start || il >= chunk.layer_start + chunk.group_size) {
                 continue;
             }
-            const auto * rc = lowrank_direct_ensure_rank_cache(bctx, ci);
+            const auto * rc = lowrank_direct_ensure_rank_cache(bctx, ci, p->direct_folded_scale);
             if (!rc) {
                 LLAMA_LOG_WARN("%s: rank-cache build failed for chunk %zu\n", __func__, ci);
                 continue;
@@ -1638,6 +1668,7 @@ void llama_kv_lowrank_direct_attn_compute(
     // Per-thread scratch — declared inside the parallel region.
     std::vector<float> VKQ_acc((size_t) head_dim_v);
     std::vector<float> qVh_k;
+    std::vector<float> v_rank;
     std::vector<float> v_val((size_t) head_dim_v);
 
     const int64_t total = (int64_t) n_head_q * n_tokens;
@@ -1657,9 +1688,19 @@ void llama_kv_lowrank_direct_attn_compute(
                 float S_acc = 0.0f;
                 std::fill(VKQ_acc.begin(), VKQ_acc.end(), 0.0f);
 
-                // --- Part 1: Active window (staged dense cells) ---
-                // Identical to llama_chunked_attn_compute.
-                {
+                const auto consume = [&](float logit) {
+                    const float M_new   = std::max(M_acc, logit);
+                    const float exp_old = S_acc > 0.0f ? expf(M_acc - M_new) : 0.0f;
+                    const float exp_new = expf(logit - M_new);
+                    S_acc               = S_acc * exp_old + exp_new;
+
+                    for (int32_t d = 0; d < head_dim_v; ++d) {
+                        VKQ_acc[d] = VKQ_acc[d] * exp_old + v_val[d] * exp_new;
+                    }
+                    M_acc = M_new;
+                };
+
+                const auto consume_active = [&]() {
                     const auto & s2c = staging->slot_to_cell[s];
                     for (uint32_t slot = 0; slot < cache_size; ++slot) {
                         if (s2c[slot] < 0) {
@@ -1681,81 +1722,100 @@ void llama_kv_lowrank_direct_attn_compute(
                         dot *= scale;
 
                         const char * v_vec = (const char *) c->data + s * c->nb[3] + slot * c->nb[2] + hkv * c->nb[1];
-
-                        float M_new = std::max(M_acc, dot);
-                        float exp_old = expf(M_acc - M_new);
-                        float exp_new = expf(dot - M_new);
-                        float S_new = S_acc * exp_old + exp_new;
-
                         for (int32_t d = 0; d < head_dim_v; ++d) {
-                            VKQ_acc[d] = VKQ_acc[d] * exp_old + llama_blocksvd_load_active(c, v_vec, d) * exp_new;
+                            v_val[d] = llama_blocksvd_load_active(c, v_vec, d);
                         }
-                        M_acc = M_new;
-                        S_acc = S_new;
+                        consume(dot);
                     }
-                }
+                };
 
-                // --- Part 2: Compressed chunks (rank-domain) ---
-                for (const auto & ref : refs) {
-                    const auto * rc = static_cast<const llama_kv_blocksvd_context::rank_chunk *>(ref.rc);
-                    GGML_ASSERT(ref.pos.empty() || (int32_t) ref.pos.size() == rc->n_tokens);
-                    const int32_t r_k = rc->r_k;
-                    const int32_t r_v = rc->r_v;
-                    const int32_t combined_k_dim = rc->combined_k_dim;
-                    const int32_t combined_v_dim = rc->combined_v_dim;
+                const auto consume_compressed = [&]() {
+                    for (const auto & ref : refs) {
+                        const auto * rc = static_cast<const llama_kv_blocksvd_context::rank_chunk *>(ref.rc);
+                        GGML_ASSERT(ref.pos.empty() || (int32_t) ref.pos.size() == rc->n_tokens);
+                        const int32_t r_k            = rc->r_k;
+                        const int32_t r_v            = rc->r_v;
+                        const int32_t combined_k_dim = rc->combined_k_dim;
+                        const int32_t combined_v_dim = rc->combined_v_dim;
 
-                    // qVh_k[i] = Σ_d q_vec[d] * vh_k[i, layer_offset_k + hkv*head_dim_k + d]
-                    if ((int32_t) qVh_k.size() < r_k) {
-                        qVh_k.resize(r_k);
-                    }
-                    const int32_t vh_k_head_off = ref.layer_offset_k + hkv * head_dim_k;
-                    for (int32_t i = 0; i < r_k; ++i) {
-                        const float * vh_row = rc->vh_k.data() + (size_t) i * combined_k_dim + vh_k_head_off;
-                        float acc = 0.0f;
-                        for (int32_t d = 0; d < head_dim_k; ++d) {
-                            acc += q_vec[d] * vh_row[d];
+                        if ((int32_t) qVh_k.size() < r_k) {
+                            qVh_k.resize(r_k);
                         }
-                        qVh_k[i] = acc;
-                    }
-
-                    const int32_t vh_v_head_off = ref.layer_offset_v + hkv * head_dim_v;
-
-                    for (int32_t tc = 0; tc < rc->n_tokens; ++tc) {
-                        if (!ref.pos.empty() && ref.pos[tc] > q_position) {
-                            continue;
+                        if ((int32_t) v_rank.size() < r_v) {
+                            v_rank.resize(r_v);
                         }
 
-                        // logit = (qVh_k · US_k[tc, :]) * scale
-                        float logit = 0.0f;
-                        const float * us_k_row = rc->us_k.data() + (size_t) tc * r_k;
+                        const int32_t vh_k_head_off = ref.layer_offset_k + hkv * head_dim_k;
                         for (int32_t i = 0; i < r_k; ++i) {
-                            logit += qVh_k[i] * us_k_row[i];
-                        }
-                        logit *= scale;
-
-                        // v_val[d] = Σ_i us_v[tc, i] * vh_v[i, layer_offset_v + hkv*head_dim_v + d]
-                        // On-the-fly V reconstruct — rank-r inner product per output dim.
-                        const float * us_v_row = rc->us_v.data() + (size_t) tc * r_v;
-                        for (int32_t d = 0; d < head_dim_v; ++d) {
-                            float vd = 0.0f;
-                            for (int32_t i = 0; i < r_v; ++i) {
-                                const float vhv = rc->vh_v[(size_t) i * combined_v_dim + vh_v_head_off + d];
-                                vd += us_v_row[i] * vhv;
+                            float acc = 0.0f;
+                            if (p->direct_folded_scale) {
+                                GGML_ASSERT(rc->folded_ready);
+                                const int8_t * vh_row = rc->vh_k_q.data() + (size_t) i * combined_k_dim + vh_k_head_off;
+                                for (int32_t d = 0; d < head_dim_k; ++d) {
+                                    acc += (float) vh_row[d] * q_vec[d];
+                                }
+                                acc *= rc->rank_scale_k[(size_t) i];
+                            } else {
+                                const float * vh_row = rc->vh_k.data() + (size_t) i * combined_k_dim + vh_k_head_off;
+                                for (int32_t d = 0; d < head_dim_k; ++d) {
+                                    acc += q_vec[d] * vh_row[d];
+                                }
                             }
-                            v_val[d] = vd;
+                            qVh_k[i] = acc;
                         }
 
-                        float M_new = std::max(M_acc, logit);
-                        float exp_old = expf(M_acc - M_new);
-                        float exp_new = expf(logit - M_new);
-                        float S_new = S_acc * exp_old + exp_new;
+                        const int32_t vh_v_head_off = ref.layer_offset_v + hkv * head_dim_v;
+                        for (int32_t tc = 0; tc < rc->n_tokens; ++tc) {
+                            if (!ref.pos.empty() && ref.pos[tc] > q_position) {
+                                continue;
+                            }
 
-                        for (int32_t d = 0; d < head_dim_v; ++d) {
-                            VKQ_acc[d] = VKQ_acc[d] * exp_old + v_val[d] * exp_new;
+                            float logit = 0.0f;
+                            if (p->direct_folded_scale) {
+                                const int8_t * u_k_row = rc->u_k_q.data() + (size_t) tc * r_k;
+                                for (int32_t i = 0; i < r_k; ++i) {
+                                    logit += (float) u_k_row[i] * qVh_k[i];
+                                }
+                            } else {
+                                const float * us_k_row = rc->us_k.data() + (size_t) tc * r_k;
+                                for (int32_t i = 0; i < r_k; ++i) {
+                                    logit += qVh_k[i] * us_k_row[i];
+                                }
+                            }
+                            logit *= scale;
+
+                            if (p->direct_folded_scale) {
+                                const int8_t * u_v_row = rc->u_v_q.data() + (size_t) tc * r_v;
+                                for (int32_t i = 0; i < r_v; ++i) {
+                                    v_rank[i] = (float) u_v_row[i] * rc->rank_scale_v[(size_t) i];
+                                }
+                            }
+                            const float * us_v_row = rc->us_v.data() + (size_t) tc * r_v;
+                            for (int32_t d = 0; d < head_dim_v; ++d) {
+                                float vd = 0.0f;
+                                for (int32_t i = 0; i < r_v; ++i) {
+                                    if (p->direct_folded_scale) {
+                                        const int8_t vhv = rc->vh_v_q[(size_t) i * combined_v_dim + vh_v_head_off + d];
+                                        vd += v_rank[i] * (float) vhv;
+                                    } else {
+                                        const float vhv = rc->vh_v[(size_t) i * combined_v_dim + vh_v_head_off + d];
+                                        vd += us_v_row[i] * vhv;
+                                    }
+                                }
+                                v_val[d] = vd;
+                            }
+
+                            consume(logit);
                         }
-                        M_acc = M_new;
-                        S_acc = S_new;
                     }
+                };
+
+                if (p->direct_compressed_first) {
+                    consume_compressed();
+                    consume_active();
+                } else {
+                    consume_active();
+                    consume_compressed();
                 }
 
                 // --- Normalize ---
