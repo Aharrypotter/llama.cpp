@@ -72,6 +72,18 @@ if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
         worker-pool.c)
     set_source_files_properties(tests/test-edgekv-hvx-gqa-mobile.c PROPERTIES
         COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+
+    set(EDGEKV_HVX_GQA_ATTN_MOBILE_TEST_LIB test-edgekv-hvx-gqa-attn-mobile-${DSP_VERSION})
+    add_library(${EDGEKV_HVX_GQA_ATTN_MOBILE_TEST_LIB} SHARED
+        tests/test-edgekv-hvx-gqa-attn-mobile.c
+        edgekv-hvx-gqa-attn.c
+        edgekv-hvx-gqa-block.c
+        edgekv-hvx-gqa-scalar.c
+        flash-attn-ops.c
+        worker-pool.c
+        hex-dma.c)
+    set_source_files_properties(tests/test-edgekv-hvx-gqa-attn-mobile.c PROPERTIES
+        COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
 endif()
 
 if (DSP_VERSION STREQUAL "v79" AND
