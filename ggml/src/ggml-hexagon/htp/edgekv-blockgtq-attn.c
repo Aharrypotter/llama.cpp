@@ -154,6 +154,28 @@ static size_t dynamic_bytes(int capacity) {
                EDGEKV_BLOCKGTQ_V_NORM_STRIDE;
 }
 
+int edgekv_blockgtq_history_addresses(
+    int capacity, int token, int head,
+    struct edgekv_blockgtq_history_addresses * addresses) {
+    if (addresses == NULL || capacity != EDGEKV_BLOCKGTQ_CAPACITY ||
+        token < 0 || token >= capacity || head < 0 ||
+        head >= EDGEKV_BLOCKGTQ_HEADS) {
+        return EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
+    }
+    addresses->k_codes = k_codes_offset(token, head);
+    addresses->k_norms = k_norms_offset(capacity, token, head);
+    addresses->v_codes = v_codes_offset(capacity, token, head);
+    addresses->v_norms = v_norms_offset(capacity, token, head);
+    const size_t bytes = dynamic_bytes(capacity);
+    if (addresses->k_codes + EDGEKV_BLOCKGTQ_K_CODE_STRIDE > bytes ||
+        addresses->k_norms + EDGEKV_BLOCKGTQ_K_NORM_STRIDE > bytes ||
+        addresses->v_codes + EDGEKV_BLOCKGTQ_V_CODE_STRIDE > bytes ||
+        addresses->v_norms + EDGEKV_BLOCKGTQ_V_NORM_STRIDE > bytes) {
+        return EDGEKV_BLOCKGTQ_DYNAMIC_LAYOUT_MISMATCH;
+    }
+    return EDGEKV_BLOCKGTQ_OK;
+}
+
 static int build_catalogs(const uint8_t * consumer,
                           size_t rotation_offsets[85],
                           size_t head_lut_bases[EDGEKV_BLOCKGTQ_HEADS]) {

@@ -59,6 +59,17 @@ struct edgekv_blockgtq_diagnostics {
     float * rotated_v;    // [16, 128], normalized weighted accumulation
 };
 
+struct edgekv_blockgtq_history_addresses {
+    size_t k_codes;
+    size_t k_norms;
+    size_t v_codes;
+    size_t v_norms;
+};
+
+int edgekv_blockgtq_history_addresses(
+    int capacity, int token, int head,
+    struct edgekv_blockgtq_history_addresses * addresses);
+
 int edgekv_blockgtq_validate_static(const uint8_t * transform,
                                     size_t transform_bytes,
                                     const uint8_t * consumer,

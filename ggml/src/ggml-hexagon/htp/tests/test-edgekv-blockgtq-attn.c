@@ -18,9 +18,12 @@ enum {
     N_THREADS = 4,
     CASE_COUNT = 36,
     MAX_SEQUENCE = 5,
-    HEADER_BYTES = 256,
-    RECORD_BYTES = 128,
+    FIXTURE_HEADER_BYTES = 240,
+    FIXTURE_RECORD_BYTES = 136,
 };
+
+_Static_assert(FIXTURE_HEADER_BYTES == 240, "fixture header schema drift");
+_Static_assert(FIXTURE_RECORD_BYTES == 136, "fixture record schema drift");
 
 static uint8_t history[EDGEKV_BLOCKGTQ_DYNAMIC_BYTES]
     __attribute__((aligned(128)));
@@ -210,6 +213,55 @@ static void fill_params(int32_t * params, int layer, int sequence) {
     memcpy(params, values, sizeof(values));
 }
 
+static int run_last_slot_address_canary(void) {
+    const int capacity = EDGEKV_BLOCKGTQ_CAPACITY;
+    const int last_token = capacity - 1;
+    const size_t k_codes_end =
+        (size_t) capacity * EDGEKV_BLOCKGTQ_HEADS *
+        EDGEKV_BLOCKGTQ_K_CODE_STRIDE;
+    const size_t k_norms_end =
+        k_codes_end + (size_t) capacity * EDGEKV_BLOCKGTQ_HEADS *
+                          EDGEKV_BLOCKGTQ_K_NORM_STRIDE;
+    const size_t v_codes_end =
+        k_norms_end + (size_t) capacity * EDGEKV_BLOCKGTQ_HEADS *
+                          EDGEKV_BLOCKGTQ_V_CODE_STRIDE;
+    const size_t v_norms_end =
+        v_codes_end + (size_t) capacity * EDGEKV_BLOCKGTQ_HEADS *
+                          EDGEKV_BLOCKGTQ_V_NORM_STRIDE;
+    for (int head = 0; head < EDGEKV_BLOCKGTQ_HEADS; ++head) {
+        struct edgekv_blockgtq_history_addresses addresses;
+        if (edgekv_blockgtq_history_addresses(
+                capacity, last_token, head, &addresses) !=
+                EDGEKV_BLOCKGTQ_OK ||
+            addresses.k_codes + EDGEKV_BLOCKGTQ_K_CODE_STRIDE >
+                k_codes_end ||
+            addresses.k_norms + EDGEKV_BLOCKGTQ_K_NORM_STRIDE >
+                k_norms_end ||
+            addresses.v_codes + EDGEKV_BLOCKGTQ_V_CODE_STRIDE >
+                v_codes_end ||
+            addresses.v_norms + EDGEKV_BLOCKGTQ_V_NORM_STRIDE >
+                v_norms_end) {
+            return 0;
+        }
+        if (head == EDGEKV_BLOCKGTQ_HEADS - 1 &&
+            (addresses.k_codes + EDGEKV_BLOCKGTQ_K_CODE_STRIDE !=
+                 k_codes_end ||
+             addresses.k_norms + EDGEKV_BLOCKGTQ_K_NORM_STRIDE !=
+                 k_norms_end ||
+             addresses.v_codes + EDGEKV_BLOCKGTQ_V_CODE_STRIDE !=
+                 v_codes_end ||
+             addresses.v_norms + EDGEKV_BLOCKGTQ_V_NORM_STRIDE !=
+                 v_norms_end)) {
+            return 0;
+        }
+    }
+    struct edgekv_blockgtq_history_addresses rejected;
+    return v_norms_end == EDGEKV_BLOCKGTQ_DYNAMIC_BYTES &&
+           edgekv_blockgtq_history_addresses(
+               capacity, capacity, 0, &rejected) ==
+               EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
+}
+
 static int run_dense(struct htp_context * ctx, const float * query,
                      int sequence) {
     struct htp_tensor q_tensor = make_tensor_4d(
@@ -258,13 +310,13 @@ int main(void) {
     const size_t fixture_bytes =
         (size_t) (edgekv_blockgtq_fixture_end -
                   edgekv_blockgtq_fixture_start);
-    if (fixture_bytes < HEADER_BYTES ||
+    if (fixture_bytes < FIXTURE_HEADER_BYTES ||
         memcmp(fixture, "BGTQH41", 7) != 0 ||
         read_u32(fixture + 8) != 1 ||
         read_u32(fixture + 12) != CASE_COUNT ||
         read_u32(fixture + 16) != EDGEKV_BLOCKGTQ_CAPACITY ||
-        read_u32(fixture + 20) != HEADER_BYTES ||
-        read_u32(fixture + 24) != RECORD_BYTES ||
+        read_u32(fixture + 20) != FIXTURE_HEADER_BYTES ||
+        read_u32(fixture + 24) != FIXTURE_RECORD_BYTES ||
         read_u32(fixture + 28) != EDGEKV_BLOCKGTQ_TRANSFORM_BYTES ||
         read_u32(fixture + 32) != EDGEKV_BLOCKGTQ_CONSUMER_BYTES ||
         read_u64(fixture + 60) != fixture_bytes) {
@@ -297,6 +349,13 @@ int main(void) {
         printf("FAIL: frozen static pool validation failed\n");
         return 4;
     }
+    if (!run_last_slot_address_canary()) {
+        printf("FAIL: token-2047 address canary\n");
+        return 15;
+    }
+    printf(
+        "PASS: token-2047 address canary fields=K-code/K-norm/V-code/V-norm "
+        "token-2048=rejected timed=false\n");
 
     struct htp_context dense_ctx;
     if (!init_dense_context(&dense_ctx)) {
@@ -334,7 +393,8 @@ int main(void) {
     float global_output = 0.0f;
     for (int index = 0; index < CASE_COUNT; ++index) {
         const uint8_t * record =
-            fixture + HEADER_BYTES + (size_t) index * RECORD_BYTES;
+            fixture + FIXTURE_HEADER_BYTES +
+            (size_t) index * FIXTURE_RECORD_BYTES;
         const int layer = (int) read_u32(record);
         const int sequence = (int) read_u32(record + 4);
         if (layer != index || (sequence != 1 && sequence != 3 &&
@@ -484,7 +544,8 @@ int main(void) {
 
     {
         const uint8_t * record =
-            fixture + HEADER_BYTES + 17u * RECORD_BYTES;
+            fixture + FIXTURE_HEADER_BYTES +
+            17u * FIXTURE_RECORD_BYTES;
         const int sequence = (int) read_u32(record + 4);
         const float * query =
             (const float *) (fixture + read_u64(record + 32));
