@@ -16,8 +16,14 @@ extern const uint8_t edgekv_blockgtq_fixture_end[];
 
 enum {
     N_THREADS = 4,
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+    CASE_COUNT = 4,
+    MAX_SEQUENCE = EDGEKV_BLOCKGTQ_CAPACITY,
+    FORMAL_SAMPLES = 5,
+#else
     CASE_COUNT = 36,
     MAX_SEQUENCE = 5,
+#endif
     FIXTURE_HEADER_BYTES = 240,
     FIXTURE_RECORD_BYTES = 136,
 };
@@ -145,6 +151,37 @@ static uint64_t median3(uint64_t a, uint64_t b, uint64_t c) {
     return a > b ? a : b;
 }
 
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+static void print_attribution_sample(int sequence, const char * mode,
+                                     int sample) {
+    const struct edgekv_blockgtq_operation_attribution * attribution =
+        edgekv_blockgtq_attn_decode_last_attribution();
+    printf(
+        "ATTR: sequence=%d mode=%s sample=%d adapter=%llu total=%llu "
+        "overhead=[",
+        sequence, mode, sample,
+        (unsigned long long)
+            attribution->adapter_input_validation_pcycles,
+        (unsigned long long) attribution->operation_body_pcycles);
+    for (int index = 0;
+         index < EDGEKV_BLOCKGTQ_COUNTER_OVERHEAD_SAMPLES; ++index) {
+        printf(
+            "%s%llu", index == 0 ? "" : ",",
+            (unsigned long long)
+                attribution->counter_overhead_pcycles[index]);
+    }
+    printf("] stages=[");
+    for (int stage = 0; stage < EDGEKV_BLOCKGTQ_STAGE_COUNT; ++stage) {
+        printf(
+            "%s%s:%llu:%lu", stage == 0 ? "" : ",",
+            edgekv_blockgtq_stage_name((enum edgekv_blockgtq_stage) stage),
+            (unsigned long long) attribution->core.pcycles[stage],
+            (unsigned long) attribution->core.intervals[stage]);
+    }
+    printf("]\n");
+}
+#endif
+
 static float max_abs(const float * actual, const uint8_t * expected,
                      size_t count) {
     float maximum = 0.0f;
@@ -262,47 +299,66 @@ static int run_last_slot_address_canary(void) {
                EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
 }
 
-static int run_dense(struct htp_context * ctx, const float * query,
-                     int sequence) {
-    struct htp_tensor q_tensor = make_tensor_4d(
+struct dense_operation {
+    struct htp_tensor q;
+    struct htp_tensor k;
+    struct htp_tensor v;
+    struct htp_tensor mask;
+    struct htp_tensor output;
+    struct htp_ops_context octx;
+};
+
+static void prepare_dense_operation(struct dense_operation * operation,
+                                    struct htp_context * ctx,
+                                    const float * query, int sequence) {
+    operation->q = make_tensor_4d(
         (void *) query, EDGEKV_BLOCKGTQ_OUTPUT_FLOATS * sizeof(float),
         HTP_TYPE_F32, sizeof(float), EDGEKV_BLOCKGTQ_HEAD_DIM, 1,
         EDGEKV_BLOCKGTQ_QUERY_HEADS, 1);
-    struct htp_tensor k_tensor = make_tensor_4d(
+    operation->k = make_tensor_4d(
         dense_k,
         (uint32_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
             EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16),
         HTP_TYPE_F16, sizeof(_Float16), EDGEKV_BLOCKGTQ_HEAD_DIM, sequence,
         EDGEKV_BLOCKGTQ_KV_HEADS, 1);
-    struct htp_tensor v_tensor = make_tensor_4d(
+    operation->v = make_tensor_4d(
         dense_v,
         (uint32_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
             EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16),
         HTP_TYPE_F16, sizeof(_Float16), EDGEKV_BLOCKGTQ_HEAD_DIM, sequence,
         EDGEKV_BLOCKGTQ_KV_HEADS, 1);
-    struct htp_tensor mask_tensor = make_tensor_4d(
+    operation->mask = make_tensor_4d(
         dense_mask, (uint32_t) sequence * sizeof(_Float16), HTP_TYPE_F16,
         sizeof(_Float16), sequence, 1, 1, 1);
-    struct htp_tensor output_tensor = make_tensor_4d(
+    operation->output = make_tensor_4d(
         dense_output, sizeof(dense_output), HTP_TYPE_F32, sizeof(float),
         EDGEKV_BLOCKGTQ_HEAD_DIM, EDGEKV_BLOCKGTQ_QUERY_HEADS, 1, 1);
-    struct htp_ops_context octx;
-    memset(&octx, 0, sizeof(octx));
-    octx.ctx = ctx;
-    octx.op = HTP_OP_FLASH_ATTN_EXT;
-    octx.src[0] = &q_tensor;
-    octx.src[1] = &k_tensor;
-    octx.src[2] = &v_tensor;
-    octx.src[3] = &mask_tensor;
-    octx.dst = &output_tensor;
-    octx.n_threads = N_THREADS;
+    memset(&operation->octx, 0, sizeof(operation->octx));
+    operation->octx.ctx = ctx;
+    operation->octx.op = HTP_OP_FLASH_ATTN_EXT;
+    operation->octx.src[0] = &operation->q;
+    operation->octx.src[1] = &operation->k;
+    operation->octx.src[2] = &operation->v;
+    operation->octx.src[3] = &operation->mask;
+    operation->octx.dst = &operation->output;
+    operation->octx.n_threads = N_THREADS;
     const float scale = 0.08838834764831845f;
     const float zero = 0.0f;
-    memcpy(octx.op_params, &scale, sizeof(scale));
-    memcpy(octx.op_params + 1, &zero, sizeof(zero));
-    memcpy(octx.op_params + 2, &zero, sizeof(zero));
+    memcpy(operation->octx.op_params, &scale, sizeof(scale));
+    memcpy(operation->octx.op_params + 1, &zero, sizeof(zero));
+    memcpy(operation->octx.op_params + 2, &zero, sizeof(zero));
     memset(dense_output, 0, sizeof(dense_output));
-    return op_flash_attn_ext(&octx);
+}
+
+static int run_dense_prepared(struct dense_operation * operation) {
+    return op_flash_attn_ext(&operation->octx);
+}
+
+static int run_dense(struct htp_context * ctx, const float * query,
+                     int sequence) {
+    struct dense_operation operation;
+    prepare_dense_operation(&operation, ctx, query, sequence);
+    return run_dense_prepared(&operation);
 }
 
 int main(void) {
@@ -397,8 +453,14 @@ int main(void) {
             (size_t) index * FIXTURE_RECORD_BYTES;
         const int layer = (int) read_u32(record);
         const int sequence = (int) read_u32(record + 4);
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+        static const int attribution_sequences[CASE_COUNT] = {
+            5, 128, 512, 2048};
+        if (layer != 17 || sequence != attribution_sequences[index] ||
+#else
         if (layer != index || (sequence != 1 && sequence != 3 &&
                                sequence != 5) ||
+#endif
             read_u32(record + 16) != (uint32_t) layer * 2u ||
             read_u32(record + 20) != (uint32_t) layer * 2u + 1u) {
             printf("FAIL: case %d identity drift\n", index);
@@ -429,6 +491,9 @@ int main(void) {
         octx.src[0] = &query_tensor;
         fill_params(octx.op_params, layer, sequence);
         memset(output, 0, sizeof(output));
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+        edgekv_blockgtq_attn_decode_test_set_diagnostics(1);
+#endif
         const int status = op_edgekv_blockgtq_attn_decode(&octx);
         if (status != HTP_STATUS_OK) {
             printf("FAIL: case=%d layer=%d status=%d\n", index, layer,
@@ -496,10 +561,77 @@ int main(void) {
                    (size_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
                        EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16));
         }
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+        edgekv_blockgtq_attn_decode_test_set_diagnostics(0);
+        memset(output, 0, sizeof(output));
+        if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+            printf("FAIL: diagnostics-off parity status case=%d\n", index);
+            result = 16;
+            goto cleanup;
+        }
+        const float production_output_error = max_abs(
+            output, expected_output, EDGEKV_BLOCKGTQ_OUTPUT_FLOATS);
+        if (production_output_error > 2.0e-5f) {
+            printf(
+                "FAIL: diagnostics-off parity case=%d error=%g\n",
+                index, (double) production_output_error);
+            result = 17;
+            goto cleanup;
+        }
+
+        static const int diagnostics_modes[2] = {1, 0};
+        static const char * const mode_names[2] = {
+            "diagnostics_on", "diagnostics_off"};
+        for (int mode = 0; mode < 2; ++mode) {
+            edgekv_blockgtq_attn_decode_test_set_diagnostics(
+                diagnostics_modes[mode]);
+            if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+                printf(
+                    "FAIL: attribution warmup sequence=%d mode=%s\n",
+                    sequence, mode_names[mode]);
+                result = 18;
+                goto cleanup;
+            }
+            for (int sample = 0; sample < FORMAL_SAMPLES; ++sample) {
+                if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+                    printf(
+                        "FAIL: attribution sample sequence=%d mode=%s\n",
+                        sequence, mode_names[mode]);
+                    result = 19;
+                    goto cleanup;
+                }
+                print_attribution_sample(
+                    sequence, mode_names[mode], sample);
+            }
+        }
+        struct dense_operation dense_operation;
+        prepare_dense_operation(
+            &dense_operation, &dense_ctx, query, sequence);
+        if (run_dense_prepared(&dense_operation) != HTP_STATUS_OK) {
+            printf("FAIL: dense warmup sequence=%d\n", sequence);
+            result = 20;
+            goto cleanup;
+        }
+        for (int sample = 0; sample < FORMAL_SAMPLES; ++sample) {
+            const uint64_t start = HAP_perf_get_pcycles();
+            const int dense_status =
+                run_dense_prepared(&dense_operation);
+            const uint64_t pcycles = HAP_perf_get_pcycles() - start;
+            if (dense_status != HTP_STATUS_OK) {
+                printf("FAIL: dense sample sequence=%d\n", sequence);
+                result = 21;
+                goto cleanup;
+            }
+            printf(
+                "DENSE: sequence=%d sample=%d total=%llu\n",
+                sequence, sample, (unsigned long long) pcycles);
+        }
+#endif
     }
 
     // Fail-closed adapter checks happen after the frozen correctness matrix and
     // do not alter any scientific fixture.
+#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
     {
         int32_t saved[HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT];
         memcpy(saved, octx.op_params, sizeof(saved));
@@ -541,6 +673,7 @@ int main(void) {
         }
         octx.src[2] = &consumer_tensor;
     }
+#endif
 
     {
         const uint8_t * record =

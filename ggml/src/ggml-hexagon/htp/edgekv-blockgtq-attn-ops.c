@@ -17,8 +17,10 @@ enum {
 static uint64_t last_kernel_pcycles;
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_TEST
-static float diagnostic_logits[EDGEKV_BLOCKGTQ_QUERY_HEADS * 5];
-static float diagnostic_weights[EDGEKV_BLOCKGTQ_QUERY_HEADS * 5];
+static float diagnostic_logits[
+    EDGEKV_BLOCKGTQ_QUERY_HEADS * EDGEKV_BLOCKGTQ_CAPACITY];
+static float diagnostic_weights[
+    EDGEKV_BLOCKGTQ_QUERY_HEADS * EDGEKV_BLOCKGTQ_CAPACITY];
 static float diagnostic_denominators[EDGEKV_BLOCKGTQ_QUERY_HEADS];
 static float diagnostic_rotated_v[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS];
 static struct edgekv_blockgtq_diagnostics test_diagnostics = {
@@ -31,6 +33,25 @@ static struct edgekv_blockgtq_diagnostics test_diagnostics = {
 const struct edgekv_blockgtq_diagnostics *
 edgekv_blockgtq_attn_decode_test_diagnostics(void) {
     return &test_diagnostics;
+}
+#endif
+
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+static int test_diagnostics_enabled = 1;
+static struct edgekv_blockgtq_operation_attribution last_attribution;
+
+static uint64_t read_pcycles(void * context) {
+    (void) context;
+    return HAP_perf_get_pcycles();
+}
+
+void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled) {
+    test_diagnostics_enabled = enabled != 0;
+}
+
+const struct edgekv_blockgtq_operation_attribution *
+edgekv_blockgtq_attn_decode_last_attribution(void) {
+    return &last_attribution;
 }
 #endif
 
@@ -74,6 +95,10 @@ static int valid_params(const int32_t * p) {
 
 int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx) {
     last_kernel_pcycles = 0;
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    memset(&last_attribution, 0, sizeof(last_attribution));
+    const uint64_t adapter_start = HAP_perf_get_pcycles();
+#endif
     if (octx == NULL || octx->src[0] == NULL || octx->src[1] == NULL ||
         octx->src[2] == NULL || octx->src[3] == NULL ||
         octx->src[4] == NULL || octx->src[5] != NULL ||
@@ -110,6 +135,10 @@ int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx) {
         !hex_is_aligned((const void *) (uintptr_t) output->data, 128)) {
         return HTP_STATUS_INVAL_PARAMS;
     }
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    last_attribution.adapter_input_validation_pcycles =
+        HAP_perf_get_pcycles() - adapter_start;
+#endif
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;
     }
@@ -131,19 +160,50 @@ int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx) {
         .capacity = octx->op_params[HTP_EDGEKV_BLOCKGTQ_CAPACITY],
     };
 #ifdef HTP_EDGEKV_BLOCKGTQ_TEST
-    memset(diagnostic_logits, 0, sizeof(diagnostic_logits));
-    memset(diagnostic_weights, 0, sizeof(diagnostic_weights));
+    memset(
+        diagnostic_logits, 0,
+        (size_t) EDGEKV_BLOCKGTQ_QUERY_HEADS *
+            (size_t) inputs.sequence_length * sizeof(float));
+    memset(
+        diagnostic_weights, 0,
+        (size_t) EDGEKV_BLOCKGTQ_QUERY_HEADS *
+            (size_t) inputs.sequence_length * sizeof(float));
     memset(diagnostic_denominators, 0, sizeof(diagnostic_denominators));
     memset(diagnostic_rotated_v, 0, sizeof(diagnostic_rotated_v));
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    struct edgekv_blockgtq_diagnostics * diagnostics =
+        test_diagnostics_enabled ? &test_diagnostics : NULL;
+#else
     struct edgekv_blockgtq_diagnostics * diagnostics =
         inputs.sequence_length <= 5 ? &test_diagnostics : NULL;
+#endif
 #else
     struct edgekv_blockgtq_diagnostics * diagnostics = NULL;
 #endif
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    for (int sample = 0;
+         sample < EDGEKV_BLOCKGTQ_COUNTER_OVERHEAD_SAMPLES; ++sample) {
+        const uint64_t overhead_start = HAP_perf_get_pcycles();
+        last_attribution.counter_overhead_pcycles[sample] =
+            HAP_perf_get_pcycles() - overhead_start;
+    }
+    last_attribution.diagnostics_enabled = diagnostics != NULL;
+    last_attribution.core.clock = read_pcycles;
+    last_attribution.core.clock_context = NULL;
+#endif
     const uint64_t start = HAP_perf_get_pcycles();
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    const int status = edgekv_blockgtq_attn_decode_profiled(
+        &inputs, (float *) (uintptr_t) output->data, diagnostics,
+        &last_attribution.core);
+#else
     const int status = edgekv_blockgtq_attn_decode(
         &inputs, (float *) (uintptr_t) output->data, diagnostics);
+#endif
     last_kernel_pcycles = HAP_perf_get_pcycles() - start;
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+    last_attribution.operation_body_pcycles = last_kernel_pcycles;
+#endif
     return status == EDGEKV_BLOCKGTQ_OK ? HTP_STATUS_OK
                                        : HTP_STATUS_INVAL_PARAMS;
 }

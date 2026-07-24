@@ -66,6 +66,51 @@ struct edgekv_blockgtq_history_addresses {
     size_t v_norms;
 };
 
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+enum edgekv_blockgtq_stage {
+    EDGEKV_BLOCKGTQ_STAGE_CORE_INPUT_VALIDATION = 0,
+    EDGEKV_BLOCKGTQ_STAGE_STATIC_PACKAGE_VALIDATION,
+    EDGEKV_BLOCKGTQ_STAGE_CATALOG_CONSTRUCTION,
+    EDGEKV_BLOCKGTQ_STAGE_QUERY_ROTATION,
+    EDGEKV_BLOCKGTQ_STAGE_FIRST_K_DECODE_DOT,
+    EDGEKV_BLOCKGTQ_STAGE_DIAGNOSTICS_OFF_SECOND_K_SOFTMAX_V_FUSED,
+    EDGEKV_BLOCKGTQ_STAGE_DIAGNOSTICS_ON_LOGIT_REUSE_SOFTMAX_V_FUSED,
+    EDGEKV_BLOCKGTQ_STAGE_NORMALIZATION,
+    EDGEKV_BLOCKGTQ_STAGE_INVERSE_V_ROTATION,
+    EDGEKV_BLOCKGTQ_STAGE_COUNT,
+};
+
+typedef uint64_t (*edgekv_blockgtq_clock_fn)(void * context);
+
+struct edgekv_blockgtq_attribution {
+    edgekv_blockgtq_clock_fn clock;
+    void * clock_context;
+    uint64_t pcycles[EDGEKV_BLOCKGTQ_STAGE_COUNT];
+    uint32_t intervals[EDGEKV_BLOCKGTQ_STAGE_COUNT];
+};
+
+enum {
+    EDGEKV_BLOCKGTQ_COUNTER_OVERHEAD_SAMPLES = 33,
+};
+
+struct edgekv_blockgtq_operation_attribution {
+    uint64_t adapter_input_validation_pcycles;
+    uint64_t operation_body_pcycles;
+    uint64_t counter_overhead_pcycles[
+        EDGEKV_BLOCKGTQ_COUNTER_OVERHEAD_SAMPLES];
+    int diagnostics_enabled;
+    struct edgekv_blockgtq_attribution core;
+};
+
+const char * edgekv_blockgtq_stage_name(enum edgekv_blockgtq_stage stage);
+
+int edgekv_blockgtq_attn_decode_profiled(
+    const struct edgekv_blockgtq_inputs * inputs,
+    float * output,
+    struct edgekv_blockgtq_diagnostics * diagnostics,
+    struct edgekv_blockgtq_attribution * attribution);
+#endif
+
 int edgekv_blockgtq_history_addresses(
     int capacity, int token, int head,
     struct edgekv_blockgtq_history_addresses * addresses);

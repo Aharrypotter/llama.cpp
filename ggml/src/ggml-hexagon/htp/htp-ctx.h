@@ -117,5 +117,11 @@ struct edgekv_blockgtq_diagnostics;
 const struct edgekv_blockgtq_diagnostics *
 edgekv_blockgtq_attn_decode_test_diagnostics(void);
 #endif
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+struct edgekv_blockgtq_operation_attribution;
+void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled);
+const struct edgekv_blockgtq_operation_attribution *
+edgekv_blockgtq_attn_decode_last_attribution(void);
+#endif
 
 #endif /* HTP_CTX_H */

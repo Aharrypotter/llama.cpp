@@ -18,6 +18,7 @@ set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV reconstruct AOT
 set(GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV direct-attention AOT object")
 set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
 set(GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE "" CACHE FILEPATH "Frozen B2-T4 Block-GTQ simulator fixture")
+option(GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION "Build the B2-T4P attribution matrix" OFF)
 option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV simulator tests" OFF)
 
 add_library(${HTP_LIB} SHARED
@@ -87,7 +88,13 @@ if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
             tests/test-edgekv-blockgtq-attn.c
             PROPERTIES COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
         target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
-            HTP_EDGEKV_BLOCKGTQ_TEST=1)
+            HTP_EDGEKV_BLOCKGTQ_TEST=1
+            HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION=1
+            EDGEKV_BLOCKGTQ_ATTRIBUTION=1)
+        if (GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION)
+            target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
+                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX=1)
+        endif()
     endif()
 
     set(EDGEKV_HVX_GQA_TEST_LIB test-edgekv-hvx-gqa-block-${DSP_VERSION})

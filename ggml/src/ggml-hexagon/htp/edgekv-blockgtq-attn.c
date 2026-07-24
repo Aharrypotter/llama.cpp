@@ -7,6 +7,50 @@
 #include <stdbool.h>
 #include <string.h>
 
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+static const char * const edgekv_blockgtq_stage_names[] = {
+    "core_input_validation",
+    "static_package_validation",
+    "catalog_construction",
+    "query_rotation",
+    "first_k_decode_dot",
+    "diagnostics_off_second_k_softmax_v_fused",
+    "diagnostics_on_logit_reuse_softmax_v_fused",
+    "normalization",
+    "inverse_v_rotation",
+};
+
+_Static_assert(
+    sizeof(edgekv_blockgtq_stage_names) /
+            sizeof(edgekv_blockgtq_stage_names[0]) ==
+        EDGEKV_BLOCKGTQ_STAGE_COUNT,
+    "Block-GTQ attribution stage inventory drift");
+
+const char * edgekv_blockgtq_stage_name(enum edgekv_blockgtq_stage stage) {
+    return stage >= 0 && stage < EDGEKV_BLOCKGTQ_STAGE_COUNT
+               ? edgekv_blockgtq_stage_names[stage]
+               : NULL;
+}
+
+static uint64_t attribution_start(
+    const struct edgekv_blockgtq_attribution * attribution) {
+    return attribution != NULL && attribution->clock != NULL
+               ? attribution->clock(attribution->clock_context)
+               : 0;
+}
+
+static void attribution_stop(
+    struct edgekv_blockgtq_attribution * attribution,
+    enum edgekv_blockgtq_stage stage, uint64_t start) {
+    if (attribution == NULL || attribution->clock == NULL) {
+        return;
+    }
+    const uint64_t stop = attribution->clock(attribution->clock_context);
+    attribution->pcycles[stage] += stop - start;
+    ++attribution->intervals[stage];
+}
+#endif
+
 enum {
     TRANSFORM_K_ROTATIONS = 0,
     TRANSFORM_V_ROTATIONS = 817728,
@@ -360,10 +404,17 @@ int edgekv_blockgtq_validate_static(const uint8_t * transform,
                                   : EDGEKV_BLOCKGTQ_STATIC_LAYOUT_MISMATCH;
 }
 
-int edgekv_blockgtq_attn_decode(
+static int edgekv_blockgtq_attn_decode_impl(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
-    struct edgekv_blockgtq_diagnostics * diagnostics) {
+    struct edgekv_blockgtq_diagnostics * diagnostics
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+    , struct edgekv_blockgtq_attribution * attribution
+#endif
+    ) {
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+    uint64_t stage_start = attribution_start(attribution);
+#endif
     if (inputs == NULL || output == NULL || inputs->query == NULL ||
         inputs->history == NULL || inputs->layer_index < 0 ||
         inputs->layer_index >= EDGEKV_BLOCKGTQ_LAYERS ||
@@ -376,18 +427,35 @@ int edgekv_blockgtq_attn_decode(
         inputs->history_bytes != EDGEKV_BLOCKGTQ_DYNAMIC_BYTES) {
         return EDGEKV_BLOCKGTQ_DYNAMIC_LAYOUT_MISMATCH;
     }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+    attribution_stop(
+        attribution, EDGEKV_BLOCKGTQ_STAGE_CORE_INPUT_VALIDATION,
+        stage_start);
+    stage_start = attribution_start(attribution);
+#endif
     int status = edgekv_blockgtq_validate_static(
         inputs->transform, inputs->transform_bytes, inputs->consumer,
         inputs->consumer_bytes, inputs->shared, inputs->shared_bytes);
     if (status != EDGEKV_BLOCKGTQ_OK) {
         return status;
     }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+    attribution_stop(
+        attribution, EDGEKV_BLOCKGTQ_STAGE_STATIC_PACKAGE_VALIDATION,
+        stage_start);
+    stage_start = attribution_start(attribution);
+#endif
     size_t rotation_offsets[85];
     size_t head_lut_bases[EDGEKV_BLOCKGTQ_HEADS];
     status = build_catalogs(inputs->consumer, rotation_offsets, head_lut_bases);
     if (status != EDGEKV_BLOCKGTQ_OK) {
         return status;
     }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+    attribution_stop(
+        attribution, EDGEKV_BLOCKGTQ_STAGE_CATALOG_CONSTRUCTION,
+        stage_start);
+#endif
     const float scale = 0.08838834764831845f;
     for (int query_head = 0; query_head < EDGEKV_BLOCKGTQ_QUERY_HEADS;
          ++query_head) {
@@ -395,6 +463,9 @@ int edgekv_blockgtq_attn_decode(
         const int head = inputs->layer_index * EDGEKV_BLOCKGTQ_KV_HEADS +
                          kv_head;
         float rotated_q[EDGEKV_BLOCKGTQ_HEAD_DIM] = {0};
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        stage_start = attribution_start(attribution);
+#endif
         for (int segment = 0; segment < EDGEKV_BLOCKGTQ_MAX_SEGMENTS;
              ++segment) {
             const int start = descriptor(inputs->consumer, head, segment, 2);
@@ -425,6 +496,12 @@ int edgekv_blockgtq_attn_decode(
                 rotated_q[start + out] = value;
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        attribution_stop(
+            attribution, EDGEKV_BLOCKGTQ_STAGE_QUERY_ROTATION,
+            stage_start);
+        stage_start = attribution_start(attribution);
+#endif
 
         float maximum = -FLT_MAX;
         for (int token = 0; token < inputs->sequence_length; ++token) {
@@ -478,6 +555,12 @@ int edgekv_blockgtq_attn_decode(
                 maximum = logit;
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        attribution_stop(
+            attribution, EDGEKV_BLOCKGTQ_STAGE_FIRST_K_DECODE_DOT,
+            stage_start);
+        stage_start = attribution_start(attribution);
+#endif
 
         float denominator = 0.0f;
         float rotated_output[EDGEKV_BLOCKGTQ_HEAD_DIM] = {0};
@@ -555,6 +638,15 @@ int edgekv_blockgtq_attn_decode(
                 rotated_output[dim] += weight * lut * norm;
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        attribution_stop(
+            attribution,
+            diagnostics != NULL && diagnostics->logits != NULL
+                ? EDGEKV_BLOCKGTQ_STAGE_DIAGNOSTICS_ON_LOGIT_REUSE_SOFTMAX_V_FUSED
+                : EDGEKV_BLOCKGTQ_STAGE_DIAGNOSTICS_OFF_SECOND_K_SOFTMAX_V_FUSED,
+            stage_start);
+        stage_start = attribution_start(attribution);
+#endif
         if (!(denominator > 0.0f) || !isfinite(denominator)) {
             return EDGEKV_BLOCKGTQ_DYNAMIC_LAYOUT_MISMATCH;
         }
@@ -570,6 +662,12 @@ int edgekv_blockgtq_attn_decode(
                                 (size_t) dim] = rotated_output[dim];
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        attribution_stop(
+            attribution, EDGEKV_BLOCKGTQ_STAGE_NORMALIZATION,
+            stage_start);
+        stage_start = attribution_start(attribution);
+#endif
         const int rotation = (int) read_u16(
             inputs->consumer + CONSUMER_V_ROTATION_INDEX +
             (size_t) head * 2u);
@@ -593,6 +691,39 @@ int edgekv_blockgtq_attn_decode(
             output[(size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM +
                    (size_t) original] = value;
         }
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        attribution_stop(
+            attribution, EDGEKV_BLOCKGTQ_STAGE_INVERSE_V_ROTATION,
+            stage_start);
+#endif
     }
     return EDGEKV_BLOCKGTQ_OK;
 }
+
+int edgekv_blockgtq_attn_decode(
+    const struct edgekv_blockgtq_inputs * inputs,
+    float * output,
+    struct edgekv_blockgtq_diagnostics * diagnostics) {
+    return edgekv_blockgtq_attn_decode_impl(
+        inputs, output, diagnostics
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+        , NULL
+#endif
+    );
+}
+
+#ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
+int edgekv_blockgtq_attn_decode_profiled(
+    const struct edgekv_blockgtq_inputs * inputs,
+    float * output,
+    struct edgekv_blockgtq_diagnostics * diagnostics,
+    struct edgekv_blockgtq_attribution * attribution) {
+    if (attribution == NULL || attribution->clock == NULL) {
+        return EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
+    }
+    memset(attribution->pcycles, 0, sizeof(attribution->pcycles));
+    memset(attribution->intervals, 0, sizeof(attribution->intervals));
+    return edgekv_blockgtq_attn_decode_impl(
+        inputs, output, diagnostics, attribution);
+}
+#endif
