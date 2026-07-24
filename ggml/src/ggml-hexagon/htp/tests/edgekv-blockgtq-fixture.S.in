@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+    .section .rodata.edgekv_blockgtq_fixture,"a",@progbits
+    .balign 128
+    .global edgekv_blockgtq_fixture_start
+    .global edgekv_blockgtq_fixture_end
+edgekv_blockgtq_fixture_start:
+    .incbin "@GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE@"
+edgekv_blockgtq_fixture_end:
+    .byte 0

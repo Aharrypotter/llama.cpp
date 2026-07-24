@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include "edgekv-blockgtq-attn.h"
+#include "htp-ctx.h"
+
+#include "HAP_compute_res.h"
+#include "HAP_perf.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+extern const uint8_t edgekv_blockgtq_fixture_start[];
+extern const uint8_t edgekv_blockgtq_fixture_end[];
+
+enum {
+    N_THREADS = 4,
+    CASE_COUNT = 36,
+    MAX_SEQUENCE = 5,
+    HEADER_BYTES = 256,
+    RECORD_BYTES = 128,
+};
+
+static uint8_t history[EDGEKV_BLOCKGTQ_DYNAMIC_BYTES]
+    __attribute__((aligned(128)));
+static uint8_t mutated_consumer[EDGEKV_BLOCKGTQ_CONSUMER_BYTES]
+    __attribute__((aligned(128)));
+static float output[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS]
+    __attribute__((aligned(128)));
+static _Float16 dense_k[MAX_SEQUENCE * EDGEKV_BLOCKGTQ_KV_HEADS *
+                        EDGEKV_BLOCKGTQ_HEAD_DIM]
+    __attribute__((aligned(128)));
+static _Float16 dense_v[MAX_SEQUENCE * EDGEKV_BLOCKGTQ_KV_HEADS *
+                        EDGEKV_BLOCKGTQ_HEAD_DIM]
+    __attribute__((aligned(128)));
+static _Float16 dense_mask[MAX_SEQUENCE] __attribute__((aligned(128)));
+static float dense_output[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS]
+    __attribute__((aligned(128)));
+
+static uint32_t read_u32(const uint8_t * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
+           ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static uint64_t read_u64(const uint8_t * p) {
+    return (uint64_t) read_u32(p) | ((uint64_t) read_u32(p + 4) << 32);
+}
+
+static float read_f32(const uint8_t * p) {
+    const uint32_t bits = read_u32(p);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static struct htp_tensor make_tensor(void * data, uint32_t size,
+                                     uint16_t type) {
+    struct htp_tensor tensor;
+    memset(&tensor, 0, sizeof(tensor));
+    tensor.data = (uint32_t) (uintptr_t) data;
+    tensor.size = size;
+    tensor.type = type;
+    return tensor;
+}
+
+static struct htp_tensor make_tensor_4d(
+    void * data, uint32_t size, uint16_t type, uint32_t element_size,
+    uint32_t ne0, uint32_t ne1, uint32_t ne2, uint32_t ne3) {
+    struct htp_tensor tensor = make_tensor(data, size, type);
+    tensor.ne[0] = ne0;
+    tensor.ne[1] = ne1;
+    tensor.ne[2] = ne2;
+    tensor.ne[3] = ne3;
+    tensor.nb[0] = element_size;
+    tensor.nb[1] = tensor.nb[0] * ne0;
+    tensor.nb[2] = tensor.nb[1] * ne1;
+    tensor.nb[3] = tensor.nb[2] * ne2;
+    return tensor;
+}
+
+static int init_dense_context(struct htp_context * ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    unsigned int vtcm_size = 8 * 1024 * 1024;
+    HAP_compute_res_query_VTCM(0, &vtcm_size, NULL, NULL, NULL);
+    compute_res_attr_t attr;
+    HAP_compute_res_attr_init(&attr);
+    HAP_compute_res_attr_set_serialize(&attr, 0);
+    HAP_compute_res_attr_set_cache_mode(&attr, 1);
+    HAP_compute_res_attr_set_vtcm_param_v2(
+        &attr, vtcm_size, vtcm_size, vtcm_size);
+    ctx->vtcm_rctx = HAP_compute_res_acquire(&attr, 1000000u);
+    if (!ctx->vtcm_rctx) {
+        return 0;
+    }
+    void * vtcm_ptr = NULL;
+    if (HAP_compute_res_attr_get_vtcm_ptr_v2(
+            &attr, &vtcm_ptr, &vtcm_size) != 0) {
+        HAP_compute_res_release(ctx->vtcm_rctx);
+        ctx->vtcm_rctx = 0;
+        return 0;
+    }
+    ctx->vtcm_base = (uint8_t *) vtcm_ptr;
+    ctx->vtcm_size = vtcm_size;
+    ctx->n_threads = N_THREADS;
+    for (int i = 0; i < N_THREADS; ++i) {
+        ctx->dma[i] = dma_queue_create(128);
+        if (!ctx->dma[i]) {
+            return 0;
+        }
+    }
+    return worker_pool_init(&ctx->worker_pool, N_THREADS) == AEE_SUCCESS;
+}
+
+static void release_dense_context(struct htp_context * ctx) {
+    if (ctx->worker_pool) {
+        worker_pool_release(&ctx->worker_pool);
+    }
+    for (int i = 0; i < N_THREADS; ++i) {
+        if (ctx->dma[i]) {
+            dma_queue_delete(ctx->dma[i]);
+            ctx->dma[i] = NULL;
+        }
+    }
+    if (ctx->vtcm_rctx) {
+        HAP_compute_res_release(ctx->vtcm_rctx);
+        ctx->vtcm_rctx = 0;
+    }
+}
+
+static uint64_t median3(uint64_t a, uint64_t b, uint64_t c) {
+    if (a > b) {
+        const uint64_t temporary = a;
+        a = b;
+        b = temporary;
+    }
+    if (b > c) {
+        const uint64_t temporary = b;
+        b = c;
+        c = temporary;
+    }
+    return a > b ? a : b;
+}
+
+static float max_abs(const float * actual, const uint8_t * expected,
+                     size_t count) {
+    float maximum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        const float value = actual[i];
+        const float error = fabsf(value - read_f32(expected + i * 4));
+        if (!isfinite(value)) {
+            return INFINITY;
+        }
+        if (error > maximum) {
+            maximum = error;
+        }
+    }
+    return maximum;
+}
+
+static void scatter_append_payloads(const uint8_t * append, int layer,
+                                    int sequence) {
+    for (int token = 0; token < sequence; ++token) {
+        const uint8_t * payload = append + (size_t) token * 316u;
+        for (int kv_head = 0; kv_head < EDGEKV_BLOCKGTQ_KV_HEADS;
+             ++kv_head) {
+            const int head = layer * EDGEKV_BLOCKGTQ_KV_HEADS + kv_head;
+            const size_t k_codes_at =
+                (size_t) token * 5472u + (size_t) head * 76u;
+            const size_t k_norms_at =
+                (size_t) EDGEKV_BLOCKGTQ_CAPACITY * 5472u +
+                (size_t) token * 1152u + (size_t) head * 16u;
+            const size_t v_codes_at =
+                (size_t) EDGEKV_BLOCKGTQ_CAPACITY * (5472u + 1152u) +
+                (size_t) token * 4608u + (size_t) head * 64u;
+            const size_t v_norms_at =
+                (size_t) EDGEKV_BLOCKGTQ_CAPACITY *
+                    (5472u + 1152u + 4608u) +
+                (size_t) token * 144u + (size_t) head * 2u;
+            memcpy(history + k_codes_at, payload + (size_t) kv_head * 76u,
+                   76);
+            memcpy(history + k_norms_at,
+                   payload + 152u + (size_t) kv_head * 16u, 16);
+            memcpy(history + v_codes_at,
+                   payload + 184u + (size_t) kv_head * 64u, 64);
+            memcpy(history + v_norms_at,
+                   payload + 312u + (size_t) kv_head * 2u, 2);
+        }
+    }
+}
+
+static void fill_params(int32_t * params, int layer, int sequence) {
+    const int32_t values[HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT] = {
+        EDGEKV_BLOCKGTQ_ABI_VERSION,
+        0x7159380b,
+        (int32_t) 0x92f8aa7c,
+        layer,
+        sequence,
+        EDGEKV_BLOCKGTQ_CAPACITY,
+        EDGEKV_BLOCKGTQ_QUERY_HEADS,
+        EDGEKV_BLOCKGTQ_KV_HEADS,
+        EDGEKV_BLOCKGTQ_HEAD_DIM,
+        EDGEKV_BLOCKGTQ_GQA,
+        EDGEKV_BLOCKGTQ_LAYERS,
+        EDGEKV_BLOCKGTQ_TRANSFORM_BYTES,
+        EDGEKV_BLOCKGTQ_CONSUMER_BYTES,
+        EDGEKV_BLOCKGTQ_SHARED_BYTES,
+        EDGEKV_BLOCKGTQ_DYNAMIC_BYTES,
+    };
+    memcpy(params, values, sizeof(values));
+}
+
+static int run_dense(struct htp_context * ctx, const float * query,
+                     int sequence) {
+    struct htp_tensor q_tensor = make_tensor_4d(
+        (void *) query, EDGEKV_BLOCKGTQ_OUTPUT_FLOATS * sizeof(float),
+        HTP_TYPE_F32, sizeof(float), EDGEKV_BLOCKGTQ_HEAD_DIM, 1,
+        EDGEKV_BLOCKGTQ_QUERY_HEADS, 1);
+    struct htp_tensor k_tensor = make_tensor_4d(
+        dense_k,
+        (uint32_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
+            EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16),
+        HTP_TYPE_F16, sizeof(_Float16), EDGEKV_BLOCKGTQ_HEAD_DIM, sequence,
+        EDGEKV_BLOCKGTQ_KV_HEADS, 1);
+    struct htp_tensor v_tensor = make_tensor_4d(
+        dense_v,
+        (uint32_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
+            EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16),
+        HTP_TYPE_F16, sizeof(_Float16), EDGEKV_BLOCKGTQ_HEAD_DIM, sequence,
+        EDGEKV_BLOCKGTQ_KV_HEADS, 1);
+    struct htp_tensor mask_tensor = make_tensor_4d(
+        dense_mask, (uint32_t) sequence * sizeof(_Float16), HTP_TYPE_F16,
+        sizeof(_Float16), sequence, 1, 1, 1);
+    struct htp_tensor output_tensor = make_tensor_4d(
+        dense_output, sizeof(dense_output), HTP_TYPE_F32, sizeof(float),
+        EDGEKV_BLOCKGTQ_HEAD_DIM, EDGEKV_BLOCKGTQ_QUERY_HEADS, 1, 1);
+    struct htp_ops_context octx;
+    memset(&octx, 0, sizeof(octx));
+    octx.ctx = ctx;
+    octx.op = HTP_OP_FLASH_ATTN_EXT;
+    octx.src[0] = &q_tensor;
+    octx.src[1] = &k_tensor;
+    octx.src[2] = &v_tensor;
+    octx.src[3] = &mask_tensor;
+    octx.dst = &output_tensor;
+    octx.n_threads = N_THREADS;
+    const float scale = 0.08838834764831845f;
+    const float zero = 0.0f;
+    memcpy(octx.op_params, &scale, sizeof(scale));
+    memcpy(octx.op_params + 1, &zero, sizeof(zero));
+    memcpy(octx.op_params + 2, &zero, sizeof(zero));
+    memset(dense_output, 0, sizeof(dense_output));
+    return op_flash_attn_ext(&octx);
+}
+
+int main(void) {
+    const uint8_t * fixture = edgekv_blockgtq_fixture_start;
+    const size_t fixture_bytes =
+        (size_t) (edgekv_blockgtq_fixture_end -
+                  edgekv_blockgtq_fixture_start);
+    if (fixture_bytes < HEADER_BYTES ||
+        memcmp(fixture, "BGTQH41", 7) != 0 ||
+        read_u32(fixture + 8) != 1 ||
+        read_u32(fixture + 12) != CASE_COUNT ||
+        read_u32(fixture + 16) != EDGEKV_BLOCKGTQ_CAPACITY ||
+        read_u32(fixture + 20) != HEADER_BYTES ||
+        read_u32(fixture + 24) != RECORD_BYTES ||
+        read_u32(fixture + 28) != EDGEKV_BLOCKGTQ_TRANSFORM_BYTES ||
+        read_u32(fixture + 32) != EDGEKV_BLOCKGTQ_CONSUMER_BYTES ||
+        read_u64(fixture + 60) != fixture_bytes) {
+        printf("FAIL: fixture header or length drift\n");
+        return 1;
+    }
+    static const uint8_t expected_package_sha[4] = {0x71, 0x59, 0x38, 0x0b};
+    static const uint8_t expected_contract_sha[4] = {0x92, 0xf8, 0xaa, 0x7c};
+    if (memcmp(fixture + 68, expected_package_sha, 4) != 0 ||
+        memcmp(fixture + 100, expected_contract_sha, 4) != 0) {
+        printf("FAIL: fixture package or contract identity drift\n");
+        return 2;
+    }
+    const uint64_t transform_offset = read_u64(fixture + 36);
+    const uint64_t consumer_offset = read_u64(fixture + 44);
+    const uint64_t shared_offset = read_u64(fixture + 52);
+    if (transform_offset + EDGEKV_BLOCKGTQ_TRANSFORM_BYTES > fixture_bytes ||
+        consumer_offset + EDGEKV_BLOCKGTQ_CONSUMER_BYTES > fixture_bytes ||
+        shared_offset + EDGEKV_BLOCKGTQ_SHARED_BYTES > fixture_bytes) {
+        printf("FAIL: fixture static pool bounds drift\n");
+        return 3;
+    }
+    const uint8_t * transform = fixture + transform_offset;
+    const uint8_t * consumer = fixture + consumer_offset;
+    const uint8_t * shared = fixture + shared_offset;
+    if (edgekv_blockgtq_validate_static(
+            transform, EDGEKV_BLOCKGTQ_TRANSFORM_BYTES, consumer,
+            EDGEKV_BLOCKGTQ_CONSUMER_BYTES, shared,
+            EDGEKV_BLOCKGTQ_SHARED_BYTES) != EDGEKV_BLOCKGTQ_OK) {
+        printf("FAIL: frozen static pool validation failed\n");
+        return 4;
+    }
+
+    struct htp_context dense_ctx;
+    if (!init_dense_context(&dense_ctx)) {
+        release_dense_context(&dense_ctx);
+        printf("FAIL: dense HTP context initialization failed\n");
+        return 5;
+    }
+    struct htp_tensor query_tensor;
+    struct htp_tensor transform_tensor = make_tensor(
+        (void *) transform, EDGEKV_BLOCKGTQ_TRANSFORM_BYTES, HTP_TYPE_I8);
+    struct htp_tensor consumer_tensor = make_tensor(
+        (void *) consumer, EDGEKV_BLOCKGTQ_CONSUMER_BYTES, HTP_TYPE_I8);
+    struct htp_tensor shared_tensor = make_tensor(
+        (void *) shared, EDGEKV_BLOCKGTQ_SHARED_BYTES, HTP_TYPE_I8);
+    struct htp_tensor history_tensor = make_tensor(
+        history, EDGEKV_BLOCKGTQ_DYNAMIC_BYTES, HTP_TYPE_I8);
+    struct htp_tensor output_tensor = make_tensor(
+        output, sizeof(output), HTP_TYPE_F32);
+    struct htp_ops_context octx;
+    memset(&octx, 0, sizeof(octx));
+    octx.ctx = &dense_ctx;
+    octx.op = HTP_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE;
+    octx.src[1] = &transform_tensor;
+    octx.src[2] = &consumer_tensor;
+    octx.src[3] = &shared_tensor;
+    octx.src[4] = &history_tensor;
+    octx.dst = &output_tensor;
+    octx.n_threads = N_THREADS;
+
+    int result = 0;
+    float global_logits = 0.0f;
+    float global_weights = 0.0f;
+    float global_denominators = 0.0f;
+    float global_rotated_v = 0.0f;
+    float global_output = 0.0f;
+    for (int index = 0; index < CASE_COUNT; ++index) {
+        const uint8_t * record =
+            fixture + HEADER_BYTES + (size_t) index * RECORD_BYTES;
+        const int layer = (int) read_u32(record);
+        const int sequence = (int) read_u32(record + 4);
+        if (layer != index || (sequence != 1 && sequence != 3 &&
+                               sequence != 5) ||
+            read_u32(record + 16) != (uint32_t) layer * 2u ||
+            read_u32(record + 20) != (uint32_t) layer * 2u + 1u) {
+            printf("FAIL: case %d identity drift\n", index);
+            result = 6;
+            goto cleanup;
+        }
+        const float * query =
+            (const float *) (fixture + read_u64(record + 32));
+        const uint8_t * append = fixture + read_u64(record + 40);
+        const uint8_t * expected_logits =
+            fixture + read_u64(record + 48);
+        const uint8_t * expected_weights =
+            fixture + read_u64(record + 56);
+        const uint8_t * expected_denominators =
+            fixture + read_u64(record + 64);
+        const uint8_t * expected_rotated_v =
+            fixture + read_u64(record + 72);
+        const uint8_t * expected_output =
+            fixture + read_u64(record + 80);
+        const uint8_t * expected_dense_k =
+            fixture + read_u64(record + 88);
+        const uint8_t * expected_dense_v =
+            fixture + read_u64(record + 96);
+        scatter_append_payloads(append, layer, sequence);
+        query_tensor = make_tensor(
+            (void *) query,
+            EDGEKV_BLOCKGTQ_OUTPUT_FLOATS * sizeof(float), HTP_TYPE_F32);
+        octx.src[0] = &query_tensor;
+        fill_params(octx.op_params, layer, sequence);
+        memset(output, 0, sizeof(output));
+        const int status = op_edgekv_blockgtq_attn_decode(&octx);
+        if (status != HTP_STATUS_OK) {
+            printf("FAIL: case=%d layer=%d status=%d\n", index, layer,
+                   status);
+            result = 7;
+            goto cleanup;
+        }
+        const struct edgekv_blockgtq_diagnostics * diagnostics =
+            edgekv_blockgtq_attn_decode_test_diagnostics();
+        const float logits_error =
+            max_abs(diagnostics->logits, expected_logits,
+                    (size_t) EDGEKV_BLOCKGTQ_QUERY_HEADS * sequence);
+        const float weights_error =
+            max_abs(diagnostics->weights, expected_weights,
+                    (size_t) EDGEKV_BLOCKGTQ_QUERY_HEADS * sequence);
+        const float denominators_error =
+            max_abs(diagnostics->denominators, expected_denominators,
+                    EDGEKV_BLOCKGTQ_QUERY_HEADS);
+        const float rotated_v_error =
+            max_abs(diagnostics->rotated_v, expected_rotated_v,
+                    EDGEKV_BLOCKGTQ_OUTPUT_FLOATS);
+        const float output_error = max_abs(
+            output, expected_output, EDGEKV_BLOCKGTQ_OUTPUT_FLOATS);
+        if (logits_error > global_logits) {
+            global_logits = logits_error;
+        }
+        if (weights_error > global_weights) {
+            global_weights = weights_error;
+        }
+        if (denominators_error > global_denominators) {
+            global_denominators = denominators_error;
+        }
+        if (rotated_v_error > global_rotated_v) {
+            global_rotated_v = rotated_v_error;
+        }
+        if (output_error > global_output) {
+            global_output = output_error;
+        }
+        if (logits_error > 2.0e-5f || weights_error > 2.0e-5f ||
+            denominators_error > 2.0e-5f ||
+            rotated_v_error > 2.0e-5f || output_error > 2.0e-5f) {
+            printf("FAIL: case=%d errors=%g,%g,%g,%g,%g\n", index,
+                   (double) logits_error, (double) weights_error,
+                   (double) denominators_error, (double) rotated_v_error,
+                   (double) output_error);
+            result = 8;
+            goto cleanup;
+        }
+        printf(
+            "PASS: case=%d layer=%d sequence=%d segments=%lu/%lu "
+            "errors=%g,%g,%g,%g,%g kernel_pcycles=%llu\n",
+            index, layer, sequence,
+            (unsigned long) read_u32(record + 8),
+            (unsigned long) read_u32(record + 12), (double) logits_error,
+            (double) weights_error, (double) denominators_error,
+            (double) rotated_v_error, (double) output_error,
+            (unsigned long long)
+                edgekv_blockgtq_attn_decode_last_pcycles());
+
+        if (layer == 17) {
+            memcpy(dense_k, expected_dense_k,
+                   (size_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
+                       EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16));
+            memcpy(dense_v, expected_dense_v,
+                   (size_t) sequence * EDGEKV_BLOCKGTQ_KV_HEADS *
+                       EDGEKV_BLOCKGTQ_HEAD_DIM * sizeof(_Float16));
+        }
+    }
+
+    // Fail-closed adapter checks happen after the frozen correctness matrix and
+    // do not alter any scientific fixture.
+    {
+        int32_t saved[HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT];
+        memcpy(saved, octx.op_params, sizeof(saved));
+        octx.op_params[HTP_EDGEKV_BLOCKGTQ_ABI_VERSION] = 2;
+        if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_NO_SUPPORT) {
+            printf("FAIL: invalid ABI version accepted\n");
+            result = 9;
+            goto cleanup;
+        }
+        memcpy(octx.op_params, saved, sizeof(saved));
+        octx.src[5] = &query_tensor;
+        if (op_edgekv_blockgtq_attn_decode(&octx) !=
+            HTP_STATUS_INVAL_PARAMS) {
+            printf("FAIL: sixth/overflow input accepted\n");
+            result = 10;
+            goto cleanup;
+        }
+        octx.src[5] = NULL;
+        struct htp_tensor short_output = output_tensor;
+        short_output.size -= sizeof(float);
+        octx.dst = &short_output;
+        if (op_edgekv_blockgtq_attn_decode(&octx) !=
+            HTP_STATUS_INVAL_PARAMS) {
+            printf("FAIL: dense-history-sized output contract not rejected\n");
+            result = 11;
+            goto cleanup;
+        }
+        octx.dst = &output_tensor;
+        memcpy(mutated_consumer, consumer, sizeof(mutated_consumer));
+        mutated_consumer[133760 + 4] ^= 1u;
+        struct htp_tensor mutated_tensor = make_tensor(
+            mutated_consumer, sizeof(mutated_consumer), HTP_TYPE_I8);
+        octx.src[2] = &mutated_tensor;
+        if (op_edgekv_blockgtq_attn_decode(&octx) !=
+            HTP_STATUS_INVAL_PARAMS) {
+            printf("FAIL: semantic descriptor drift accepted\n");
+            result = 12;
+            goto cleanup;
+        }
+        octx.src[2] = &consumer_tensor;
+    }
+
+    {
+        const uint8_t * record =
+            fixture + HEADER_BYTES + 17u * RECORD_BYTES;
+        const int sequence = (int) read_u32(record + 4);
+        const float * query =
+            (const float *) (fixture + read_u64(record + 32));
+        query_tensor = make_tensor(
+            (void *) query,
+            EDGEKV_BLOCKGTQ_OUTPUT_FLOATS * sizeof(float), HTP_TYPE_F32);
+        octx.src[0] = &query_tensor;
+        fill_params(octx.op_params, 17, sequence);
+        uint64_t blockgtq_samples[3];
+        uint64_t dense_samples[3];
+        for (int sample = 0; sample < 3; ++sample) {
+            if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+                printf("FAIL: Block-GTQ Pcycles sample failed\n");
+                result = 13;
+                goto cleanup;
+            }
+            blockgtq_samples[sample] =
+                edgekv_blockgtq_attn_decode_last_pcycles();
+            const uint64_t start = HAP_perf_get_pcycles();
+            const int dense_status = run_dense(&dense_ctx, query, sequence);
+            dense_samples[sample] = HAP_perf_get_pcycles() - start;
+            if (dense_status != HTP_STATUS_OK) {
+                printf("FAIL: dense HTP Pcycles sample status=%d\n",
+                       dense_status);
+                result = 14;
+                goto cleanup;
+            }
+        }
+        const uint64_t blockgtq_median =
+            median3(blockgtq_samples[0], blockgtq_samples[1],
+                    blockgtq_samples[2]);
+        const uint64_t dense_median = median3(
+            dense_samples[0], dense_samples[1], dense_samples[2]);
+        printf(
+            "PERF: blockgtq_op raw=[%llu,%llu,%llu] median=%llu "
+            "dense_htp raw=[%llu,%llu,%llu] median=%llu ratio=%.9f "
+            "scope=operation_body_only target=v79\n",
+            (unsigned long long) blockgtq_samples[0],
+            (unsigned long long) blockgtq_samples[1],
+            (unsigned long long) blockgtq_samples[2],
+            (unsigned long long) blockgtq_median,
+            (unsigned long long) dense_samples[0],
+            (unsigned long long) dense_samples[1],
+            (unsigned long long) dense_samples[2],
+            (unsigned long long) dense_median,
+            (double) blockgtq_median / (double) dense_median);
+    }
+
+    printf(
+        "PASS: B2-T4 v79 matrix cases=36 layouts=72 groups=319 "
+        "max_errors=%g,%g,%g,%g,%g persistent_dense_history_bytes=0\n",
+        (double) global_logits, (double) global_weights,
+        (double) global_denominators, (double) global_rotated_v,
+        (double) global_output);
+
+cleanup:
+    release_dense_context(&dense_ctx);
+    return result;
+}

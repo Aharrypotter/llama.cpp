@@ -109,5 +109,13 @@ int op_solve_tri(struct htp_ops_context * octx);
 int op_edgekv_reconstruct(struct htp_ops_context * octx);
 int op_edgekv_attn_decode(struct htp_ops_context * octx);
 uint64_t edgekv_attn_decode_last_aot_pcycles(void);
+int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx);
+uint64_t edgekv_blockgtq_attn_decode_last_pcycles(void);
+
+#ifdef HTP_EDGEKV_BLOCKGTQ_TEST
+struct edgekv_blockgtq_diagnostics;
+const struct edgekv_blockgtq_diagnostics *
+edgekv_blockgtq_attn_decode_test_diagnostics(void);
+#endif
 
 #endif /* HTP_CTX_H */

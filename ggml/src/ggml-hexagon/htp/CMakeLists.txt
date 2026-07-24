@@ -17,6 +17,7 @@ set(HTP_LIB ggml-htp-${DSP_VERSION})
 set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV reconstruct AOT object")
 set(GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV direct-attention AOT object")
 set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
+set(GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE "" CACHE FILEPATH "Frozen B2-T4 Block-GTQ simulator fixture")
 option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV simulator tests" OFF)
 
 add_library(${HTP_LIB} SHARED
@@ -45,6 +46,8 @@ add_library(${HTP_LIB} SHARED
     edgekv-aot-runtime.c
     edgekv-reconstruct-ops.c
     edgekv-attn-decode-ops.c
+    edgekv-blockgtq-attn.c
+    edgekv-blockgtq-attn-ops.c
 )
 
 if (DSP_VERSION STREQUAL "v79")
@@ -60,6 +63,33 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE})
 
 if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
+    if (GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE)
+        if (NOT EXISTS "${GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE}")
+            message(FATAL_ERROR "Block-GTQ fixture does not exist: ${GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE}")
+        endif()
+        configure_file(
+            tests/edgekv-blockgtq-fixture.S.in
+            ${CMAKE_CURRENT_BINARY_DIR}/edgekv-blockgtq-fixture.S
+            @ONLY)
+        set_source_files_properties(
+            ${CMAKE_CURRENT_BINARY_DIR}/edgekv-blockgtq-fixture.S
+            PROPERTIES GENERATED TRUE)
+        set(EDGEKV_BLOCKGTQ_TEST_LIB test-edgekv-blockgtq-attn-${DSP_VERSION})
+        add_library(${EDGEKV_BLOCKGTQ_TEST_LIB} SHARED
+            tests/test-edgekv-blockgtq-attn.c
+            edgekv-blockgtq-attn.c
+            edgekv-blockgtq-attn-ops.c
+            flash-attn-ops.c
+            worker-pool.c
+            hex-dma.c
+            ${CMAKE_CURRENT_BINARY_DIR}/edgekv-blockgtq-fixture.S)
+        set_source_files_properties(
+            tests/test-edgekv-blockgtq-attn.c
+            PROPERTIES COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
+        target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
+            HTP_EDGEKV_BLOCKGTQ_TEST=1)
+    endif()
+
     set(EDGEKV_HVX_GQA_TEST_LIB test-edgekv-hvx-gqa-block-${DSP_VERSION})
     add_library(${EDGEKV_HVX_GQA_TEST_LIB} SHARED
         tests/test-edgekv-hvx-gqa-block.c
