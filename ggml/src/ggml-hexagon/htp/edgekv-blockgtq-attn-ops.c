@@ -17,10 +17,15 @@ enum {
 static uint64_t last_kernel_pcycles;
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_TEST
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
 static float diagnostic_logits[
     EDGEKV_BLOCKGTQ_QUERY_HEADS * EDGEKV_BLOCKGTQ_CAPACITY];
 static float diagnostic_weights[
     EDGEKV_BLOCKGTQ_QUERY_HEADS * EDGEKV_BLOCKGTQ_CAPACITY];
+#else
+static float diagnostic_logits[EDGEKV_BLOCKGTQ_QUERY_HEADS * 5];
+static float diagnostic_weights[EDGEKV_BLOCKGTQ_QUERY_HEADS * 5];
+#endif
 static float diagnostic_denominators[EDGEKV_BLOCKGTQ_QUERY_HEADS];
 static float diagnostic_rotated_v[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS];
 static struct edgekv_blockgtq_diagnostics test_diagnostics = {

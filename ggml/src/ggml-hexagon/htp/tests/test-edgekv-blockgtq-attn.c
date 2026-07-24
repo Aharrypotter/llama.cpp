@@ -727,8 +727,15 @@ int main(void) {
             (double) blockgtq_median / (double) dense_median);
     }
 
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+    printf(
+        "PASS: B2-T4P v79 attribution matrix cases=4 layer=17 "
+        "sequences=5,128,512,2048 modes=diagnostics_on,diagnostics_off "
+        "formal_samples=5 "
+#else
     printf(
         "PASS: B2-T4 v79 matrix cases=36 layouts=72 groups=319 "
+#endif
         "max_errors=%g,%g,%g,%g,%g persistent_dense_history_bytes=0\n",
         (double) global_logits, (double) global_weights,
         (double) global_denominators, (double) global_rotated_v,

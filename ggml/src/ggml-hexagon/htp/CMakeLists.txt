@@ -88,12 +88,12 @@ if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
             tests/test-edgekv-blockgtq-attn.c
             PROPERTIES COMPILE_OPTIONS "-fno-lto;-O3;-fno-vectorize;-fno-slp-vectorize")
         target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
-            HTP_EDGEKV_BLOCKGTQ_TEST=1
-            HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION=1
-            EDGEKV_BLOCKGTQ_ATTRIBUTION=1)
+            HTP_EDGEKV_BLOCKGTQ_TEST=1)
         if (GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION)
             target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
-                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX=1)
+                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX=1
+                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION=1
+                EDGEKV_BLOCKGTQ_ATTRIBUTION=1)
         endif()
     endif()
 
