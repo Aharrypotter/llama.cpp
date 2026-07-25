@@ -33,8 +33,10 @@ _Static_assert(FIXTURE_RECORD_BYTES == 136, "fixture record schema drift");
 
 static uint8_t history[EDGEKV_BLOCKGTQ_DYNAMIC_BYTES]
     __attribute__((aligned(128)));
+#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
 static uint8_t mutated_consumer[EDGEKV_BLOCKGTQ_CONSUMER_BYTES]
     __attribute__((aligned(128)));
+#endif
 static float output[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS]
     __attribute__((aligned(128)));
 static _Float16 dense_k[MAX_SEQUENCE * EDGEKV_BLOCKGTQ_KV_HEADS *
