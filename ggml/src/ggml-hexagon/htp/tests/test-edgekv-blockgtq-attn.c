@@ -139,6 +139,7 @@ static void release_dense_context(struct htp_context * ctx) {
     }
 }
 
+#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
 static uint64_t median3(uint64_t a, uint64_t b, uint64_t c) {
     if (a > b) {
         const uint64_t temporary = a;
@@ -152,6 +153,7 @@ static uint64_t median3(uint64_t a, uint64_t b, uint64_t c) {
     }
     return a > b ? a : b;
 }
+#endif
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
 static void print_attribution_sample(int sequence, const char * mode,
@@ -356,12 +358,14 @@ static int run_dense_prepared(struct dense_operation * operation) {
     return op_flash_attn_ext(&operation->octx);
 }
 
+#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
 static int run_dense(struct htp_context * ctx, const float * query,
                      int sequence) {
     struct dense_operation operation;
     prepare_dense_operation(&operation, ctx, query, sequence);
     return run_dense_prepared(&operation);
 }
+#endif
 
 int main(void) {
     const uint8_t * fixture = edgekv_blockgtq_fixture_start;
@@ -675,7 +679,6 @@ int main(void) {
         }
         octx.src[2] = &consumer_tensor;
     }
-#endif
 
     {
         const uint8_t * record =
@@ -728,6 +731,7 @@ int main(void) {
             (unsigned long long) dense_median,
             (double) blockgtq_median / (double) dense_median);
     }
+#endif
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
     printf(
