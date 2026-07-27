@@ -274,6 +274,61 @@ static void print_target_observability_records(
                 target->weight_bits_fnv1a64[query_head]);
     }
 }
+
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+static void print_target_logit_forensics_records(void) {
+    const struct edgekv_blockgtq_target_observability * target =
+        edgekv_blockgtq_attn_decode_test_observability();
+    for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
+        printf(
+            "EDGEKV_H4_QUERY magic=BGTQH4Q1 schema=1 "
+            "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+            "mode=diagnostics_on query_head=11 storage_head=35 "
+            "dim=%d target_rotated_query=%08lx\n",
+            dim, (unsigned long) target->rotated_query_bits[dim]);
+    }
+    for (int token = 0; token < 128; ++token) {
+        printf(
+            "EDGEKV_H4_TOKEN magic=BGTQH4T1 schema=1 "
+            "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+            "mode=diagnostics_on query_head=11 storage_head=35 token=%d "
+            "code0=%016llx code1=%016llx code2=%016llx code3=%016llx "
+            "lut0=%016llx lut1=%016llx lut2=%016llx lut3=%016llx "
+            "norm0=%08lx norm1=%08lx norm2=%08lx norm3=%08lx "
+            "dot0=%08lx dot1=%08lx dot2=%08lx dot3=%08lx "
+            "pre_scale_dot=%08lx logit=%08lx\n",
+            token,
+            (unsigned long long) target->code_fnv1a64[token][0],
+            (unsigned long long) target->code_fnv1a64[token][1],
+            (unsigned long long) target->code_fnv1a64[token][2],
+            (unsigned long long) target->code_fnv1a64[token][3],
+            (unsigned long long) target->lut_bits_fnv1a64[token][0],
+            (unsigned long long) target->lut_bits_fnv1a64[token][1],
+            (unsigned long long) target->lut_bits_fnv1a64[token][2],
+            (unsigned long long) target->lut_bits_fnv1a64[token][3],
+            (unsigned long) target->norm_bits[token][0],
+            (unsigned long) target->norm_bits[token][1],
+            (unsigned long) target->norm_bits[token][2],
+            (unsigned long) target->norm_bits[token][3],
+            (unsigned long) target->cumulative_dot_bits[token][0],
+            (unsigned long) target->cumulative_dot_bits[token][1],
+            (unsigned long) target->cumulative_dot_bits[token][2],
+            (unsigned long) target->cumulative_dot_bits[token][3],
+            (unsigned long) target->pre_scale_dot_bits[token],
+            (unsigned long) target->logit_bits[token]);
+    }
+    printf(
+        "EDGEKV_H4_SUMMARY magic=BGTQH4S1 schema=1 "
+        "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+        "mode=diagnostics_on query_head=11 storage_head=35 segments=%lu "
+        "target_max_logit=%08lx target_logits_fnv1a64=%016llx "
+        "target_denominator=%08lx\n",
+        (unsigned long) target->segment_count,
+        (unsigned long) target->maximum_logit_bits[11],
+        (unsigned long long) target->logit_bits_fnv1a64[11],
+        (unsigned long) target->denominator_bits[11]);
+}
+#endif
 #endif
 
 static void scatter_append_payloads(const uint8_t * append, int layer,
@@ -585,7 +640,10 @@ int main(void) {
             result = 7;
             goto cleanup;
         }
-#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+        print_target_logit_forensics_records();
+        continue;
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
         print_target_observability_records(
             "diagnostics_on", layer, sequence, expected_logits,
             expected_weights, expected_denominators);
@@ -827,7 +885,13 @@ int main(void) {
     }
 #endif
 
-#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+    printf(
+        "PASS: B2-T4P-H4 target logit-path forensics "
+        "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+        "mode=diagnostics_on query_head=11 storage_head=35 "
+        "query_records=128 token_records=128 summary_records=1\n");
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
     printf(
         "PASS: B2-T4P-H3 target observability profile=qwen2_5_3b_reference "
         "layer=17 sequence=128 modes=diagnostics_on,diagnostics_off "

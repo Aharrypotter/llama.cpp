@@ -109,6 +109,14 @@ static uint64_t fnv1a64_u32(uint64_t hash, uint32_t bits) {
     }
     return hash;
 }
+
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+static uint64_t fnv1a64_u8(uint64_t hash, uint8_t value) {
+    hash ^= value;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+#endif
 #endif
 
 static float half_to_float(uint16_t bits) {
@@ -515,6 +523,17 @@ static int edgekv_blockgtq_attn_decode_impl(
                 rotated_q[start + out] = value;
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+        const bool capture_logit_forensics =
+            observability != NULL && inputs->layer_index == 17 &&
+            inputs->sequence_length == 128 && query_head == 11;
+        if (capture_logit_forensics) {
+            for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
+                observability->rotated_query_bits[dim] =
+                    float_bits(rotated_q[dim]);
+            }
+        }
+#endif
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
         attribution_stop(
             attribution, EDGEKV_BLOCKGTQ_STAGE_QUERY_ROTATION,
@@ -565,8 +584,64 @@ static int edgekv_blockgtq_attn_decode_impl(
                                                lut_index * 2u));
                     dot += rotated_q[start + local] * lut * norm;
                 }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+                if (capture_logit_forensics) {
+                    observability->cumulative_dot_bits[token][segment] =
+                        float_bits(dot);
+                    observability->segment_count = (uint32_t) segment + 1u;
+                }
+#endif
             }
             const float logit = dot * scale;
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+            if (capture_logit_forensics) {
+                observability->pre_scale_dot_bits[token] = float_bits(dot);
+                observability->logit_bits[token] = float_bits(logit);
+                for (int segment = 0;
+                     segment < (int) observability->segment_count;
+                     ++segment) {
+                    const int start =
+                        descriptor(inputs->consumer, head, segment, 2);
+                    const int bits =
+                        descriptor(inputs->consumer, head, segment, 1);
+                    const int length =
+                        descriptor(inputs->consumer, head, segment, 3);
+                    const int pack_offset =
+                        descriptor(inputs->consumer, head, segment, 4);
+                    const float norm = half_to_float(
+                        read_u16(norms + (size_t) segment * 2u));
+                    uint64_t code_hash =
+                        UINT64_C(14695981039346656037);
+                    uint64_t lut_hash =
+                        UINT64_C(14695981039346656037);
+                    for (int local = 0; local < length; ++local) {
+                        const uint8_t code =
+                            packed_code(codes, pack_offset, local, bits);
+                        const int local_lut = read_i32(
+                            inputs->consumer + CONSUMER_K_LUT_OFFSET +
+                            ((size_t) head *
+                                 EDGEKV_BLOCKGTQ_HEAD_DIM +
+                             (size_t) start + (size_t) local) *
+                                4u);
+                        const size_t lut_index =
+                            head_lut_bases[head] +
+                            (size_t) local_lut + code;
+                        const float lut = half_to_float(read_u16(
+                            inputs->consumer + CONSUMER_K_LUT +
+                            lut_index * 2u));
+                        code_hash = fnv1a64_u8(code_hash, code);
+                        lut_hash =
+                            fnv1a64_u32(lut_hash, float_bits(lut));
+                    }
+                    observability->code_fnv1a64[token][segment] =
+                        code_hash;
+                    observability->lut_bits_fnv1a64[token][segment] =
+                        lut_hash;
+                    observability->norm_bits[token][segment] =
+                        float_bits(norm);
+                }
+            }
+#endif
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
             logit_bits_hash =
                 fnv1a64_u32(logit_bits_hash, float_bits(logit));
