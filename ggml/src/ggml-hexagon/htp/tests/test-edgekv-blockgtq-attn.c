@@ -203,6 +203,7 @@ static float max_abs(const float * actual, const uint8_t * expected,
 }
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+#ifndef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
 static uint64_t fnv1a64_bytes(const uint8_t * bytes, size_t count) {
     uint64_t hash = UINT64_C(14695981039346656037);
     for (size_t index = 0; index < count; ++index) {
@@ -274,6 +275,7 @@ static void print_target_observability_records(
                 target->weight_bits_fnv1a64[query_head]);
     }
 }
+#endif
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
 static void print_target_logit_forensics_records(void) {
