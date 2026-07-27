@@ -117,9 +117,17 @@ struct edgekv_blockgtq_diagnostics;
 const struct edgekv_blockgtq_diagnostics *
 edgekv_blockgtq_attn_decode_test_diagnostics(void);
 #endif
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION) || \
+    defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
+void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled);
+#endif
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+struct edgekv_blockgtq_target_observability;
+const struct edgekv_blockgtq_target_observability *
+edgekv_blockgtq_attn_decode_test_observability(void);
+#endif
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
 struct edgekv_blockgtq_operation_attribution;
-void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled);
 const struct edgekv_blockgtq_operation_attribution *
 edgekv_blockgtq_attn_decode_last_attribution(void);
 #endif

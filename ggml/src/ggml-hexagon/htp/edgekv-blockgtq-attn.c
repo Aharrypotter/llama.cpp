@@ -95,6 +95,22 @@ static float read_f32(const uint8_t * p) {
     return value;
 }
 
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+static uint32_t float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static uint64_t fnv1a64_u32(uint64_t hash, uint32_t bits) {
+    for (int byte = 0; byte < 4; ++byte) {
+        hash ^= (bits >> (byte * 8)) & 0xffu;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+#endif
+
 static float half_to_float(uint16_t bits) {
     const uint32_t sign = (uint32_t) (bits & 0x8000u) << 16;
     uint32_t exponent = (bits >> 10) & 0x1fu;
@@ -411,6 +427,9 @@ static int edgekv_blockgtq_attn_decode_impl(
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
     , struct edgekv_blockgtq_attribution * attribution
 #endif
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    , struct edgekv_blockgtq_target_observability * observability
+#endif
     ) {
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
     uint64_t stage_start = attribution_start(attribution);
@@ -555,6 +574,13 @@ static int edgekv_blockgtq_attn_decode_impl(
                 maximum = logit;
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        if (observability != NULL) {
+            observability->maximum_logit_bits[query_head] =
+                float_bits(maximum);
+        }
+        uint64_t weight_bits_hash = UINT64_C(14695981039346656037);
+#endif
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
         attribution_stop(
             attribution, EDGEKV_BLOCKGTQ_STAGE_FIRST_K_DECODE_DOT,
@@ -615,6 +641,10 @@ static int edgekv_blockgtq_attn_decode_impl(
                 logit = dot * scale;
             }
             const float weight = expf(logit - maximum);
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+            weight_bits_hash =
+                fnv1a64_u32(weight_bits_hash, float_bits(weight));
+#endif
             if (diagnostics != NULL && diagnostics->weights != NULL) {
                 diagnostics
                     ->weights[(size_t) query_head *
@@ -653,6 +683,14 @@ static int edgekv_blockgtq_attn_decode_impl(
         if (diagnostics != NULL && diagnostics->denominators != NULL) {
             diagnostics->denominators[query_head] = denominator;
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        if (observability != NULL) {
+            observability->denominator_bits[query_head] =
+                float_bits(denominator);
+            observability->weight_bits_fnv1a64[query_head] =
+                weight_bits_hash;
+        }
+#endif
         for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
             rotated_output[dim] /= denominator;
             if (diagnostics != NULL && diagnostics->rotated_v != NULL) {
@@ -703,11 +741,18 @@ static int edgekv_blockgtq_attn_decode_impl(
 int edgekv_blockgtq_attn_decode(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
-    struct edgekv_blockgtq_diagnostics * diagnostics) {
+    struct edgekv_blockgtq_diagnostics * diagnostics
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    , struct edgekv_blockgtq_target_observability * observability
+#endif
+    ) {
     return edgekv_blockgtq_attn_decode_impl(
         inputs, output, diagnostics
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
         , NULL
+#endif
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        , observability
 #endif
     );
 }
@@ -717,13 +762,21 @@ int edgekv_blockgtq_attn_decode_profiled(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
     struct edgekv_blockgtq_diagnostics * diagnostics,
-    struct edgekv_blockgtq_attribution * attribution) {
+    struct edgekv_blockgtq_attribution * attribution
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    , struct edgekv_blockgtq_target_observability * observability
+#endif
+    ) {
     if (attribution == NULL || attribution->clock == NULL) {
         return EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
     }
     memset(attribution->pcycles, 0, sizeof(attribution->pcycles));
     memset(attribution->intervals, 0, sizeof(attribution->intervals));
     return edgekv_blockgtq_attn_decode_impl(
-        inputs, output, diagnostics, attribution);
+        inputs, output, diagnostics, attribution
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        , observability
+#endif
+    );
 }
 #endif

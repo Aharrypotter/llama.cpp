@@ -17,7 +17,8 @@ enum {
 static uint64_t last_kernel_pcycles;
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_TEST
-#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION) || \
+    defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
 static float diagnostic_logits[
     EDGEKV_BLOCKGTQ_QUERY_HEADS * EDGEKV_BLOCKGTQ_CAPACITY];
 static float diagnostic_weights[
@@ -39,19 +40,32 @@ const struct edgekv_blockgtq_diagnostics *
 edgekv_blockgtq_attn_decode_test_diagnostics(void) {
     return &test_diagnostics;
 }
+
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+static struct edgekv_blockgtq_target_observability test_observability;
+
+const struct edgekv_blockgtq_target_observability *
+edgekv_blockgtq_attn_decode_test_observability(void) {
+    return &test_observability;
+}
+#endif
+#endif
+
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION) || \
+    defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
+static int test_diagnostics_enabled = 1;
+
+void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled) {
+    test_diagnostics_enabled = enabled != 0;
+}
 #endif
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
-static int test_diagnostics_enabled = 1;
 static struct edgekv_blockgtq_operation_attribution last_attribution;
 
 static uint64_t read_pcycles(void * context) {
     (void) context;
     return HAP_perf_get_pcycles();
-}
-
-void edgekv_blockgtq_attn_decode_test_set_diagnostics(int enabled) {
-    test_diagnostics_enabled = enabled != 0;
 }
 
 const struct edgekv_blockgtq_operation_attribution *
@@ -175,7 +189,11 @@ int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx) {
             (size_t) inputs.sequence_length * sizeof(float));
     memset(diagnostic_denominators, 0, sizeof(diagnostic_denominators));
     memset(diagnostic_rotated_v, 0, sizeof(diagnostic_rotated_v));
-#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    memset(&test_observability, 0, sizeof(test_observability));
+#endif
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION) || \
+    defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
     struct edgekv_blockgtq_diagnostics * diagnostics =
         test_diagnostics_enabled ? &test_diagnostics : NULL;
 #else
@@ -200,10 +218,18 @@ int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx) {
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION
     const int status = edgekv_blockgtq_attn_decode_profiled(
         &inputs, (float *) (uintptr_t) output->data, diagnostics,
-        &last_attribution.core);
+        &last_attribution.core
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        , &test_observability
+#endif
+    );
 #else
     const int status = edgekv_blockgtq_attn_decode(
-        &inputs, (float *) (uintptr_t) output->data, diagnostics);
+        &inputs, (float *) (uintptr_t) output->data, diagnostics
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        , &test_observability
+#endif
+    );
 #endif
     last_kernel_pcycles = HAP_perf_get_pcycles() - start;
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION

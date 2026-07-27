@@ -19,7 +19,13 @@ set(GGML_HEXAGON_EDGEKV_DIRECT_AOT_OBJECT "" CACHE FILEPATH "v79 EdgeKV direct-a
 set(GGML_HEXAGON_EDGEKV_RUNTIME_LIBRARY "" CACHE FILEPATH "Hexagon-MLIR async runtime archive")
 set(GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE "" CACHE FILEPATH "Frozen B2-T4 Block-GTQ simulator fixture")
 option(GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION "Build the B2-T4P attribution matrix" OFF)
+option(GGML_HEXAGON_EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY "Build the B2-T4P-H3 target observability diagnostic" OFF)
 option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "Build the v79 EdgeKV simulator tests" OFF)
+
+if (GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION AND
+    GGML_HEXAGON_EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
+    message(FATAL_ERROR "Block-GTQ attribution and target observability builds are mutually exclusive")
+endif()
 
 add_library(${HTP_LIB} SHARED
     main.c
@@ -94,6 +100,13 @@ if (DSP_VERSION STREQUAL "v79" AND GGML_HEXAGON_EDGEKV_BUILD_TESTS)
                 HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX=1
                 HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION=1
                 EDGEKV_BLOCKGTQ_ATTRIBUTION=1)
+        endif()
+        if (GGML_HEXAGON_EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
+            target_compile_definitions(${EDGEKV_BLOCKGTQ_TEST_LIB} PRIVATE
+                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX=1
+                HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION=1
+                EDGEKV_BLOCKGTQ_ATTRIBUTION=1
+                EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY=1)
         endif()
     endif()
 

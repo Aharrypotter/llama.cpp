@@ -202,6 +202,70 @@ static float max_abs(const float * actual, const uint8_t * expected,
     return maximum;
 }
 
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+static uint64_t fnv1a64_bytes(const uint8_t * bytes, size_t count) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t index = 0; index < count; ++index) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint32_t expected_maximum_bits(const uint8_t * expected_logits,
+                                      int query_head, int sequence) {
+    const uint8_t * row =
+        expected_logits +
+        (size_t) query_head * (size_t) sequence * sizeof(float);
+    float maximum = read_f32(row);
+    uint32_t maximum_bits = read_u32(row);
+    for (int token = 1; token < sequence; ++token) {
+        const uint8_t * value_bytes = row + (size_t) token * sizeof(float);
+        const float value = read_f32(value_bytes);
+        if (value > maximum) {
+            maximum = value;
+            maximum_bits = read_u32(value_bytes);
+        }
+    }
+    return maximum_bits;
+}
+
+static void print_target_observability_records(
+    const char * mode, int layer, int sequence,
+    const uint8_t * expected_logits, const uint8_t * expected_weights,
+    const uint8_t * expected_denominators) {
+    const struct edgekv_blockgtq_target_observability * target =
+        edgekv_blockgtq_attn_decode_test_observability();
+    for (int query_head = 0;
+         query_head < EDGEKV_BLOCKGTQ_QUERY_HEADS; ++query_head) {
+        const uint8_t * expected_weight_row =
+            expected_weights +
+            (size_t) query_head * (size_t) sequence * sizeof(float);
+        const uint64_t expected_weight_hash = fnv1a64_bytes(
+            expected_weight_row, (size_t) sequence * sizeof(float));
+        printf(
+            "EDGEKV_OBS magic=BGTQH3O1 schema=1 "
+            "profile=qwen2_5_3b_reference layer=%d sequence=%d "
+            "mode=%s head=%d expected_max_logit=%08lx "
+            "target_max_logit=%08lx expected_denominator=%08lx "
+            "target_denominator=%08lx "
+            "expected_weights_fnv1a64=%016llx "
+            "target_weights_fnv1a64=%016llx\n",
+            layer, sequence, mode, query_head,
+            (unsigned long) expected_maximum_bits(
+                expected_logits, query_head, sequence),
+            (unsigned long) target->maximum_logit_bits[query_head],
+            (unsigned long) read_u32(
+                expected_denominators +
+                (size_t) query_head * sizeof(float)),
+            (unsigned long) target->denominator_bits[query_head],
+            (unsigned long long) expected_weight_hash,
+            (unsigned long long)
+                target->weight_bits_fnv1a64[query_head]);
+    }
+}
+#endif
+
 static void scatter_append_payloads(const uint8_t * append, int layer,
                                     int sequence) {
     for (int token = 0; token < sequence; ++token) {
@@ -453,7 +517,11 @@ int main(void) {
     float global_denominators = 0.0f;
     float global_rotated_v = 0.0f;
     float global_output = 0.0f;
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    for (int index = 1; index < 2; ++index) {
+#else
     for (int index = 0; index < CASE_COUNT; ++index) {
+#endif
         const uint8_t * record =
             fixture + FIXTURE_HEADER_BYTES +
             (size_t) index * FIXTURE_RECORD_BYTES;
@@ -507,6 +575,22 @@ int main(void) {
             result = 7;
             goto cleanup;
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        print_target_observability_records(
+            "diagnostics_on", layer, sequence, expected_logits,
+            expected_weights, expected_denominators);
+        edgekv_blockgtq_attn_decode_test_set_diagnostics(0);
+        memset(output, 0, sizeof(output));
+        if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+            printf("FAIL: H3 diagnostics-off status\n");
+            result = 22;
+            goto cleanup;
+        }
+        print_target_observability_records(
+            "diagnostics_off", layer, sequence, expected_logits,
+            expected_weights, expected_denominators);
+        continue;
+#endif
         const struct edgekv_blockgtq_diagnostics * diagnostics =
             edgekv_blockgtq_attn_decode_test_diagnostics();
         const float logits_error =
@@ -733,6 +817,12 @@ int main(void) {
     }
 #endif
 
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    printf(
+        "PASS: B2-T4P-H3 target observability profile=qwen2_5_3b_reference "
+        "layer=17 sequence=128 modes=diagnostics_on,diagnostics_off "
+        "heads=16 records=32\n");
+#else
 #ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
     printf(
         "PASS: B2-T4P v79 attribution matrix cases=4 layer=17 "
@@ -746,6 +836,7 @@ int main(void) {
         (double) global_logits, (double) global_weights,
         (double) global_denominators, (double) global_rotated_v,
         (double) global_output);
+#endif
 
 cleanup:
     release_dense_context(&dense_ctx);

@@ -59,6 +59,14 @@ struct edgekv_blockgtq_diagnostics {
     float * rotated_v;    // [16, 128], normalized weighted accumulation
 };
 
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+struct edgekv_blockgtq_target_observability {
+    uint32_t maximum_logit_bits[EDGEKV_BLOCKGTQ_QUERY_HEADS];
+    uint32_t denominator_bits[EDGEKV_BLOCKGTQ_QUERY_HEADS];
+    uint64_t weight_bits_fnv1a64[EDGEKV_BLOCKGTQ_QUERY_HEADS];
+};
+#endif
+
 struct edgekv_blockgtq_history_addresses {
     size_t k_codes;
     size_t k_norms;
@@ -108,7 +116,11 @@ int edgekv_blockgtq_attn_decode_profiled(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
     struct edgekv_blockgtq_diagnostics * diagnostics,
-    struct edgekv_blockgtq_attribution * attribution);
+    struct edgekv_blockgtq_attribution * attribution
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    , struct edgekv_blockgtq_target_observability * observability
+#endif
+);
 #endif
 
 int edgekv_blockgtq_history_addresses(
@@ -125,6 +137,10 @@ int edgekv_blockgtq_validate_static(const uint8_t * transform,
 int edgekv_blockgtq_attn_decode(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
-    struct edgekv_blockgtq_diagnostics * diagnostics);
+    struct edgekv_blockgtq_diagnostics * diagnostics
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+    , struct edgekv_blockgtq_target_observability * observability
+#endif
+);
 
 #endif
