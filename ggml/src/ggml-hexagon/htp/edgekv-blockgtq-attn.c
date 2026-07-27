@@ -428,6 +428,63 @@ int edgekv_blockgtq_validate_static(const uint8_t * transform,
                                   : EDGEKV_BLOCKGTQ_STATIC_LAYOUT_MISMATCH;
 }
 
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+__attribute__((noinline))
+static void capture_query_rotation_forensics(
+    const struct edgekv_blockgtq_inputs * inputs,
+    const size_t rotation_offsets[85], int head, const float * rotated_q,
+    struct edgekv_blockgtq_target_observability * observability) {
+    const int segment = 0;
+    const int out = 2;
+    const int start = descriptor(inputs->consumer, head, segment, 2);
+    const int length = descriptor(inputs->consumer, head, segment, 3);
+    const int rotation = descriptor(inputs->consumer, head, segment, 6);
+    if (start != 0 || length != 22 || rotation != 34) {
+        return;
+    }
+    const size_t rotation_base = rotation_offsets[rotation];
+    volatile float separate_accumulator = 0.0f;
+    float fma_accumulator = 0.0f;
+
+    for (int in = 0; in < length; ++in) {
+        const int source_dim =
+            permutation(inputs->shared, head, start + in);
+        const float query_value =
+            inputs->query[(size_t) 11 * EDGEKV_BLOCKGTQ_HEAD_DIM +
+                          (size_t) source_dim];
+        const float rotation_value =
+            read_f32(inputs->transform + TRANSFORM_K_ROTATIONS +
+                     (rotation_base + (size_t) out * (size_t) length +
+                      (size_t) in) *
+                         4u);
+        volatile float product = query_value * rotation_value;
+        separate_accumulator = separate_accumulator + product;
+        fma_accumulator =
+            fmaf(query_value, rotation_value, fma_accumulator);
+
+        observability->h5_source_dims[in] = (uint32_t) source_dim;
+        observability->h5_query_bits[in] = float_bits(query_value);
+        observability->h5_rotation_bits[in] =
+            float_bits(rotation_value);
+        observability->h5_product_bits[in] = float_bits(product);
+        observability->h5_separate_accumulator_bits[in] =
+            float_bits(separate_accumulator);
+        observability->h5_fma_accumulator_bits[in] =
+            float_bits(fma_accumulator);
+    }
+
+    uint64_t query_hash = UINT64_C(14695981039346656037);
+    for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
+        query_hash = fnv1a64_u32(query_hash, float_bits(rotated_q[dim]));
+    }
+    observability->h5_original_query_fnv1a64 = query_hash;
+    observability->h5_original_out_bits = float_bits(rotated_q[start + out]);
+    observability->h5_separate_final_bits =
+        float_bits(separate_accumulator);
+    observability->h5_fma_final_bits = float_bits(fma_accumulator);
+}
+#endif
+
 static int edgekv_blockgtq_attn_decode_impl(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
@@ -532,6 +589,13 @@ static int edgekv_blockgtq_attn_decode_impl(
                 observability->rotated_query_bits[dim] =
                     float_bits(rotated_q[dim]);
             }
+        }
+#endif
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+        if (observability != NULL && inputs->layer_index == 17 &&
+            inputs->sequence_length == 128 && query_head == 11) {
+            capture_query_rotation_forensics(
+                inputs, rotation_offsets, head, rotated_q, observability);
         }
 #endif
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION

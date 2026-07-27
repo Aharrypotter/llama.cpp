@@ -75,6 +75,18 @@ struct edgekv_blockgtq_target_observability {
     uint32_t logit_bits[128];
     uint32_t segment_count;
 #endif
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+    uint32_t h5_source_dims[22];
+    uint32_t h5_query_bits[22];
+    uint32_t h5_rotation_bits[22];
+    uint32_t h5_product_bits[22];
+    uint32_t h5_separate_accumulator_bits[22];
+    uint32_t h5_fma_accumulator_bits[22];
+    uint64_t h5_original_query_fnv1a64;
+    uint32_t h5_original_out_bits;
+    uint32_t h5_separate_final_bits;
+    uint32_t h5_fma_final_bits;
+#endif
 };
 #endif
 

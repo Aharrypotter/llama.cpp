@@ -203,7 +203,8 @@ static float max_abs(const float * actual, const uint8_t * expected,
 }
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
-#ifndef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+#if !defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS) && \
+    !defined(EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS)
 static uint64_t fnv1a64_bytes(const uint8_t * bytes, size_t count) {
     uint64_t hash = UINT64_C(14695981039346656037);
     for (size_t index = 0; index < count; ++index) {
@@ -274,6 +275,44 @@ static void print_target_observability_records(
             (unsigned long long)
                 target->weight_bits_fnv1a64[query_head]);
     }
+}
+#endif
+
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+static void print_target_query_rotation_forensics_records(void) {
+    const struct edgekv_blockgtq_target_observability * target =
+        edgekv_blockgtq_attn_decode_test_observability();
+    for (int inner = 0; inner < 22; ++inner) {
+        printf(
+            "EDGEKV_H5_TERM magic=BGTQH5T1 schema=1 "
+            "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+            "mode=diagnostics_on query_head=11 storage_head=35 "
+            "segment=0 out=2 inner=%d source_dim=%lu query=%08lx "
+            "rotation=%08lx product=%08lx separate_acc=%08lx "
+            "fma_acc=%08lx\n",
+            inner, (unsigned long) target->h5_source_dims[inner],
+            (unsigned long) target->h5_query_bits[inner],
+            (unsigned long) target->h5_rotation_bits[inner],
+            (unsigned long) target->h5_product_bits[inner],
+            (unsigned long)
+                target->h5_separate_accumulator_bits[inner],
+            (unsigned long) target->h5_fma_accumulator_bits[inner]);
+    }
+    printf(
+        "EDGEKV_H5_SUMMARY magic=BGTQH5S1 schema=1 "
+        "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+        "mode=diagnostics_on query_head=11 storage_head=35 "
+        "segment=0 out=2 terms=22 original_query_fnv1a64=%016llx "
+        "original_out=%08lx separate_final=%08lx fma_final=%08lx "
+        "target_max_logit=%08lx target_logits_fnv1a64=%016llx "
+        "target_denominator=%08lx\n",
+        (unsigned long long) target->h5_original_query_fnv1a64,
+        (unsigned long) target->h5_original_out_bits,
+        (unsigned long) target->h5_separate_final_bits,
+        (unsigned long) target->h5_fma_final_bits,
+        (unsigned long) target->maximum_logit_bits[11],
+        (unsigned long long) target->logit_bits_fnv1a64[11],
+        (unsigned long) target->denominator_bits[11]);
 }
 #endif
 
@@ -642,7 +681,10 @@ int main(void) {
             result = 7;
             goto cleanup;
         }
-#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+        print_target_query_rotation_forensics_records();
+        continue;
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS)
         print_target_logit_forensics_records();
         continue;
 #elif defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY)
@@ -887,7 +929,13 @@ int main(void) {
     }
 #endif
 
-#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
+#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+    printf(
+        "PASS: B2-T4P-H5 query-rotation forensics "
+        "profile=qwen2_5_3b_reference layer=17 sequence=128 "
+        "mode=diagnostics_on query_head=11 storage_head=35 "
+        "segment=0 out=2 term_records=22 summary_records=1\n");
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS)
     printf(
         "PASS: B2-T4P-H4 target logit-path forensics "
         "profile=qwen2_5_3b_reference layer=17 sequence=128 "
