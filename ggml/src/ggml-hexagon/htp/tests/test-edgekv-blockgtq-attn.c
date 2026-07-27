@@ -247,7 +247,10 @@ static void print_target_observability_records(
             "EDGEKV_OBS magic=BGTQH3O1 schema=1 "
             "profile=qwen2_5_3b_reference layer=%d sequence=%d "
             "mode=%s head=%d expected_max_logit=%08lx "
-            "target_max_logit=%08lx expected_denominator=%08lx "
+            "target_max_logit=%08lx "
+            "expected_logits_fnv1a64=%016llx "
+            "target_logits_fnv1a64=%016llx "
+            "expected_denominator=%08lx "
             "target_denominator=%08lx "
             "expected_weights_fnv1a64=%016llx "
             "target_weights_fnv1a64=%016llx\n",
@@ -255,6 +258,13 @@ static void print_target_observability_records(
             (unsigned long) expected_maximum_bits(
                 expected_logits, query_head, sequence),
             (unsigned long) target->maximum_logit_bits[query_head],
+            (unsigned long long) fnv1a64_bytes(
+                expected_logits +
+                    (size_t) query_head * (size_t) sequence *
+                        sizeof(float),
+                (size_t) sequence * sizeof(float)),
+            (unsigned long long)
+                target->logit_bits_fnv1a64[query_head],
             (unsigned long) read_u32(
                 expected_denominators +
                 (size_t) query_head * sizeof(float)),

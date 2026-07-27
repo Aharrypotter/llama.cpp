@@ -62,6 +62,7 @@ struct edgekv_blockgtq_diagnostics {
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
 struct edgekv_blockgtq_target_observability {
     uint32_t maximum_logit_bits[EDGEKV_BLOCKGTQ_QUERY_HEADS];
+    uint64_t logit_bits_fnv1a64[EDGEKV_BLOCKGTQ_QUERY_HEADS];
     uint32_t denominator_bits[EDGEKV_BLOCKGTQ_QUERY_HEADS];
     uint64_t weight_bits_fnv1a64[EDGEKV_BLOCKGTQ_QUERY_HEADS];
 };

@@ -523,6 +523,9 @@ static int edgekv_blockgtq_attn_decode_impl(
 #endif
 
         float maximum = -FLT_MAX;
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        uint64_t logit_bits_hash = UINT64_C(14695981039346656037);
+#endif
         for (int token = 0; token < inputs->sequence_length; ++token) {
             const uint8_t * codes =
                 inputs->history + k_codes_offset(token, head);
@@ -564,6 +567,10 @@ static int edgekv_blockgtq_attn_decode_impl(
                 }
             }
             const float logit = dot * scale;
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+            logit_bits_hash =
+                fnv1a64_u32(logit_bits_hash, float_bits(logit));
+#endif
             if (diagnostics != NULL && diagnostics->logits != NULL) {
                 diagnostics
                     ->logits[(size_t) query_head *
@@ -578,6 +585,8 @@ static int edgekv_blockgtq_attn_decode_impl(
         if (observability != NULL) {
             observability->maximum_logit_bits[query_head] =
                 float_bits(maximum);
+            observability->logit_bits_fnv1a64[query_head] =
+                logit_bits_hash;
         }
         uint64_t weight_bits_hash = UINT64_C(14695981039346656037);
 #endif
