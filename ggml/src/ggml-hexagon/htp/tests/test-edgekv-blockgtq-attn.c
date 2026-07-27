@@ -16,16 +16,24 @@ extern const uint8_t edgekv_blockgtq_fixture_end[];
 
 enum {
     N_THREADS = 4,
-#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX) || \
+    defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
     CASE_COUNT = 4,
     MAX_SEQUENCE = EDGEKV_BLOCKGTQ_CAPACITY,
+#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
     FORMAL_SAMPLES = 5,
+#endif
 #else
     CASE_COUNT = 36,
     MAX_SEQUENCE = 5,
 #endif
     FIXTURE_HEADER_BYTES = 240,
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+    FIXTURE_RECORD_BYTES = 144,
+    H7_IDENTITY_BYTES_PER_HEAD = 40,
+#else
     FIXTURE_RECORD_BYTES = 136,
+#endif
 };
 
 _Static_assert(FIXTURE_HEADER_BYTES == 240, "fixture header schema drift");
@@ -201,6 +209,170 @@ static float max_abs(const float * actual, const uint8_t * expected,
     }
     return maximum;
 }
+
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+struct h7_mixed_metrics {
+    float max_abs;
+    float max_relative;
+    float max_ratio;
+    int finite;
+};
+
+struct h7_head_metrics {
+    struct h7_mixed_metrics weights;
+    struct h7_mixed_metrics denominator;
+    struct h7_mixed_metrics rotated_v;
+    struct h7_mixed_metrics output;
+    uint32_t denominator_ulp;
+    int gate_a;
+    int gate_b;
+    int gate_c;
+};
+
+static uint32_t float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float bits_float(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static float float32_ulp(float reference) {
+    const uint32_t bits = float_bits(fabsf(reference));
+    if ((bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000)) {
+        return INFINITY;
+    }
+    if (bits == 0) {
+        return bits_float(1);
+    }
+    return bits_float(bits + 1u) - bits_float(bits);
+}
+
+static uint32_t positive_ulp_distance(float actual, float expected) {
+    if (!(actual >= 0.0f) || !(expected >= 0.0f) ||
+        !isfinite(actual) || !isfinite(expected)) {
+        return UINT32_MAX;
+    }
+    const uint32_t actual_bits = float_bits(actual);
+    const uint32_t expected_bits = float_bits(expected);
+    return actual_bits > expected_bits ? actual_bits - expected_bits
+                                       : expected_bits - actual_bits;
+}
+
+static struct h7_mixed_metrics h7_mixed_metrics(
+    const float * actual, const uint8_t * expected, size_t count,
+    float ulp_limit, float relative_limit, float absolute_floor) {
+    struct h7_mixed_metrics metrics = {0.0f, 0.0f, 0.0f, 1};
+    for (size_t index = 0; index < count; ++index) {
+        const float candidate = actual[index];
+        const float reference = read_f32(expected + index * sizeof(float));
+        if (!isfinite(candidate) || !isfinite(reference)) {
+            metrics.finite = 0;
+            metrics.max_abs = INFINITY;
+            metrics.max_relative = INFINITY;
+            metrics.max_ratio = INFINITY;
+            return metrics;
+        }
+        const float error = fabsf(candidate - reference);
+        const float relative =
+            error / fmaxf(fabsf(reference), absolute_floor);
+        const float bound = fmaxf(
+            ulp_limit * float32_ulp(reference),
+            fmaxf(relative_limit * fabsf(reference), absolute_floor));
+        const float ratio = error / bound;
+        if (error > metrics.max_abs) {
+            metrics.max_abs = error;
+        }
+        if (relative > metrics.max_relative) {
+            metrics.max_relative = relative;
+        }
+        if (ratio > metrics.max_ratio) {
+            metrics.max_ratio = ratio;
+        }
+    }
+    return metrics;
+}
+
+static int h7_observability_equal(
+    const struct edgekv_blockgtq_target_observability * left,
+    const struct edgekv_blockgtq_target_observability * right) {
+    return memcmp(
+               left->packed_code_bits_fnv1a64,
+               right->packed_code_bits_fnv1a64,
+               sizeof(left->packed_code_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->lut_bits_fnv1a64, right->lut_bits_fnv1a64,
+               sizeof(left->lut_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->norm_bits_fnv1a64, right->norm_bits_fnv1a64,
+               sizeof(left->norm_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->maximum_logit_bits, right->maximum_logit_bits,
+               sizeof(left->maximum_logit_bits)) == 0 &&
+           memcmp(
+               left->logit_bits_fnv1a64, right->logit_bits_fnv1a64,
+               sizeof(left->logit_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->denominator_bits, right->denominator_bits,
+               sizeof(left->denominator_bits)) == 0 &&
+           memcmp(
+               left->weight_bits_fnv1a64, right->weight_bits_fnv1a64,
+               sizeof(left->weight_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->rotated_v_bits_fnv1a64,
+               right->rotated_v_bits_fnv1a64,
+               sizeof(left->rotated_v_bits_fnv1a64)) == 0 &&
+           memcmp(
+               left->output_bits_fnv1a64, right->output_bits_fnv1a64,
+               sizeof(left->output_bits_fnv1a64)) == 0;
+}
+
+static void print_h7_head(
+    int case_index, int sequence, const char * mode, int query_head,
+    const struct edgekv_blockgtq_target_observability * target,
+    const struct h7_head_metrics * metrics, int mode_parity) {
+    printf(
+        "EDGEKV_H7_HEAD schema=1 case=%d sequence=%d mode=%s "
+        "query_head=%d storage_head=%d code=%016llx lut=%016llx "
+        "norm=%016llx max=%08lx logits=%016llx weights=%016llx "
+        "denominator=%08lx rotated_v=%016llx output=%016llx "
+        "weight_abs=%.9g weight_rel=%.9g weight_ratio=%.9g "
+        "denom_abs=%.9g denom_rel=%.9g denom_ratio=%.9g denom_ulp=%lu "
+        "rotated_abs=%.9g rotated_rel=%.9g rotated_ratio=%.9g "
+        "output_abs=%.9g output_rel=%.9g output_ratio=%.9g "
+        "gate_a=%d gate_b=%d gate_c=%d mode_parity=%d\n",
+        case_index, sequence, mode, query_head,
+        34 + query_head / EDGEKV_BLOCKGTQ_GQA,
+        (unsigned long long)
+            target->packed_code_bits_fnv1a64[query_head],
+        (unsigned long long) target->lut_bits_fnv1a64[query_head],
+        (unsigned long long) target->norm_bits_fnv1a64[query_head],
+        (unsigned long) target->maximum_logit_bits[query_head],
+        (unsigned long long) target->logit_bits_fnv1a64[query_head],
+        (unsigned long long) target->weight_bits_fnv1a64[query_head],
+        (unsigned long) target->denominator_bits[query_head],
+        (unsigned long long) target->rotated_v_bits_fnv1a64[query_head],
+        (unsigned long long) target->output_bits_fnv1a64[query_head],
+        (double) metrics->weights.max_abs,
+        (double) metrics->weights.max_relative,
+        (double) metrics->weights.max_ratio,
+        (double) metrics->denominator.max_abs,
+        (double) metrics->denominator.max_relative,
+        (double) metrics->denominator.max_ratio,
+        (unsigned long) metrics->denominator_ulp,
+        (double) metrics->rotated_v.max_abs,
+        (double) metrics->rotated_v.max_relative,
+        (double) metrics->rotated_v.max_ratio,
+        (double) metrics->output.max_abs,
+        (double) metrics->output.max_relative,
+        (double) metrics->output.max_ratio,
+        metrics->gate_a, metrics->gate_b, metrics->gate_c, mode_parity);
+}
+#endif
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
 #if !defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS) && \
@@ -543,7 +715,11 @@ int main(void) {
         (size_t) (edgekv_blockgtq_fixture_end -
                   edgekv_blockgtq_fixture_start);
     if (fixture_bytes < FIXTURE_HEADER_BYTES ||
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+        memcmp(fixture, "BGTQH71", 7) != 0 ||
+#else
         memcmp(fixture, "BGTQH41", 7) != 0 ||
+#endif
         read_u32(fixture + 8) != 1 ||
         read_u32(fixture + 12) != CASE_COUNT ||
         read_u32(fixture + 16) != EDGEKV_BLOCKGTQ_CAPACITY ||
@@ -623,7 +799,8 @@ int main(void) {
     float global_denominators = 0.0f;
     float global_rotated_v = 0.0f;
     float global_output = 0.0f;
-#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+#if defined(EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY) && \
+    !defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
     for (int index = 1; index < 2; ++index) {
 #else
     for (int index = 0; index < CASE_COUNT; ++index) {
@@ -633,7 +810,8 @@ int main(void) {
             (size_t) index * FIXTURE_RECORD_BYTES;
         const int layer = (int) read_u32(record);
         const int sequence = (int) read_u32(record + 4);
-#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX) || \
+    defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
         static const int attribution_sequences[CASE_COUNT] = {
             5, 128, 512, 2048};
         if (layer != 17 || sequence != attribution_sequences[index] ||
@@ -664,6 +842,10 @@ int main(void) {
             fixture + read_u64(record + 88);
         const uint8_t * expected_dense_v =
             fixture + read_u64(record + 96);
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+        const uint8_t * expected_identity =
+            fixture + read_u64(record + 104);
+#endif
         scatter_append_payloads(append, layer, sequence);
         query_tensor = make_tensor(
             (void *) query,
@@ -671,7 +853,8 @@ int main(void) {
         octx.src[0] = &query_tensor;
         fill_params(octx.op_params, layer, sequence);
         memset(output, 0, sizeof(output));
-#ifdef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+#if defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX) || \
+    defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
         edgekv_blockgtq_attn_decode_test_set_diagnostics(1);
 #endif
         const int status = op_edgekv_blockgtq_attn_decode(&octx);
@@ -681,7 +864,141 @@ int main(void) {
             result = 7;
             goto cleanup;
         }
-#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+        if (read_u64(record + 104) +
+                (uint64_t) EDGEKV_BLOCKGTQ_QUERY_HEADS *
+                    H7_IDENTITY_BYTES_PER_HEAD >
+            fixture_bytes) {
+            printf("FAIL: H7 identity bounds case=%d\n", index);
+            result = 23;
+            goto cleanup;
+        }
+        const struct edgekv_blockgtq_diagnostics * h7_diagnostics =
+            edgekv_blockgtq_attn_decode_test_diagnostics();
+        const struct edgekv_blockgtq_target_observability *
+            on_observability =
+                edgekv_blockgtq_attn_decode_test_observability();
+        struct edgekv_blockgtq_target_observability on_copy =
+            *on_observability;
+        struct h7_head_metrics on_metrics[EDGEKV_BLOCKGTQ_QUERY_HEADS];
+        int all_on_gates = 1;
+        for (int query_head = 0;
+             query_head < EDGEKV_BLOCKGTQ_QUERY_HEADS; ++query_head) {
+            const uint8_t * identity =
+                expected_identity +
+                (size_t) query_head * H7_IDENTITY_BYTES_PER_HEAD;
+            struct h7_head_metrics * metrics = &on_metrics[query_head];
+            memset(metrics, 0, sizeof(*metrics));
+            metrics->weights = h7_mixed_metrics(
+                h7_diagnostics->weights +
+                    (size_t) query_head * (size_t) sequence,
+                expected_weights +
+                    (size_t) query_head * (size_t) sequence *
+                        sizeof(float),
+                (size_t) sequence, 8.0f, 0x1p-20f, 0x1p-21f);
+            metrics->denominator = h7_mixed_metrics(
+                h7_diagnostics->denominators + query_head,
+                expected_denominators +
+                    (size_t) query_head * sizeof(float),
+                1, 8.0f, 0x1p-20f, 0x1p-21f);
+            metrics->rotated_v = h7_mixed_metrics(
+                h7_diagnostics->rotated_v +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM,
+                expected_rotated_v +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM *
+                        sizeof(float),
+                EDGEKV_BLOCKGTQ_HEAD_DIM, 16.0f, 2.0e-5f, 2.0e-5f);
+            metrics->output = h7_mixed_metrics(
+                output +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM,
+                expected_output +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM *
+                        sizeof(float),
+                EDGEKV_BLOCKGTQ_HEAD_DIM, 16.0f, 2.0e-5f, 2.0e-5f);
+            metrics->denominator_ulp = positive_ulp_distance(
+                h7_diagnostics->denominators[query_head],
+                read_f32(
+                    expected_denominators +
+                    (size_t) query_head * sizeof(float)));
+            metrics->gate_a =
+                on_copy.packed_code_bits_fnv1a64[query_head] ==
+                    read_u64(identity) &&
+                on_copy.lut_bits_fnv1a64[query_head] ==
+                    read_u64(identity + 8) &&
+                on_copy.norm_bits_fnv1a64[query_head] ==
+                    read_u64(identity + 16) &&
+                on_copy.maximum_logit_bits[query_head] ==
+                    read_u32(identity + 24) &&
+                on_copy.logit_bits_fnv1a64[query_head] ==
+                    read_u64(identity + 32);
+            metrics->gate_b =
+                metrics->weights.finite &&
+                metrics->weights.max_ratio <= 1.0f &&
+                metrics->denominator.finite &&
+                metrics->denominator.max_ratio <= 1.0f &&
+                metrics->denominator_ulp <= 16u;
+            metrics->gate_c =
+                metrics->rotated_v.finite &&
+                metrics->rotated_v.max_ratio <= 1.0f &&
+                metrics->output.finite &&
+                metrics->output.max_ratio <= 1.0f;
+            all_on_gates &=
+                metrics->gate_a && metrics->gate_b && metrics->gate_c;
+            print_h7_head(
+                index, sequence, "diagnostics_on", query_head, &on_copy,
+                metrics, 1);
+        }
+
+        edgekv_blockgtq_attn_decode_test_set_diagnostics(0);
+        memset(output, 0, sizeof(output));
+        if (op_edgekv_blockgtq_attn_decode(&octx) != HTP_STATUS_OK) {
+            printf("FAIL: H7 diagnostics-off status case=%d\n", index);
+            result = 24;
+            goto cleanup;
+        }
+        const struct edgekv_blockgtq_target_observability *
+            off_observability =
+                edgekv_blockgtq_attn_decode_test_observability();
+        const int mode_parity =
+            h7_observability_equal(&on_copy, off_observability);
+        int all_off_gates = mode_parity;
+        for (int query_head = 0;
+             query_head < EDGEKV_BLOCKGTQ_QUERY_HEADS; ++query_head) {
+            struct h7_head_metrics metrics = on_metrics[query_head];
+            metrics.output = h7_mixed_metrics(
+                output +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM,
+                expected_output +
+                    (size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM *
+                        sizeof(float),
+                EDGEKV_BLOCKGTQ_HEAD_DIM, 16.0f, 2.0e-5f, 2.0e-5f);
+            metrics.gate_a &= mode_parity;
+            metrics.gate_b &= mode_parity;
+            metrics.gate_c =
+                mode_parity && metrics.output.finite &&
+                metrics.output.max_ratio <= 1.0f;
+            all_off_gates &=
+                metrics.gate_a && metrics.gate_b && metrics.gate_c;
+            print_h7_head(
+                index, sequence, "diagnostics_off", query_head,
+                off_observability, &metrics, mode_parity);
+        }
+        if (!all_on_gates || !all_off_gates) {
+            printf(
+                "FAIL: H7 layered gate case=%d sequence=%d "
+                "on=%d off=%d mode_parity=%d\n",
+                index, sequence, all_on_gates, all_off_gates,
+                mode_parity);
+            result = 25;
+            goto cleanup;
+        }
+        printf(
+            "EDGEKV_H7_CASE schema=1 case=%d layer=17 sequence=%d "
+            "heads=16 modes=2 gate_a=1 gate_b=1 gate_c=1 "
+            "mode_parity=1\n",
+            index, sequence);
+        continue;
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS)
         print_target_query_rotation_forensics_records();
         continue;
 #elif defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS)
@@ -929,7 +1246,13 @@ int main(void) {
     }
 #endif
 
-#ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+    printf(
+        "PASS: B2-T4P-H7 cross-libm matrix cases=4 layer=17 "
+        "sequences=5,128,512,2048 modes=diagnostics_on,diagnostics_off "
+        "heads=16 records=128 gate_a=bit_exact gate_b=mixed_cross_libm "
+        "gate_c=representation_output\n");
+#elif defined(EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS)
     printf(
         "PASS: B2-T4P-H5 query-rotation forensics "
         "profile=qwen2_5_3b_reference layer=17 sequence=128 "

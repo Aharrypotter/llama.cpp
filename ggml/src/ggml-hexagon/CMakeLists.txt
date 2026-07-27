@@ -26,6 +26,7 @@ option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
 option(GGML_HEXAGON_FA_EXP2_HF "ggml-hexagon: use FP16 exp2 polynomial in FA softmax instead of F32 exp round-trip" OFF)
 option(GGML_HEXAGON_EDGEKV_BUILD_TESTS "ggml-hexagon: build the v79 EdgeKV simulator tests" OFF)
 option(GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION "ggml-hexagon: build the B2-T4P attribution matrix" OFF)
+option(GGML_HEXAGON_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX "ggml-hexagon: build the B2-T4P-H7 cross-libm correctness matrix" OFF)
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml-hexagon: quantize group size (32, 64, or 128)")
 set(GGML_HEXAGON_EDGEKV_AOT_OBJECT "" CACHE FILEPATH "ggml-hexagon: v79 EdgeKV reconstruct AOT object")
@@ -100,6 +101,7 @@ function(build_htp_skel V)
             -DGGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE:FILEPATH=${GGML_HEXAGON_EDGEKV_BLOCKGTQ_FIXTURE}
             -DGGML_HEXAGON_EDGEKV_BUILD_TESTS=${GGML_HEXAGON_EDGEKV_BUILD_TESTS}
             -DGGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION=${GGML_HEXAGON_EDGEKV_BLOCKGTQ_ATTRIBUTION}
+            -DGGML_HEXAGON_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX=${GGML_HEXAGON_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX}
             -DDSP_VERSION=${V}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)

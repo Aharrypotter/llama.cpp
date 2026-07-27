@@ -110,12 +110,13 @@ static uint64_t fnv1a64_u32(uint64_t hash, uint32_t bits) {
     return hash;
 }
 
-#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
 static uint64_t fnv1a64_u8(uint64_t hash, uint8_t value) {
     hash ^= value;
     hash *= UINT64_C(1099511628211);
     return hash;
 }
+
+#ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
 #endif
 #endif
 
@@ -566,16 +567,18 @@ static int edgekv_blockgtq_attn_decode_impl(
                 for (int in = 0; in < length; ++in) {
                     const int source_dim =
                         permutation(inputs->shared, head, start + in);
-                    value +=
+                    const float query_value =
                         inputs->query[(size_t) query_head *
                                           EDGEKV_BLOCKGTQ_HEAD_DIM +
-                                      (size_t) source_dim] *
+                                      (size_t) source_dim];
+                    const float rotation_value =
                         read_f32(inputs->transform +
                                  TRANSFORM_K_ROTATIONS +
                                  (rotation_base +
                                   (size_t) out * (size_t) length +
                                   (size_t) in) *
                                      4u);
+                    value = fmaf(query_value, rotation_value, value);
                 }
                 rotated_q[start + out] = value;
             }
@@ -607,6 +610,10 @@ static int edgekv_blockgtq_attn_decode_impl(
 
         float maximum = -FLT_MAX;
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        uint64_t packed_code_bits_hash =
+            UINT64_C(14695981039346656037);
+        uint64_t lut_bits_hash = UINT64_C(14695981039346656037);
+        uint64_t norm_bits_hash = UINT64_C(14695981039346656037);
         uint64_t logit_bits_hash = UINT64_C(14695981039346656037);
 #endif
         for (int token = 0; token < inputs->sequence_length; ++token) {
@@ -615,6 +622,13 @@ static int edgekv_blockgtq_attn_decode_impl(
             const uint8_t * norms =
                 inputs->history +
                 k_norms_offset(inputs->capacity, token, head);
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+            for (int packed = 0; packed < EDGEKV_BLOCKGTQ_K_CODE_STRIDE;
+                 ++packed) {
+                packed_code_bits_hash =
+                    fnv1a64_u8(packed_code_bits_hash, codes[packed]);
+            }
+#endif
             float dot = 0.0f;
             for (int segment = 0;
                  segment < EDGEKV_BLOCKGTQ_MAX_SEGMENTS; ++segment) {
@@ -631,6 +645,10 @@ static int edgekv_blockgtq_attn_decode_impl(
                     descriptor(inputs->consumer, head, segment, 4);
                 const float norm =
                     half_to_float(read_u16(norms + (size_t) segment * 2u));
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+                norm_bits_hash =
+                    fnv1a64_u32(norm_bits_hash, float_bits(norm));
+#endif
                 for (int local = 0; local < length; ++local) {
                     const uint8_t code =
                         packed_code(codes, pack_offset, local, bits);
@@ -646,7 +664,13 @@ static int edgekv_blockgtq_attn_decode_impl(
                         half_to_float(read_u16(inputs->consumer +
                                                CONSUMER_K_LUT +
                                                lut_index * 2u));
-                    dot += rotated_q[start + local] * lut * norm;
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+                    lut_bits_hash =
+                        fnv1a64_u32(lut_bits_hash, float_bits(lut));
+#endif
+                    const float first_product =
+                        rotated_q[start + local] * lut;
+                    dot = fmaf(first_product, norm, dot);
                 }
 #ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
                 if (capture_logit_forensics) {
@@ -722,6 +746,12 @@ static int edgekv_blockgtq_attn_decode_impl(
         }
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
         if (observability != NULL) {
+            observability->packed_code_bits_fnv1a64[query_head] =
+                packed_code_bits_hash;
+            observability->lut_bits_fnv1a64[query_head] =
+                lut_bits_hash;
+            observability->norm_bits_fnv1a64[query_head] =
+                norm_bits_hash;
             observability->maximum_logit_bits[query_head] =
                 float_bits(maximum);
             observability->logit_bits_fnv1a64[query_head] =
@@ -783,7 +813,9 @@ static int edgekv_blockgtq_attn_decode_impl(
                         const float lut = half_to_float(read_u16(
                             inputs->consumer + CONSUMER_K_LUT +
                             lut_index * 2u));
-                        dot += rotated_q[start + local] * lut * norm;
+                        const float first_product =
+                            rotated_q[start + local] * lut;
+                        dot = fmaf(first_product, norm, dot);
                     }
                 }
                 logit = dot * scale;
@@ -848,6 +880,17 @@ static int edgekv_blockgtq_attn_decode_impl(
                                 (size_t) dim] = rotated_output[dim];
             }
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        if (observability != NULL) {
+            uint64_t rotated_v_hash = UINT64_C(14695981039346656037);
+            for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
+                rotated_v_hash = fnv1a64_u32(
+                    rotated_v_hash, float_bits(rotated_output[dim]));
+            }
+            observability->rotated_v_bits_fnv1a64[query_head] =
+                rotated_v_hash;
+        }
+#endif
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
         attribution_stop(
             attribution, EDGEKV_BLOCKGTQ_STAGE_NORMALIZATION,
@@ -877,6 +920,20 @@ static int edgekv_blockgtq_attn_decode_impl(
             output[(size_t) query_head * EDGEKV_BLOCKGTQ_HEAD_DIM +
                    (size_t) original] = value;
         }
+#ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+        if (observability != NULL) {
+            uint64_t output_hash = UINT64_C(14695981039346656037);
+            for (int dim = 0; dim < EDGEKV_BLOCKGTQ_HEAD_DIM; ++dim) {
+                output_hash = fnv1a64_u32(
+                    output_hash,
+                    float_bits(
+                        output[(size_t) query_head *
+                                   EDGEKV_BLOCKGTQ_HEAD_DIM +
+                               (size_t) dim]));
+            }
+            observability->output_bits_fnv1a64[query_head] = output_hash;
+        }
+#endif
 #ifdef EDGEKV_BLOCKGTQ_ATTRIBUTION
         attribution_stop(
             attribution, EDGEKV_BLOCKGTQ_STAGE_INVERSE_V_ROTATION,
