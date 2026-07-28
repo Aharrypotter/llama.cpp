@@ -350,9 +350,35 @@ llama_context::llama_context(
                     "WHLR-KV or BlockSVD cache transforms");
             }
 
+            ggml_backend_t blockgtq_backend = backend_cpu;
+            if (const char * requested_backend =
+                    getenv("LLAMA_EDGEKV_BLOCKGTQ_BACKEND")) {
+                blockgtq_backend = nullptr;
+                for (const auto & candidate : backends) {
+                    ggml_backend_t backend = candidate.get();
+                    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+                    const char * backend_name = ggml_backend_name(backend);
+                    const char * device_name =
+                        device ? ggml_backend_dev_name(device) : nullptr;
+                    if ((backend_name &&
+                         strcmp(backend_name, requested_backend) == 0) ||
+                        (device_name &&
+                         strcmp(device_name, requested_backend) == 0)) {
+                        blockgtq_backend = backend;
+                        break;
+                    }
+                }
+                if (!blockgtq_backend) {
+                    throw std::runtime_error(
+                        "LLAMA_EDGEKV_BLOCKGTQ_BACKEND requested unavailable "
+                        "backend: " +
+                        std::string(requested_backend));
+                }
+            }
+
             std::string error;
             kv_blockgtq = llama_kv_blockgtq_runtime::create(
-                package_path, backend_cpu, &error);
+                package_path, blockgtq_backend, &error);
             if (!kv_blockgtq) {
                 throw std::runtime_error(
                     "failed to initialize frozen Block-GTQ runtime: " + error);
@@ -361,7 +387,7 @@ llama_context::llama_context(
                 "%s: experimental Block-GTQ runtime enabled "
                 "(package=%s, capacity=%d, backend=%s)\n",
                 __func__, package_path, LLAMA_KV_BLOCKGTQ_CAPACITY,
-                ggml_backend_name(backend_cpu));
+                ggml_backend_name(blockgtq_backend));
         }
 #endif
 
@@ -1357,6 +1383,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 ||
             !ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id) {
             return reject("only non-empty single-sequence decoder graphs are supported");
+        }
+        if (kv_blockgtq->backend() != backend_cpu && ubatch.n_tokens != 1) {
+            return reject(
+                "non-CPU Block-GTQ backend requires single-token decode; "
+                "batched producer placement is not implemented");
         }
         const int32_t token_start = ubatch.pos[0];
         for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {

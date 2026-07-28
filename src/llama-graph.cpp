@@ -2648,7 +2648,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 blockgtq->consumer(),
                 blockgtq->shared(),
                 &pack_params);
-            ggml_backend_sched_set_tensor_backend(sched, current, blockgtq->backend());
+            ggml_backend_sched_set_tensor_backend(sched, current, backend_cpu);
             ggml_format_name(current, "edgekv_blockgtq_pack_token-%d", il);
             cb(current, "edgekv_blockgtq_pack_token", il);
 
