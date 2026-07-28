@@ -661,6 +661,19 @@ void llama_context::sched_reserve() {
         cparams.auto_fa = false;
     }
 
+#ifdef LLAMA_KV_BLOCKGTQ
+    if (kv_blockgtq && cparams.auto_fgdn) {
+        // Block-GTQ owns the complete Qwen2 attention state and only exposes
+        // single-token microbatches. The generic fused-GDN capability probe
+        // builds a synthetic 16-token graph even for architectures without
+        // GDN, which would require the dense KV memory that Block-GTQ replaces.
+        cparams.auto_fgdn    = false;
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+        LLAMA_LOG_INFO("%s: Block-GTQ runtime skips fused Gated Delta Net probes\n", __func__);
+    }
+#endif
+
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 

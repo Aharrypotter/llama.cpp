@@ -25,6 +25,7 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
 #ifdef LLAMA_KV_BLOCKGTQ
@@ -2737,6 +2738,12 @@ ggml_tensor * llm_graph_context::build_attn(
         cb(committed, "edgekv_blockgtq_pack_batch", il);
         input->add_batch(committed);
         ggml_build_forward_expand(gf, committed);
+
+        if (!mctx_cur) {
+            throw std::runtime_error(
+                "Block-GTQ batched attention requires dense KV memory; "
+                "the compressed-only memory adapter supports single-token microbatches");
+        }
     }
 #endif
 
