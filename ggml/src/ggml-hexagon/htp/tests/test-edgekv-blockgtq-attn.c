@@ -379,6 +379,7 @@ static void print_h7_head(
 #endif
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_OBSERVABILITY
+#ifndef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
 #if !defined(EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS) && \
     !defined(EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS)
 static uint64_t fnv1a64_bytes(const uint8_t * bytes, size_t count) {
@@ -452,6 +453,7 @@ static void print_target_observability_records(
                 target->weight_bits_fnv1a64[query_head]);
     }
 }
+#endif
 #endif
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
