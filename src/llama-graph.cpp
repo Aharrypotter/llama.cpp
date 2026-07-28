@@ -844,13 +844,15 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    if (!blockgtq_direct) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    // When chunked attention replaces all standard attention ops, the mask tensor
-    // is unused and the allocator skips it — don't try to fill a null buffer.
-    if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        // When chunked attention replaces all standard attention ops, the mask tensor
+        // is unused and the allocator skips it — don't try to fill a null buffer.
+        if (self_kq_mask && self_kq_mask->buffer) {
+            mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        }
     }
 
     if (self_k_rot) {
@@ -2631,6 +2633,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
         auto * input = blockgtq_graph_input(res, blockgtq);
         if (n_tokens == 1) {
+            inp->blockgtq_direct = true;
             const ggml_edgekv_blockgtq_pack_token_params pack_params = {
                 /* .abi_version = */ 2,
                 /* .layer_index = */ il,
