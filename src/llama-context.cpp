@@ -1351,8 +1351,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return static_cast<llm_graph_result *>(nullptr);
         };
+        // n_seqs counts sequence sets, so split_simple reports one set per
+        // token even when every token belongs to the same sequence.
         if (gtype != LLM_GRAPH_TYPE_DEFAULT || ubatch.n_tokens == 0 ||
-            ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 ||
+            ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 ||
             !ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id) {
             return reject("only non-empty single-sequence decoder graphs are supported");
         }
