@@ -57,9 +57,11 @@ static _Float16 dense_k[MAX_SEQUENCE * EDGEKV_BLOCKGTQ_KV_HEADS *
 static _Float16 dense_v[MAX_SEQUENCE * EDGEKV_BLOCKGTQ_KV_HEADS *
                         EDGEKV_BLOCKGTQ_HEAD_DIM]
     __attribute__((aligned(128)));
+#ifndef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
 static _Float16 dense_mask[MAX_SEQUENCE] __attribute__((aligned(128)));
 static float dense_output[EDGEKV_BLOCKGTQ_OUTPUT_FLOATS]
     __attribute__((aligned(128)));
+#endif
 
 static uint32_t read_u32(const uint8_t * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
@@ -87,6 +89,7 @@ static struct htp_tensor make_tensor(void * data, uint32_t size,
     return tensor;
 }
 
+#ifndef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
 static struct htp_tensor make_tensor_4d(
     void * data, uint32_t size, uint16_t type, uint32_t element_size,
     uint32_t ne0, uint32_t ne1, uint32_t ne2, uint32_t ne3) {
@@ -101,6 +104,7 @@ static struct htp_tensor make_tensor_4d(
     tensor.nb[3] = tensor.nb[2] * ne2;
     return tensor;
 }
+#endif
 
 static int init_dense_context(struct htp_context * ctx) {
     memset(ctx, 0, sizeof(*ctx));
