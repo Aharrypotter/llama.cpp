@@ -3338,17 +3338,23 @@ static bool ggml_hexagon_supported_edgekv_blockgtq_attn_decode(
         op->op_params[HTP_EDGEKV_BLOCKGTQ_SEQUENCE_LENGTH] > 2048) {
         return false;
     }
-    static const enum ggml_type expected_types[GGML_MAX_SRC] = {
+    static_assert(HTP_OP_MAX_INPUTS == 6);
+    static const enum ggml_type expected_types[HTP_OP_MAX_INPUTS] = {
         GGML_TYPE_F32, GGML_TYPE_I8, GGML_TYPE_I8,
         GGML_TYPE_I8, GGML_TYPE_I8, GGML_TYPE_I8,
     };
-    static const size_t expected_bytes[GGML_MAX_SRC] = {
+    static const size_t expected_bytes[HTP_OP_MAX_INPUTS] = {
         8192, 958144, 143168, 23616, 23298048, 316,
     };
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+    for (int i = 0; i < HTP_OP_MAX_INPUTS; ++i) {
         if (!op->src[i] || op->src[i]->type != expected_types[i] ||
             ggml_nbytes(op->src[i]) != expected_bytes[i] ||
             !ggml_is_contiguous(op->src[i])) {
+            return false;
+        }
+    }
+    for (int i = HTP_OP_MAX_INPUTS; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] != nullptr) {
             return false;
         }
     }
