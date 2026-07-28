@@ -1199,6 +1199,7 @@ int main(void) {
         octx.src[2] = &consumer_tensor;
     }
 
+#ifndef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
     {
         const uint8_t * record =
             fixture + FIXTURE_HEADER_BYTES +
@@ -1250,6 +1251,7 @@ int main(void) {
             (unsigned long long) dense_median,
             (double) blockgtq_median / (double) dense_median);
     }
+#endif
 #endif
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
