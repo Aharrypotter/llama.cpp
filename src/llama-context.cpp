@@ -1493,6 +1493,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 #ifdef LLAMA_KV_BLOCKGTQ
     if (kv_blockgtq) {
         kv_blockgtq->finish();
+        bool & logged =
+            ubatch.n_tokens == 1
+                ? kv_blockgtq_logged_decode
+                : kv_blockgtq_logged_prefill;
+        if (!logged) {
+            LLAMA_LOG_INFO(
+                "%s: Block-GTQ %s graph completed "
+                "(token_start=%d, token_count=%u, sequence_length=%d)\n",
+                __func__,
+                ubatch.n_tokens == 1 ? "direct-decode" : "prefill-append",
+                ubatch.pos[0],
+                ubatch.n_tokens,
+                kv_blockgtq->sequence_length());
+            logged = true;
+        }
     }
 #endif
 
