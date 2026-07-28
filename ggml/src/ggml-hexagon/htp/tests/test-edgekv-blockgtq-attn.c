@@ -37,7 +37,11 @@ enum {
 };
 
 _Static_assert(FIXTURE_HEADER_BYTES == 240, "fixture header schema drift");
+#ifdef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
+_Static_assert(FIXTURE_RECORD_BYTES == 144, "H7 fixture record schema drift");
+#else
 _Static_assert(FIXTURE_RECORD_BYTES == 136, "fixture record schema drift");
+#endif
 
 static uint8_t history[EDGEKV_BLOCKGTQ_DYNAMIC_BYTES]
     __attribute__((aligned(128)));
