@@ -723,7 +723,7 @@ static int edgekv_blockgtq_attn_decode_impl(
                     }
                     observability->code_fnv1a64[token][segment] =
                         code_hash;
-                    observability->lut_bits_fnv1a64[token][segment] =
+                    observability->segment_lut_bits_fnv1a64[token][segment] =
                         lut_hash;
                     observability->norm_bits[token][segment] =
                         float_bits(norm);

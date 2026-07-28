@@ -73,7 +73,7 @@ struct edgekv_blockgtq_target_observability {
 #ifdef EDGEKV_BLOCKGTQ_TARGET_LOGIT_FORENSICS
     uint32_t rotated_query_bits[EDGEKV_BLOCKGTQ_HEAD_DIM];
     uint64_t code_fnv1a64[128][4];
-    uint64_t lut_bits_fnv1a64[128][4];
+    uint64_t segment_lut_bits_fnv1a64[128][4];
     uint32_t norm_bits[128][4];
     uint32_t cumulative_dot_bits[128][4];
     uint32_t pre_scale_dot_bits[128];
