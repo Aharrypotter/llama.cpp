@@ -652,6 +652,7 @@ static int run_last_slot_address_canary(void) {
                EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
 }
 
+#ifndef HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX
 struct dense_operation {
     struct htp_tensor q;
     struct htp_tensor k;
@@ -715,6 +716,7 @@ static int run_dense(struct htp_context * ctx, const float * query,
     prepare_dense_operation(&operation, ctx, query, sequence);
     return run_dense_prepared(&operation);
 }
+#endif
 #endif
 
 int main(void) {
