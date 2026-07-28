@@ -151,7 +151,8 @@ static void release_dense_context(struct htp_context * ctx) {
     }
 }
 
-#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+#if !defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX) && \
+    !defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
 static uint64_t median3(uint64_t a, uint64_t b, uint64_t c) {
     if (a > b) {
         const uint64_t temporary = a;
@@ -706,7 +707,8 @@ static int run_dense_prepared(struct dense_operation * operation) {
     return op_flash_attn_ext(&operation->octx);
 }
 
-#ifndef HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX
+#if !defined(HTP_EDGEKV_BLOCKGTQ_ATTRIBUTION_MATRIX) && \
+    !defined(HTP_EDGEKV_BLOCKGTQ_CROSS_LIBM_MATRIX)
 static int run_dense(struct htp_context * ctx, const float * query,
                      int sequence) {
     struct dense_operation operation;
