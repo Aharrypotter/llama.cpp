@@ -2,11 +2,15 @@
 
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "llama-batch.h"
+#include "llama-impl.h"
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -492,4 +496,305 @@ bool llama_kv_blockgtq_runtime::valid() const {
 
 int32_t llama_kv_blockgtq_runtime::sequence_length() const {
     return impl_->sequence_length;
+}
+
+bool llama_kv_blockgtq_runtime::reset(
+        bool clear_data,
+        std::string * error) {
+    if (impl_->pending) {
+        if (error) {
+            *error = "cannot reset while a graph update is pending";
+        }
+        return false;
+    }
+    if (clear_data) {
+        constexpr size_t ZERO_CHUNK_BYTES = 1024 * 1024;
+        const std::vector<uint8_t> zeroes(ZERO_CHUNK_BYTES);
+        const size_t history_bytes = ggml_nbytes(impl_->history);
+        for (size_t offset = 0; offset < history_bytes;
+             offset += ZERO_CHUNK_BYTES) {
+            const size_t size =
+                std::min(ZERO_CHUNK_BYTES, history_bytes - offset);
+            ggml_backend_tensor_set(
+                impl_->history, zeroes.data(), offset, size);
+        }
+    }
+    impl_->sequence_length = 0;
+    impl_->pending_start = 0;
+    impl_->pending_count = 0;
+    impl_->pending = false;
+    impl_->valid = true;
+    return true;
+}
+
+bool llama_kv_blockgtq_runtime::truncate(
+        int32_t sequence_length,
+        std::string * error) {
+    if (!impl_->valid) {
+        if (error) {
+            *error = "runtime is invalid after an earlier failure";
+        }
+        return false;
+    }
+    if (impl_->pending) {
+        if (error) {
+            *error = "cannot truncate while a graph update is pending";
+        }
+        return false;
+    }
+    if (sequence_length < 0 ||
+        sequence_length > impl_->sequence_length) {
+        if (error) {
+            *error = "truncate length is outside committed history";
+        }
+        return false;
+    }
+    impl_->sequence_length = sequence_length;
+    return true;
+}
+
+namespace {
+
+class llama_memory_blockgtq_context final : public llama_memory_context_i {
+public:
+    explicit llama_memory_blockgtq_context(llama_memory_status status) :
+        status_(status) {
+    }
+
+    explicit llama_memory_blockgtq_context(
+            std::vector<llama_ubatch> ubatches) :
+        status_(LLAMA_MEMORY_STATUS_SUCCESS),
+        ubatches_(std::move(ubatches)) {
+    }
+
+    bool next() override {
+        assert(status_ == LLAMA_MEMORY_STATUS_SUCCESS);
+        if (++current_ >= ubatches_.size()) {
+            return false;
+        }
+        return true;
+    }
+
+    bool apply() override {
+        return !llama_memory_status_is_fail(status_);
+    }
+
+    const llama_ubatch & get_ubatch() const override {
+        assert(status_ == LLAMA_MEMORY_STATUS_SUCCESS);
+        assert(current_ < ubatches_.size());
+        return ubatches_[current_];
+    }
+
+    llama_memory_status get_status() const override {
+        return status_;
+    }
+
+private:
+    llama_memory_status status_;
+    std::vector<llama_ubatch> ubatches_;
+    size_t current_ = 0;
+};
+
+}  // namespace
+
+llama_memory_blockgtq::llama_memory_blockgtq(
+        llama_kv_blockgtq_runtime * runtime,
+        uint32_t n_seq_max) :
+    runtime_(runtime) {
+    if (!runtime_) {
+        throw std::runtime_error("Block-GTQ memory requires a runtime");
+    }
+    if (n_seq_max != 1) {
+        throw std::runtime_error(
+            "Block-GTQ memory supports exactly one sequence");
+    }
+}
+
+llama_memory_context_ptr llama_memory_blockgtq::init_batch(
+        llama_batch_allocr & balloc,
+        uint32_t n_ubatch,
+        bool embd_all) {
+    GGML_UNUSED(embd_all);
+
+    if (n_ubatch != 1) {
+        return std::make_unique<llama_memory_blockgtq_context>(
+            LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    balloc.split_reset();
+    std::vector<llama_ubatch> ubatches;
+    while (true) {
+        auto ubatch = balloc.split_simple(1);
+        if (ubatch.n_tokens == 0) {
+            break;
+        }
+        if (ubatch.n_tokens != 1 || ubatch.n_seqs_unq != 1 ||
+            ubatch.n_seq_id[0] != 1 || !ubatch.seq_id[0] ||
+            ubatch.seq_id[0][0] != 0) {
+            return std::make_unique<llama_memory_blockgtq_context>(
+                LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        ubatches.push_back(std::move(ubatch));
+    }
+    if (ubatches.empty() ||
+        balloc.get_n_used() != balloc.get_n_tokens()) {
+        return std::make_unique<llama_memory_blockgtq_context>(
+            LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    return std::make_unique<llama_memory_blockgtq_context>(
+        std::move(ubatches));
+}
+
+llama_memory_context_ptr llama_memory_blockgtq::init_full() {
+    return std::make_unique<llama_memory_blockgtq_context>(
+        LLAMA_MEMORY_STATUS_SUCCESS);
+}
+
+llama_memory_context_ptr llama_memory_blockgtq::init_update(
+        llama_context * lctx,
+        bool optimize) {
+    GGML_UNUSED(lctx);
+    GGML_UNUSED(optimize);
+    return std::make_unique<llama_memory_blockgtq_context>(
+        LLAMA_MEMORY_STATUS_NO_UPDATE);
+}
+
+bool llama_memory_blockgtq::get_can_shift() const {
+    return false;
+}
+
+void llama_memory_blockgtq::clear(bool data) {
+    std::string error;
+    if (!runtime_->reset(data, &error)) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to clear Block-GTQ memory: %s\n",
+            __func__,
+            error.c_str());
+        runtime_->fail();
+    }
+}
+
+bool llama_memory_blockgtq::seq_rm(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    if (seq_id != -1 && seq_id != 0) {
+        return false;
+    }
+    const llama_pos length = runtime_->sequence_length();
+    p0 = p0 < 0 ? 0 : p0;
+    p1 = p1 < 0 ? length : std::min(p1, length);
+    if (p0 >= p1) {
+        return true;
+    }
+    if (p1 != length) {
+        return false;
+    }
+    std::string error;
+    if (!runtime_->truncate(p0, &error)) {
+        LLAMA_LOG_ERROR(
+            "%s: failed to truncate Block-GTQ memory: %s\n",
+            __func__,
+            error.c_str());
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_blockgtq::invalidate_unsupported(
+        const char * operation) {
+    LLAMA_LOG_ERROR(
+        "%s: Block-GTQ memory does not support %s; runtime invalidated\n",
+        __func__,
+        operation);
+    runtime_->fail();
+}
+
+void llama_memory_blockgtq::seq_cp(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    if (seq_id_src == 0 && seq_id_dst == 0) {
+        return;
+    }
+    invalidate_unsupported("sequence copy");
+}
+
+void llama_memory_blockgtq::seq_keep(llama_seq_id seq_id) {
+    if (seq_id == 0) {
+        return;
+    }
+    invalidate_unsupported("sequence keep");
+}
+
+void llama_memory_blockgtq::seq_add(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        llama_pos shift) {
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    if (seq_id == 0 && shift == 0) {
+        return;
+    }
+    invalidate_unsupported("sequence position shift");
+}
+
+void llama_memory_blockgtq::seq_div(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        int d) {
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    if (seq_id == 0 && d == 1) {
+        return;
+    }
+    invalidate_unsupported("sequence position division");
+}
+
+llama_pos llama_memory_blockgtq::seq_pos_min(
+        llama_seq_id seq_id) const {
+    if (seq_id != 0 || runtime_->sequence_length() == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+llama_pos llama_memory_blockgtq::seq_pos_max(
+        llama_seq_id seq_id) const {
+    if (seq_id != 0 || runtime_->sequence_length() == 0) {
+        return -1;
+    }
+    return runtime_->sequence_length() - 1;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t>
+llama_memory_blockgtq::memory_breakdown() const {
+    return {};
+}
+
+void llama_memory_blockgtq::state_write(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) const {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    throw std::runtime_error(
+        "Block-GTQ memory state serialization is not implemented");
+}
+
+void llama_memory_blockgtq::state_read(
+        llama_io_read_i & io,
+        llama_seq_id seq_id,
+        llama_state_seq_flags flags) {
+    GGML_UNUSED(io);
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(flags);
+    throw std::runtime_error(
+        "Block-GTQ memory state deserialization is not implemented");
 }

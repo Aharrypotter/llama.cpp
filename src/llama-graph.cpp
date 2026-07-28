@@ -845,6 +845,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (!blockgtq_direct) {
+        GGML_ASSERT(mctx);
         mctx->set_input_k_idxs(self_k_idxs, ubatch);
         mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -865,7 +866,15 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+    if (blockgtq_direct) {
+        return params.blockgtq != nullptr &&
+               params.ubatch.n_tokens == 1;
+    }
+
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    if (!mctx) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -2575,6 +2584,16 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+#ifdef LLAMA_KV_BLOCKGTQ
+    if (blockgtq) {
+        auto inp = std::make_unique<llm_graph_input_attn_kv>(
+            hparams, cparams, nullptr);
+        inp->blockgtq_direct = true;
+        return static_cast<llm_graph_input_attn_kv *>(
+            res->add_input(std::move(inp)));
+    }
+#endif
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);

@@ -1,6 +1,8 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "llama-batch.h"
 #include "llama-kv-blockgtq.h"
+#include "llama-vocab.h"
 
 #undef NDEBUG
 #include <algorithm>
@@ -366,6 +368,70 @@ int main(int argc, char ** argv) {
     runtime->fail();
     assert(!runtime->valid());
     assert(!runtime->prepare(SEQUENCE, 1, &runtime_error));
+    assert(runtime->reset(false, &runtime_error));
+    assert(runtime->valid());
+    assert(runtime->sequence_length() == 0);
+
+    llama_memory_blockgtq memory(runtime.get(), 1);
+    assert(memory.memory_breakdown().empty());
+    assert(!memory.get_can_shift());
+    assert(memory.seq_pos_min(0) == -1);
+    assert(memory.seq_pos_max(0) == -1);
+
+    llama_vocab vocab;
+    llama_batch_allocr balloc(1);
+    float embedding = 1.0f;
+    llama_batch batch = {
+        /* .n_tokens = */ 1,
+        /* .token    = */ nullptr,
+        /* .embd     = */ &embedding,
+        /* .pos      = */ nullptr,
+        /* .n_seq_id = */ nullptr,
+        /* .seq_id   = */ nullptr,
+        /* .logits   = */ nullptr,
+    };
+    assert(balloc.init(batch, vocab, &memory, 1, 1, false));
+    auto batch_context = memory.init_batch(balloc, 1, false);
+    assert(
+        batch_context->get_status() ==
+        LLAMA_MEMORY_STATUS_SUCCESS);
+    assert(batch_context->get_ubatch().n_tokens == 1);
+    assert(batch_context->get_ubatch().pos[0] == 0);
+    assert(batch_context->apply());
+    assert(!batch_context->next());
+
+    auto full_context = memory.init_full();
+    assert(
+        full_context->get_status() ==
+        LLAMA_MEMORY_STATUS_SUCCESS);
+    auto update_context = memory.init_update(nullptr, false);
+    assert(
+        update_context->get_status() ==
+        LLAMA_MEMORY_STATUS_NO_UPDATE);
+
+    assert(runtime->prepare(0, SEQUENCE, &runtime_error));
+    runtime->finish();
+    assert(memory.seq_pos_min(0) == 0);
+    assert(memory.seq_pos_max(0) == SEQUENCE - 1);
+    assert(!memory.seq_rm(0, 1, 2));
+    assert(memory.seq_rm(0, SEQUENCE - 1, -1));
+    assert(runtime->sequence_length() == SEQUENCE - 1);
+    assert(memory.seq_pos_max(0) == SEQUENCE - 2);
+    memory.clear(false);
+    assert(runtime->valid());
+    assert(runtime->sequence_length() == 0);
+
+    memory.seq_cp(0, 1, 0, -1);
+    assert(!runtime->valid());
+    memory.clear(false);
+    assert(runtime->valid());
+
+    const uint8_t marker = 0x5a;
+    uint8_t cleared = marker;
+    ggml_backend_tensor_set(runtime->history(), &marker, 0, 1);
+    memory.clear(true);
+    ggml_backend_tensor_get(runtime->history(), &cleared, 0, 1);
+    assert(cleared == 0);
     runtime.reset();
     ggml_backend_free(runtime_backend);
 

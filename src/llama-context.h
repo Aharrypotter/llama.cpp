@@ -287,15 +287,15 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    std::unique_ptr<llama_memory_i> memory;
-
-    llama_kv_lowrank_context kv_lowrank_ctx;
-
 #ifdef LLAMA_KV_BLOCKGTQ
     std::unique_ptr<llama_kv_blockgtq_runtime> kv_blockgtq;
     bool kv_blockgtq_logged_prefill = false;
     bool kv_blockgtq_logged_decode  = false;
 #endif
+
+    std::unique_ptr<llama_memory_i> memory;
+
+    llama_kv_lowrank_context kv_lowrank_ctx;
 
 #ifdef LLAMA_KV_BLOCKSVD
     std::unique_ptr<llama_kv_blocksvd_context> kv_blocksvd_shadow;

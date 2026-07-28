@@ -425,7 +425,22 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+#ifdef LLAMA_KV_BLOCKGTQ
+        if (kv_blockgtq) {
+            if (cparams.n_seq_max != 1 || cparams.n_ubatch != 1) {
+                throw std::runtime_error(
+                    "Block-GTQ memory requires n_seq_max=1 and n_ubatch=1");
+            }
+            memory = std::make_unique<llama_memory_blockgtq>(
+                kv_blockgtq.get(), cparams.n_seq_max);
+            LLAMA_LOG_INFO(
+                "%s: Block-GTQ memory enabled; default dense KV cache disabled\n",
+                __func__);
+        } else
+#endif
+        {
+            memory.reset(model.create_memory(params_mem, cparams));
+        }
 
 #ifdef LLAMA_KV_BLOCKSVD
         // Wire bctx into kv_cache so its clear() drops the bctx pending buffer too.
