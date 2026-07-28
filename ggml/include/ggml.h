@@ -558,6 +558,9 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_EDGEKV_RECONSTRUCT,
         GGML_OP_EDGEKV_ATTN_DECODE,
+        GGML_OP_EDGEKV_BLOCKGTQ_PACK_TOKEN,
+        GGML_OP_EDGEKV_BLOCKGTQ_PACK_BATCH,
+        GGML_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2477,6 +2480,80 @@ extern "C" {
                                                           struct ggml_tensor *                          active_k,
                                                           struct ggml_tensor *                          active_v,
                                                           const struct ggml_edgekv_attn_decode_params * params);
+
+    // Frozen Block-GTQ mobile representation for Qwen2.5-3B. The pack op
+    // consumes one post-RoPE K / projection-output V token and materializes the
+    // 316-byte append payload for one layer. The attention op commits that
+    // payload to the append-only history before consuming the packed history.
+    // This sixth source is also the graph dependency that orders producer and
+    // consumer without copying the full history.
+    enum {
+        GGML_EDGEKV_BLOCKGTQ_PACK_TOKEN_PARAM_COUNT = 4,
+        GGML_EDGEKV_BLOCKGTQ_PACK_BATCH_PARAM_COUNT = 5,
+        GGML_EDGEKV_BLOCKGTQ_ATTN_PARAM_COUNT       = 15,
+    };
+
+    struct ggml_edgekv_blockgtq_pack_token_params {
+        int32_t abi_version;
+        int32_t layer_index;
+        int32_t n_head_kv;
+        int32_t head_dim;
+    };
+
+    struct ggml_edgekv_blockgtq_attn_params {
+        int32_t abi_version;
+        int32_t package_id;
+        int32_t contract_id;
+        int32_t layer_index;
+        int32_t sequence_length;
+        int32_t capacity;
+        int32_t n_head_q;
+        int32_t n_head_kv;
+        int32_t head_dim;
+        int32_t gqa;
+        int32_t n_layers;
+        int32_t producer_bytes;
+        int32_t consumer_bytes;
+        int32_t shared_bytes;
+        int32_t dynamic_bytes;
+    };
+
+    struct ggml_edgekv_blockgtq_pack_batch_params {
+        int32_t abi_version;
+        int32_t layer_index;
+        int32_t token_start;
+        int32_t token_count;
+        int32_t capacity;
+    };
+
+    GGML_API struct ggml_tensor * ggml_edgekv_blockgtq_pack_token(
+            struct ggml_context                                  * ctx,
+            struct ggml_tensor                                   * k,
+            struct ggml_tensor                                   * v,
+            struct ggml_tensor                                   * producer,
+            struct ggml_tensor                                   * consumer,
+            struct ggml_tensor                                   * shared,
+            const struct ggml_edgekv_blockgtq_pack_token_params * params);
+
+    GGML_API struct ggml_tensor * ggml_edgekv_blockgtq_pack_batch(
+            struct ggml_context                                  * ctx,
+            struct ggml_tensor                                   * k,
+            struct ggml_tensor                                   * v,
+            struct ggml_tensor                                   * producer,
+            struct ggml_tensor                                   * consumer,
+            struct ggml_tensor                                   * shared,
+            struct ggml_tensor                                   * history,
+            const struct ggml_edgekv_blockgtq_pack_batch_params * params);
+
+    GGML_API struct ggml_tensor * ggml_edgekv_blockgtq_attn_decode(
+            struct ggml_context                            * ctx,
+            struct ggml_tensor                             * q,
+            struct ggml_tensor                             * producer,
+            struct ggml_tensor                             * consumer,
+            struct ggml_tensor                             * shared,
+            struct ggml_tensor                             * history,
+            struct ggml_tensor                             * current_token,
+            const struct ggml_edgekv_blockgtq_attn_params * params);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

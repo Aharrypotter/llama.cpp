@@ -323,6 +323,48 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+#ifdef LLAMA_KV_BLOCKGTQ
+        if (const char * package_path = getenv("LLAMA_EDGEKV_BLOCKGTQ_PACKAGE")) {
+            const bool geometry_matches =
+                model.arch == LLM_ARCH_QWEN2 &&
+                hparams.n_layer == LLAMA_KV_BLOCKGTQ_LAYERS &&
+                hparams.n_head() == LLAMA_KV_BLOCKGTQ_QUERY_HEADS &&
+                hparams.n_head_kv() == LLAMA_KV_BLOCKGTQ_KV_HEADS &&
+                hparams.n_embd_head_k() == LLAMA_KV_BLOCKGTQ_HEAD_DIM &&
+                hparams.n_embd_head_v() == LLAMA_KV_BLOCKGTQ_HEAD_DIM;
+            if (!geometry_matches) {
+                throw std::runtime_error(
+                    "LLAMA_EDGEKV_BLOCKGTQ_PACKAGE requires the frozen "
+                    "Qwen2.5-3B L36/Hq16/Hkv2/D128 geometry");
+            }
+            if (cparams.n_seq_max != 1 || cparams.n_ctx > LLAMA_KV_BLOCKGTQ_CAPACITY) {
+                throw std::runtime_error(
+                    "LLAMA_EDGEKV_BLOCKGTQ_PACKAGE requires one sequence and n_ctx <= 2048");
+            }
+            if (cparams.kv_lowrank ||
+                cparams.kv_blocksvd_params.rank > 0 ||
+                cparams.kv_blocksvd_params.backend ||
+                cparams.kv_blocksvd_params.memory_reduction) {
+                throw std::runtime_error(
+                    "LLAMA_EDGEKV_BLOCKGTQ_PACKAGE cannot be combined with "
+                    "WHLR-KV or BlockSVD cache transforms");
+            }
+
+            std::string error;
+            kv_blockgtq = llama_kv_blockgtq_runtime::create(
+                package_path, backend_cpu, &error);
+            if (!kv_blockgtq) {
+                throw std::runtime_error(
+                    "failed to initialize frozen Block-GTQ runtime: " + error);
+            }
+            LLAMA_LOG_INFO(
+                "%s: experimental Block-GTQ runtime enabled "
+                "(package=%s, capacity=%d, backend=%s)\n",
+                __func__, package_path, LLAMA_KV_BLOCKGTQ_CAPACITY,
+                ggml_backend_name(backend_cpu));
+        }
+#endif
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1302,8 +1344,45 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+#ifdef LLAMA_KV_BLOCKGTQ
+    if (kv_blockgtq) {
+        auto reject = [&](const char * message) {
+            LLAMA_LOG_ERROR("%s: Block-GTQ runtime rejected ubatch: %s\n", __func__, message);
+            ret = GGML_STATUS_FAILED;
+            return static_cast<llm_graph_result *>(nullptr);
+        };
+        if (gtype != LLM_GRAPH_TYPE_DEFAULT || ubatch.n_tokens == 0 ||
+            ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_pos != 1 ||
+            !ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id) {
+            return reject("only non-empty single-sequence decoder graphs are supported");
+        }
+        const int32_t token_start = ubatch.pos[0];
+        for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+            if (ubatch.pos[token] != token_start + static_cast<int32_t>(token) ||
+                ubatch.n_seq_id[token] != 1 || !ubatch.seq_id[token] ||
+                ubatch.seq_id[token][0] != 0) {
+                return reject("positions must be contiguous and use only sequence id 0");
+            }
+        }
+        std::string error;
+        if (!kv_blockgtq->prepare(
+                token_start, static_cast<int32_t>(ubatch.n_tokens), &error)) {
+            LLAMA_LOG_ERROR(
+                "%s: Block-GTQ runtime preparation failed: %s\n",
+                __func__, error.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+#endif
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+#ifdef LLAMA_KV_BLOCKGTQ
+        if (kv_blockgtq) {
+            kv_blockgtq->fail();
+        }
+#endif
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -1368,12 +1447,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+#ifdef LLAMA_KV_BLOCKGTQ
+            if (kv_blockgtq) {
+                kv_blockgtq->fail();
+            }
+#endif
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+#ifdef LLAMA_KV_BLOCKGTQ
+            if (kv_blockgtq) {
+                kv_blockgtq->fail();
+            }
+#endif
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1392,9 +1481,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+#ifdef LLAMA_KV_BLOCKGTQ
+        if (kv_blockgtq) {
+            kv_blockgtq->fail();
+        }
+#endif
         ret = status;
         return nullptr;
     }
+
+#ifdef LLAMA_KV_BLOCKGTQ
+    if (kv_blockgtq) {
+        kv_blockgtq->finish();
+    }
+#endif
 
 #ifdef LLAMA_KV_BLOCKSVD
     // Optional: release dense rows for cells that are backed by compressed xKV chunks.
@@ -2909,6 +3009,11 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+#ifdef LLAMA_KV_BLOCKGTQ
+        /*.blockgtq    =*/ kv_blockgtq.get(),
+#else
+        /*.blockgtq    =*/ nullptr,
+#endif
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

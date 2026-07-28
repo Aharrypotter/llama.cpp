@@ -602,6 +602,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE:
             return op_edgekv_blockgtq_attn_decode(octx);
 
+        case HTP_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE_V2:
+            return op_edgekv_blockgtq_attn_decode_v2(octx);
+
         case HTP_OP_INVALID:
             break;
 

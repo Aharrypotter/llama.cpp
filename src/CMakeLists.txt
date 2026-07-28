@@ -53,6 +53,12 @@ if (LLAMA_KV_BLOCKSVD)
     )
 endif()
 
+if (LLAMA_KV_BLOCKGTQ)
+    list(APPEND LLAMA_SOURCES
+        llama-kv-blockgtq.cpp
+    )
+endif()
+
 add_library(llama ${LLAMA_SOURCES})
 
 set_target_properties(llama PROPERTIES
@@ -70,6 +76,10 @@ if (LLAMA_KV_BLOCKSVD)
     target_compile_definitions(llama PRIVATE LLAMA_KV_BLOCKSVD)
 else()
     target_link_libraries(llama PUBLIC ggml)
+endif()
+
+if (LLAMA_KV_BLOCKGTQ)
+    target_compile_definitions(llama PRIVATE LLAMA_KV_BLOCKGTQ)
 endif()
 
 if (BUILD_SHARED_LIBS)

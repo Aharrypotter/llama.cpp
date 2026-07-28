@@ -76,6 +76,9 @@ add_library(${HTP_LIB} SHARED
     edgekv-attn-decode-ops.c
     edgekv-blockgtq-attn.c
     edgekv-blockgtq-attn-ops.c
+    edgekv-blockgtq-attn-v2-ops.c
+    ../../edgekv-blockgtq-runtime.c
+    ../../edgekv-blockgtq-runtime.h
 )
 
 if (DSP_VERSION STREQUAL "v79")

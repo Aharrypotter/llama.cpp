@@ -103,6 +103,12 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
 void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_edgekv_reconstruct(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_edgekv_blockgtq_pack_token(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_edgekv_blockgtq_pack_batch(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_edgekv_blockgtq_attn_decode(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -110,6 +110,7 @@ int op_edgekv_reconstruct(struct htp_ops_context * octx);
 int op_edgekv_attn_decode(struct htp_ops_context * octx);
 uint64_t edgekv_attn_decode_last_aot_pcycles(void);
 int op_edgekv_blockgtq_attn_decode(struct htp_ops_context * octx);
+int op_edgekv_blockgtq_attn_decode_v2(struct htp_ops_context * octx);
 uint64_t edgekv_blockgtq_attn_decode_last_pcycles(void);
 
 #ifdef HTP_EDGEKV_BLOCKGTQ_TEST

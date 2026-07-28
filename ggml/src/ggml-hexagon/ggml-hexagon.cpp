@@ -54,6 +54,7 @@ static_assert((int) HTP_TYPE_I8  == (int) GGML_TYPE_I8);
 static_assert((int) HTP_TYPE_I32 == (int) GGML_TYPE_I32);
 static_assert((int) HTP_EDGEKV_PARAM_COUNT == (int) GGML_EDGEKV_RECONSTRUCT_PARAM_COUNT);
 static_assert((int) HTP_EDGEKV_ATTN_PARAM_COUNT == (int) GGML_EDGEKV_ATTN_DECODE_PARAM_COUNT);
+static_assert((int) HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT == (int) GGML_EDGEKV_BLOCKGTQ_ATTN_PARAM_COUNT);
 
 static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
@@ -2813,6 +2814,8 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_EDGEKV_RECONSTRUCT: return HTP_OP_EDGEKV_RECONSTRUCT;
         case GGML_OP_EDGEKV_ATTN_DECODE:
             return HTP_OP_EDGEKV_ATTN_DECODE;
+        case GGML_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE:
+            return HTP_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE_V2;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
                 case GGML_UNARY_OP_SILU:     return HTP_OP_UNARY_SILU;
@@ -3297,6 +3300,66 @@ static bool ggml_hexagon_supported_edgekv_attn_decode(const struct ggml_hexagon_
 #endif
 }
 
+static bool ggml_hexagon_supported_edgekv_blockgtq_attn_decode(
+        const struct ggml_hexagon_session * sess,
+        const struct ggml_tensor          * op) {
+    static const int32_t expected[HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT] = {
+        2,
+        (int32_t) UINT32_C(0x7159380b),
+        (int32_t) UINT32_C(0x92f8aa7c),
+        0,
+        1,
+        2048,
+        16,
+        2,
+        128,
+        8,
+        36,
+        958144,
+        143168,
+        23616,
+        23298048,
+    };
+    if (opt_arch != 79) {
+        return false;
+    }
+    for (int i = 0; i < HTP_EDGEKV_BLOCKGTQ_PARAM_COUNT; ++i) {
+        if (i == HTP_EDGEKV_BLOCKGTQ_LAYER_INDEX ||
+            i == HTP_EDGEKV_BLOCKGTQ_SEQUENCE_LENGTH) {
+            continue;
+        }
+        if (op->op_params[i] != expected[i]) {
+            return false;
+        }
+    }
+    if (op->op_params[HTP_EDGEKV_BLOCKGTQ_LAYER_INDEX] < 0 ||
+        op->op_params[HTP_EDGEKV_BLOCKGTQ_LAYER_INDEX] >= 36 ||
+        op->op_params[HTP_EDGEKV_BLOCKGTQ_SEQUENCE_LENGTH] <= 0 ||
+        op->op_params[HTP_EDGEKV_BLOCKGTQ_SEQUENCE_LENGTH] > 2048) {
+        return false;
+    }
+    static const enum ggml_type expected_types[GGML_MAX_SRC] = {
+        GGML_TYPE_F32, GGML_TYPE_I8, GGML_TYPE_I8,
+        GGML_TYPE_I8, GGML_TYPE_I8, GGML_TYPE_I8,
+    };
+    static const size_t expected_bytes[GGML_MAX_SRC] = {
+        8192, 958144, 143168, 23616, 23298048, 316,
+    };
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (!op->src[i] || op->src[i]->type != expected_types[i] ||
+            ggml_nbytes(op->src[i]) != expected_bytes[i] ||
+            !ggml_is_contiguous(op->src[i])) {
+            return false;
+        }
+    }
+    if (op->type != GGML_TYPE_F32 || ggml_nbytes(op) != 8192 ||
+        !ggml_is_contiguous(op)) {
+        return false;
+    }
+    GGML_UNUSED(sess);
+    return true;
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
@@ -3445,6 +3508,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_EDGEKV_ATTN_DECODE:
             supp = ggml_hexagon_supported_edgekv_attn_decode(sess, op);
+            break;
+
+        case GGML_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE:
+            supp = ggml_hexagon_supported_edgekv_blockgtq_attn_decode(sess, op);
             break;
 
         default:

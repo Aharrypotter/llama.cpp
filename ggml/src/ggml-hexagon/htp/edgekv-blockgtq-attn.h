@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum {
     EDGEKV_BLOCKGTQ_ABI_VERSION = 1,
     EDGEKV_BLOCKGTQ_LAYERS = 36,
@@ -21,6 +25,8 @@ enum {
     EDGEKV_BLOCKGTQ_V_NORM_STRIDE = 2,
     EDGEKV_BLOCKGTQ_CAPACITY = 2048,
     EDGEKV_BLOCKGTQ_TRANSFORM_BYTES = 948800,
+    EDGEKV_BLOCKGTQ_PRODUCER_BYTES = 958144,
+    EDGEKV_BLOCKGTQ_PRODUCER_V_ROTATIONS_OFFSET = 827008,
     EDGEKV_BLOCKGTQ_CONSUMER_BYTES = 143168,
     EDGEKV_BLOCKGTQ_SHARED_BYTES = 23616,
     EDGEKV_BLOCKGTQ_DYNAMIC_BYTES = 23298048,
@@ -39,6 +45,9 @@ struct edgekv_blockgtq_inputs {
     const float * query;
     const uint8_t * transform;
     size_t transform_bytes;
+    // Zero selects the frozen ABI-v1 transform layout. ABI v2 points at the
+    // V rotations inside the canonical static_producer_pool.
+    size_t transform_v_rotations_offset;
     const uint8_t * consumer;
     size_t consumer_bytes;
     const uint8_t * shared;
@@ -162,6 +171,13 @@ int edgekv_blockgtq_validate_static(const uint8_t * transform,
                                     const uint8_t * shared,
                                     size_t shared_bytes);
 
+int edgekv_blockgtq_validate_static_v2(const uint8_t * producer,
+                                       size_t producer_bytes,
+                                       const uint8_t * consumer,
+                                       size_t consumer_bytes,
+                                       const uint8_t * shared,
+                                       size_t shared_bytes);
+
 int edgekv_blockgtq_attn_decode(
     const struct edgekv_blockgtq_inputs * inputs,
     float * output,
@@ -170,5 +186,9 @@ int edgekv_blockgtq_attn_decode(
     , struct edgekv_blockgtq_target_observability * observability
 #endif
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

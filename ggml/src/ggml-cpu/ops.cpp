@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "../edgekv-blockgtq-runtime.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -10651,6 +10652,127 @@ void ggml_compute_forward_edgekv_attn_decode(const struct ggml_compute_params * 
             std::fill(output_head, output_head + p.head_dim_v, 0.0f);
         }
     }
+}
+
+void ggml_compute_forward_edgekv_blockgtq_pack_token(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * k        = dst->src[0];
+    const ggml_tensor * v        = dst->src[1];
+    const ggml_tensor * producer = dst->src[2];
+    const ggml_tensor * consumer = dst->src[3];
+    const ggml_tensor * shared   = dst->src[4];
+    GGML_ASSERT(k && k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(producer && producer->type == GGML_TYPE_I8);
+    GGML_ASSERT(consumer && consumer->type == GGML_TYPE_I8);
+    GGML_ASSERT(shared && shared->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8 && ggml_nbytes(dst) == EDGEKV_BLOCKGTQ_APPEND_BYTES);
+
+    ggml_edgekv_blockgtq_pack_token_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    GGML_ASSERT(p.abi_version == 2);
+    const int status = edgekv_blockgtq_pack_token_v2(
+        static_cast<const float *>(k->data),
+        static_cast<const float *>(v->data),
+        static_cast<const uint8_t *>(producer->data), ggml_nbytes(producer),
+        static_cast<const uint8_t *>(consumer->data), ggml_nbytes(consumer),
+        static_cast<const uint8_t *>(shared->data), ggml_nbytes(shared),
+        p.layer_index, static_cast<uint8_t *>(dst->data));
+    GGML_ASSERT(status == EDGEKV_BLOCKGTQ_OK);
+}
+
+void ggml_compute_forward_edgekv_blockgtq_pack_batch(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * k        = dst->src[0];
+    const ggml_tensor * v        = dst->src[1];
+    const ggml_tensor * producer = dst->src[2];
+    const ggml_tensor * consumer = dst->src[3];
+    const ggml_tensor * shared   = dst->src[4];
+    const ggml_tensor * history  = dst->src[5];
+    GGML_ASSERT(k && k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(producer && producer->type == GGML_TYPE_I8);
+    GGML_ASSERT(consumer && consumer->type == GGML_TYPE_I8);
+    GGML_ASSERT(shared && shared->type == GGML_TYPE_I8);
+    GGML_ASSERT(history && history->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8 && ggml_nbytes(dst) == 1);
+
+    ggml_edgekv_blockgtq_pack_batch_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    GGML_ASSERT(p.abi_version == 2);
+    uint8_t current[EDGEKV_BLOCKGTQ_APPEND_BYTES];
+    const size_t token_values = 2u * 128u;
+    for (int token = 0; token < p.token_count; ++token) {
+        int status = edgekv_blockgtq_pack_token_v2(
+            static_cast<const float *>(k->data) + (size_t) token * token_values,
+            static_cast<const float *>(v->data) + (size_t) token * token_values,
+            static_cast<const uint8_t *>(producer->data), ggml_nbytes(producer),
+            static_cast<const uint8_t *>(consumer->data), ggml_nbytes(consumer),
+            static_cast<const uint8_t *>(shared->data), ggml_nbytes(shared),
+            p.layer_index, current);
+        GGML_ASSERT(status == EDGEKV_BLOCKGTQ_OK);
+        status = edgekv_blockgtq_commit_token_v2(
+            static_cast<uint8_t *>(history->data), ggml_nbytes(history),
+            p.capacity, p.layer_index, p.token_start + token,
+            current, sizeof(current));
+        GGML_ASSERT(status == EDGEKV_BLOCKGTQ_OK);
+    }
+    static_cast<uint8_t *>(dst->data)[0] = 1;
+}
+
+void ggml_compute_forward_edgekv_blockgtq_attn_decode(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * q             = dst->src[0];
+    const ggml_tensor * producer      = dst->src[1];
+    const ggml_tensor * consumer      = dst->src[2];
+    const ggml_tensor * shared        = dst->src[3];
+    const ggml_tensor * history       = dst->src[4];
+    const ggml_tensor * current_token = dst->src[5];
+    GGML_ASSERT(q && q->type == GGML_TYPE_F32);
+    GGML_ASSERT(producer && producer->type == GGML_TYPE_I8);
+    GGML_ASSERT(consumer && consumer->type == GGML_TYPE_I8);
+    GGML_ASSERT(shared && shared->type == GGML_TYPE_I8);
+    GGML_ASSERT(history && history->type == GGML_TYPE_I8);
+    GGML_ASSERT(current_token && current_token->type == GGML_TYPE_I8);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    ggml_edgekv_blockgtq_attn_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    GGML_ASSERT(p.abi_version == 2);
+    int status = edgekv_blockgtq_commit_token_v2(
+        static_cast<uint8_t *>(history->data), ggml_nbytes(history),
+        p.capacity, p.layer_index, p.sequence_length - 1,
+        static_cast<const uint8_t *>(current_token->data),
+        ggml_nbytes(current_token));
+    GGML_ASSERT(status == EDGEKV_BLOCKGTQ_OK);
+
+    const edgekv_blockgtq_inputs inputs = {
+        /* .query                        = */ static_cast<const float *>(q->data),
+        /* .transform                    = */ static_cast<const uint8_t *>(producer->data),
+        /* .transform_bytes              = */ ggml_nbytes(producer),
+        /* .transform_v_rotations_offset = */ EDGEKV_BLOCKGTQ_PRODUCER_V_ROTATIONS_OFFSET,
+        /* .consumer                     = */ static_cast<const uint8_t *>(consumer->data),
+        /* .consumer_bytes               = */ ggml_nbytes(consumer),
+        /* .shared                       = */ static_cast<const uint8_t *>(shared->data),
+        /* .shared_bytes                 = */ ggml_nbytes(shared),
+        /* .history                      = */ static_cast<const uint8_t *>(history->data),
+        /* .history_bytes                = */ ggml_nbytes(history),
+        /* .layer_index                  = */ p.layer_index,
+        /* .sequence_length              = */ p.sequence_length,
+        /* .capacity                     = */ p.capacity,
+    };
+    status = edgekv_blockgtq_attn_decode(
+        &inputs, static_cast<float *>(dst->data), nullptr);
+    GGML_ASSERT(status == EDGEKV_BLOCKGTQ_OK);
 }
 
 // ggml_compute_forward_gated_delta_net

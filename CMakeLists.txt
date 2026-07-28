@@ -116,6 +116,7 @@ option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 option(LLAMA_KV_BLOCKSVD "llama: enable EdgeKV Block SVD KV cache compression (requires Eigen3)" OFF)
+option(LLAMA_KV_BLOCKGTQ "llama: enable the frozen EdgeKV Block-GTQ mobile runtime" OFF)
 
 
 # Required for relocatable CMake package

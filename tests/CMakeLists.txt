@@ -249,6 +249,40 @@ llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-edgekv-attn-decode.cpp)
 
+set(LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE "" CACHE FILEPATH
+    "Path to the frozen B2-T4P-H7 Block-GTQ fixture")
+set(LLAMA_EDGEKV_BLOCKGTQ_PACKAGE "" CACHE FILEPATH
+    "Path to the frozen B2-T3P Block-GTQ mobile package")
+set(LLAMA_EDGEKV_BLOCKGTQ_GRAPH_FIXTURE "" CACHE FILEPATH
+    "Path to the frozen B2-T5 Block-GTQ llama graph fixture")
+if (LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE)
+    if (NOT LLAMA_KV_BLOCKGTQ)
+        message(FATAL_ERROR
+            "LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE requires LLAMA_KV_BLOCKGTQ=ON")
+    endif()
+    if (NOT EXISTS "${LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE}")
+        message(FATAL_ERROR
+            "LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE does not exist: "
+            "${LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE}")
+    endif()
+    if (NOT EXISTS "${LLAMA_EDGEKV_BLOCKGTQ_PACKAGE}")
+        message(FATAL_ERROR
+            "LLAMA_EDGEKV_BLOCKGTQ_PACKAGE does not exist: "
+            "${LLAMA_EDGEKV_BLOCKGTQ_PACKAGE}")
+    endif()
+    if (NOT EXISTS "${LLAMA_EDGEKV_BLOCKGTQ_GRAPH_FIXTURE}")
+        message(FATAL_ERROR
+            "LLAMA_EDGEKV_BLOCKGTQ_GRAPH_FIXTURE does not exist: "
+            "${LLAMA_EDGEKV_BLOCKGTQ_GRAPH_FIXTURE}")
+    endif()
+    llama_build_and_test(
+        test-edgekv-blockgtq.cpp
+        ARGS
+            "${LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE}"
+            "${LLAMA_EDGEKV_BLOCKGTQ_PACKAGE}"
+            "${LLAMA_EDGEKV_BLOCKGTQ_GRAPH_FIXTURE}")
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

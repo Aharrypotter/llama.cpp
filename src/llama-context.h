@@ -11,6 +11,9 @@
 #ifdef LLAMA_KV_BLOCKSVD
 #include "llama-kv-blocksvd.h"
 #endif
+#ifdef LLAMA_KV_BLOCKGTQ
+#include "llama-kv-blockgtq.h"
+#endif
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -287,6 +290,10 @@ private:
     std::unique_ptr<llama_memory_i> memory;
 
     llama_kv_lowrank_context kv_lowrank_ctx;
+
+#ifdef LLAMA_KV_BLOCKGTQ
+    std::unique_ptr<llama_kv_blockgtq_runtime> kv_blockgtq;
+#endif
 
 #ifdef LLAMA_KV_BLOCKSVD
     std::unique_ptr<llama_kv_blocksvd_context> kv_blocksvd_shadow;

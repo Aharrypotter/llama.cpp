@@ -11,6 +11,9 @@
 #include "llama-kv-blocksvd.h"
 #include "llama-kv-blocksvd-execution.h"
 #endif
+#ifdef LLAMA_KV_BLOCKGTQ
+#include "llama-kv-blockgtq.h"
+#endif
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -23,6 +26,67 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+#ifdef LLAMA_KV_BLOCKGTQ
+class llm_graph_input_blockgtq final : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_blockgtq(llama_kv_blockgtq_runtime * runtime) :
+        runtime(runtime) {
+    }
+
+    void add_direct(ggml_tensor * tensor) {
+        direct.push_back(tensor);
+    }
+
+    void add_batch(ggml_tensor * tensor) {
+        batch.push_back(tensor);
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch && ubatch->n_tokens > 0 && ubatch->pos);
+        const int32_t token_start = ubatch->pos[0];
+        for (ggml_tensor * tensor : direct) {
+            ggml_edgekv_blockgtq_attn_params params;
+            memcpy(&params, tensor->op_params, sizeof(params));
+            params.sequence_length = token_start + 1;
+            memcpy(tensor->op_params, &params, sizeof(params));
+        }
+        for (ggml_tensor * tensor : batch) {
+            ggml_edgekv_blockgtq_pack_batch_params params;
+            memcpy(&params, tensor->op_params, sizeof(params));
+            params.token_start = token_start;
+            params.token_count = ubatch->n_tokens;
+            memcpy(tensor->op_params, &params, sizeof(params));
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.blockgtq == runtime &&
+               ((params.ubatch.n_tokens == 1 && !direct.empty() && batch.empty()) ||
+                (params.ubatch.n_tokens > 1 && direct.empty() && !batch.empty()));
+    }
+
+    llama_kv_blockgtq_runtime * runtime;
+    std::vector<ggml_tensor *> direct;
+    std::vector<ggml_tensor *> batch;
+};
+
+static llm_graph_input_blockgtq * blockgtq_graph_input(
+        llm_graph_result * result,
+        llama_kv_blockgtq_runtime * runtime) {
+    for (const auto & input : result->inputs) {
+        auto * candidate = dynamic_cast<llm_graph_input_blockgtq *>(input.get());
+        if (candidate) {
+            GGML_ASSERT(candidate->runtime == runtime);
+            return candidate;
+        }
+    }
+    auto input = std::make_unique<llm_graph_input_blockgtq>(runtime);
+    auto * result_input = input.get();
+    result->add_input(std::move(input));
+    return result_input;
+}
+#endif
 
 #ifdef LLAMA_KV_BLOCKSVD
 struct llm_graph_blocksvd_pool_key {
@@ -1290,6 +1354,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    blockgtq         (params.blockgtq),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2547,6 +2612,111 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
+
+#ifdef LLAMA_KV_BLOCKGTQ
+    if (blockgtq) {
+        GGML_ASSERT(arch == LLM_ARCH_QWEN2);
+        GGML_ASSERT(inp->self_k_rot == nullptr && inp->self_v_rot == nullptr);
+        GGML_ASSERT(kq_b == nullptr && sinks == nullptr);
+        GGML_ASSERT(kq_scale == 1.0f / sqrtf(128.0f));
+        GGML_ASSERT(q_cur->type == GGML_TYPE_F32 && ggml_is_contiguous(q_cur));
+        GGML_ASSERT(k_cur->type == GGML_TYPE_F32 && ggml_is_contiguous(k_cur));
+        GGML_ASSERT(v_cur->type == GGML_TYPE_F32 && ggml_is_contiguous(v_cur));
+        GGML_ASSERT(q_cur->ne[0] == LLAMA_KV_BLOCKGTQ_HEAD_DIM);
+        GGML_ASSERT(q_cur->ne[1] == LLAMA_KV_BLOCKGTQ_QUERY_HEADS);
+        GGML_ASSERT(k_cur->ne[0] == LLAMA_KV_BLOCKGTQ_HEAD_DIM);
+        GGML_ASSERT(k_cur->ne[1] == LLAMA_KV_BLOCKGTQ_KV_HEADS);
+        GGML_ASSERT(v_cur->ne[0] == LLAMA_KV_BLOCKGTQ_HEAD_DIM);
+        GGML_ASSERT(v_cur->ne[1] == LLAMA_KV_BLOCKGTQ_KV_HEADS);
+
+        auto * input = blockgtq_graph_input(res, blockgtq);
+        if (n_tokens == 1) {
+            const ggml_edgekv_blockgtq_pack_token_params pack_params = {
+                /* .abi_version = */ 2,
+                /* .layer_index = */ il,
+                /* .n_head_kv   = */ LLAMA_KV_BLOCKGTQ_KV_HEADS,
+                /* .head_dim    = */ LLAMA_KV_BLOCKGTQ_HEAD_DIM,
+            };
+            ggml_tensor * current = ggml_edgekv_blockgtq_pack_token(
+                ctx0,
+                k_cur,
+                v_cur,
+                blockgtq->producer(),
+                blockgtq->consumer(),
+                blockgtq->shared(),
+                &pack_params);
+            ggml_backend_sched_set_tensor_backend(sched, current, blockgtq->backend());
+            ggml_format_name(current, "edgekv_blockgtq_pack_token-%d", il);
+            cb(current, "edgekv_blockgtq_pack_token", il);
+
+            const ggml_edgekv_blockgtq_attn_params attn_params = {
+                /* .abi_version     = */ 2,
+                /* .package_id      = */ static_cast<int32_t>(UINT32_C(0x7159380b)),
+                /* .contract_id     = */ static_cast<int32_t>(UINT32_C(0x92f8aa7c)),
+                /* .layer_index     = */ il,
+                /* .sequence_length = */ ubatch.pos[0] + 1,
+                /* .capacity        = */ LLAMA_KV_BLOCKGTQ_CAPACITY,
+                /* .n_head_q        = */ LLAMA_KV_BLOCKGTQ_QUERY_HEADS,
+                /* .n_head_kv       = */ LLAMA_KV_BLOCKGTQ_KV_HEADS,
+                /* .head_dim        = */ LLAMA_KV_BLOCKGTQ_HEAD_DIM,
+                /* .gqa             = */ 8,
+                /* .n_layers        = */ LLAMA_KV_BLOCKGTQ_LAYERS,
+                /* .producer_bytes  = */ LLAMA_KV_BLOCKGTQ_PRODUCER_BYTES,
+                /* .consumer_bytes  = */ LLAMA_KV_BLOCKGTQ_CONSUMER_BYTES,
+                /* .shared_bytes    = */ LLAMA_KV_BLOCKGTQ_SHARED_BYTES,
+                /* .dynamic_bytes   = */ LLAMA_KV_BLOCKGTQ_HISTORY_BYTES,
+            };
+            ggml_tensor * cur = ggml_edgekv_blockgtq_attn_decode(
+                ctx0,
+                q_cur,
+                blockgtq->producer(),
+                blockgtq->consumer(),
+                blockgtq->shared(),
+                blockgtq->history(),
+                current,
+                &attn_params);
+            ggml_backend_sched_set_tensor_backend(sched, cur, blockgtq->backend());
+            ggml_format_name(cur, "edgekv_blockgtq_attn_decode-%d", il);
+            cb(cur, "edgekv_blockgtq_attn_decode", il);
+            input->add_direct(cur);
+
+            cur = ggml_reshape_2d(
+                ctx0,
+                cur,
+                LLAMA_KV_BLOCKGTQ_QUERY_HEADS * LLAMA_KV_BLOCKGTQ_HEAD_DIM,
+                1);
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+            return cur;
+        }
+
+        const ggml_edgekv_blockgtq_pack_batch_params pack_params = {
+            /* .abi_version = */ 2,
+            /* .layer_index = */ il,
+            /* .token_start = */ ubatch.pos[0],
+            /* .token_count = */ static_cast<int32_t>(n_tokens),
+            /* .capacity    = */ LLAMA_KV_BLOCKGTQ_CAPACITY,
+        };
+        ggml_tensor * committed = ggml_edgekv_blockgtq_pack_batch(
+            ctx0,
+            k_cur,
+            v_cur,
+            blockgtq->producer(),
+            blockgtq->consumer(),
+            blockgtq->shared(),
+            blockgtq->history(),
+            &pack_params);
+        ggml_backend_sched_set_tensor_backend(sched, committed, blockgtq->backend());
+        ggml_format_name(committed, "edgekv_blockgtq_pack_batch-%d", il);
+        cb(committed, "edgekv_blockgtq_pack_batch", il);
+        input->add_batch(committed);
+        ggml_build_forward_expand(gf, committed);
+    }
+#endif
 
     // store to KV cache
     {

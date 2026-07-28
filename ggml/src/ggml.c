@@ -1054,6 +1054,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "EDGEKV_RECONSTRUCT",
     "EDGEKV_ATTN_DECODE",
+    "EDGEKV_BLOCKGTQ_PACK_TOKEN",
+    "EDGEKV_BLOCKGTQ_PACK_BATCH",
+    "EDGEKV_BLOCKGTQ_ATTN_DECODE",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1082,7 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1166,6 +1169,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_back(x)",
     "edgekv_reconstruct(u,vh,scale,pos)",
     "edgekv_attn_decode(q,u,vh,metadata,active_k,active_v)",
+    "edgekv_blockgtq_pack_token(k,v,producer,consumer,shared)",
+    "edgekv_blockgtq_pack_batch(k,v,producer,consumer,shared,history)",
+    "edgekv_blockgtq_attn_decode(q,producer,consumer,shared,history,current)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1194,7 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5564,6 +5570,143 @@ struct ggml_tensor * ggml_edgekv_attn_decode(struct ggml_context *              
     return result;
 }
 
+struct ggml_tensor * ggml_edgekv_blockgtq_pack_token(
+        struct ggml_context                                  * ctx,
+        struct ggml_tensor                                   * k,
+        struct ggml_tensor                                   * v,
+        struct ggml_tensor                                   * producer,
+        struct ggml_tensor                                   * consumer,
+        struct ggml_tensor                                   * shared,
+        const struct ggml_edgekv_blockgtq_pack_token_params * params) {
+    static_assert(
+        sizeof(struct ggml_edgekv_blockgtq_pack_token_params) ==
+            GGML_EDGEKV_BLOCKGTQ_PACK_TOKEN_PARAM_COUNT * sizeof(int32_t),
+        "Block-GTQ producer params must remain int32-only");
+
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(k != NULL && k->type == GGML_TYPE_F32 && ggml_is_contiguous(k));
+    GGML_ASSERT(v != NULL && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v));
+    GGML_ASSERT(producer != NULL && producer->type == GGML_TYPE_I8 && ggml_is_contiguous(producer));
+    GGML_ASSERT(consumer != NULL && consumer->type == GGML_TYPE_I8 && ggml_is_contiguous(consumer));
+    GGML_ASSERT(shared != NULL && shared->type == GGML_TYPE_I8 && ggml_is_contiguous(shared));
+    GGML_ASSERT(params->abi_version == 2);
+    GGML_ASSERT(params->layer_index >= 0 && params->layer_index < 36);
+    GGML_ASSERT(params->n_head_kv == 2 && params->head_dim == 128);
+    GGML_ASSERT(ggml_nbytes(k) == 2 * 128 * sizeof(float));
+    GGML_ASSERT(ggml_nbytes(v) == 2 * 128 * sizeof(float));
+    GGML_ASSERT(ggml_nbytes(producer) == 958144);
+    GGML_ASSERT(ggml_nbytes(consumer) == 143168);
+    GGML_ASSERT(ggml_nbytes(shared) == 23616);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 316);
+    ggml_set_op_params(result, params, sizeof(*params));
+    result->op     = GGML_OP_EDGEKV_BLOCKGTQ_PACK_TOKEN;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = producer;
+    result->src[3] = consumer;
+    result->src[4] = shared;
+    return result;
+}
+
+struct ggml_tensor * ggml_edgekv_blockgtq_pack_batch(
+        struct ggml_context                                  * ctx,
+        struct ggml_tensor                                   * k,
+        struct ggml_tensor                                   * v,
+        struct ggml_tensor                                   * producer,
+        struct ggml_tensor                                   * consumer,
+        struct ggml_tensor                                   * shared,
+        struct ggml_tensor                                   * history,
+        const struct ggml_edgekv_blockgtq_pack_batch_params * params) {
+    static_assert(
+        sizeof(struct ggml_edgekv_blockgtq_pack_batch_params) ==
+            GGML_EDGEKV_BLOCKGTQ_PACK_BATCH_PARAM_COUNT * sizeof(int32_t),
+        "Block-GTQ batch producer params must remain int32-only");
+
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(k != NULL && k->type == GGML_TYPE_F32 && ggml_is_contiguous(k));
+    GGML_ASSERT(v != NULL && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v));
+    GGML_ASSERT(producer != NULL && producer->type == GGML_TYPE_I8 && ggml_is_contiguous(producer));
+    GGML_ASSERT(consumer != NULL && consumer->type == GGML_TYPE_I8 && ggml_is_contiguous(consumer));
+    GGML_ASSERT(shared != NULL && shared->type == GGML_TYPE_I8 && ggml_is_contiguous(shared));
+    GGML_ASSERT(history != NULL && history->type == GGML_TYPE_I8 && ggml_is_contiguous(history));
+    GGML_ASSERT(params->abi_version == 2);
+    GGML_ASSERT(params->layer_index >= 0 && params->layer_index < 36);
+    GGML_ASSERT(params->token_start >= 0 && params->token_count > 0);
+    GGML_ASSERT(params->token_start + params->token_count <= params->capacity);
+    GGML_ASSERT(params->capacity == 2048);
+    GGML_ASSERT(ggml_nbytes(k) == (size_t) params->token_count * 2 * 128 * sizeof(float));
+    GGML_ASSERT(ggml_nbytes(v) == (size_t) params->token_count * 2 * 128 * sizeof(float));
+    GGML_ASSERT(ggml_nbytes(producer) == 958144);
+    GGML_ASSERT(ggml_nbytes(consumer) == 143168);
+    GGML_ASSERT(ggml_nbytes(shared) == 23616);
+    GGML_ASSERT(ggml_nbytes(history) == 23298048);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 1);
+    ggml_set_op_params(result, params, sizeof(*params));
+    result->op     = GGML_OP_EDGEKV_BLOCKGTQ_PACK_BATCH;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = producer;
+    result->src[3] = consumer;
+    result->src[4] = shared;
+    result->src[5] = history;
+    return result;
+}
+
+struct ggml_tensor * ggml_edgekv_blockgtq_attn_decode(
+        struct ggml_context                            * ctx,
+        struct ggml_tensor                             * q,
+        struct ggml_tensor                             * producer,
+        struct ggml_tensor                             * consumer,
+        struct ggml_tensor                             * shared,
+        struct ggml_tensor                             * history,
+        struct ggml_tensor                             * current_token,
+        const struct ggml_edgekv_blockgtq_attn_params * params) {
+    static_assert(
+        sizeof(struct ggml_edgekv_blockgtq_attn_params) ==
+            GGML_EDGEKV_BLOCKGTQ_ATTN_PARAM_COUNT * sizeof(int32_t),
+        "Block-GTQ attention params must match HTP op_params");
+
+    GGML_ASSERT(params != NULL);
+    GGML_ASSERT(q != NULL && q->type == GGML_TYPE_F32 && ggml_is_contiguous(q));
+    GGML_ASSERT(producer != NULL && producer->type == GGML_TYPE_I8 && ggml_is_contiguous(producer));
+    GGML_ASSERT(consumer != NULL && consumer->type == GGML_TYPE_I8 && ggml_is_contiguous(consumer));
+    GGML_ASSERT(shared != NULL && shared->type == GGML_TYPE_I8 && ggml_is_contiguous(shared));
+    GGML_ASSERT(history != NULL && history->type == GGML_TYPE_I8 && ggml_is_contiguous(history));
+    GGML_ASSERT(current_token != NULL && current_token->type == GGML_TYPE_I8 &&
+                ggml_is_contiguous(current_token));
+    GGML_ASSERT(params->abi_version == 2);
+    GGML_ASSERT((uint32_t) params->package_id == UINT32_C(0x7159380b));
+    GGML_ASSERT((uint32_t) params->contract_id == UINT32_C(0x92f8aa7c));
+    GGML_ASSERT(params->layer_index >= 0 && params->layer_index < 36);
+    GGML_ASSERT(params->sequence_length > 0 && params->sequence_length <= params->capacity);
+    GGML_ASSERT(params->capacity == 2048);
+    GGML_ASSERT(params->n_head_q == 16 && params->n_head_kv == 2);
+    GGML_ASSERT(params->head_dim == 128 && params->gqa == 8 && params->n_layers == 36);
+    GGML_ASSERT(params->producer_bytes == 958144);
+    GGML_ASSERT(params->consumer_bytes == 143168);
+    GGML_ASSERT(params->shared_bytes == 23616);
+    GGML_ASSERT(params->dynamic_bytes == 23298048);
+    GGML_ASSERT(ggml_nbytes(q) == 16 * 128 * sizeof(float));
+    GGML_ASSERT(ggml_nbytes(producer) == (size_t) params->producer_bytes);
+    GGML_ASSERT(ggml_nbytes(consumer) == (size_t) params->consumer_bytes);
+    GGML_ASSERT(ggml_nbytes(shared) == (size_t) params->shared_bytes);
+    GGML_ASSERT(ggml_nbytes(history) == (size_t) params->dynamic_bytes);
+    GGML_ASSERT(ggml_nbytes(current_token) == 316);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, params->head_dim, params->n_head_q);
+    ggml_set_op_params(result, params, sizeof(*params));
+    result->op     = GGML_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE;
+    result->src[0] = q;
+    result->src[1] = producer;
+    result->src[2] = consumer;
+    result->src[3] = shared;
+    result->src[4] = history;
+    result->src[5] = current_token;
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -7038,6 +7181,9 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_EDGEKV_RECONSTRUCT:
         case GGML_OP_EDGEKV_ATTN_DECODE:
+        case GGML_OP_EDGEKV_BLOCKGTQ_PACK_TOKEN:
+        case GGML_OP_EDGEKV_BLOCKGTQ_PACK_BATCH:
+        case GGML_OP_EDGEKV_BLOCKGTQ_ATTN_DECODE:
             {
                 GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
             }

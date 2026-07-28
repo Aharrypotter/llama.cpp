@@ -71,6 +71,13 @@ enum {
     K_LUT_HALF_VALUES = 28864,
 };
 
+static size_t v_rotations_offset(
+    const struct edgekv_blockgtq_inputs * inputs) {
+    return inputs->transform_v_rotations_offset != 0
+               ? inputs->transform_v_rotations_offset
+               : TRANSFORM_V_ROTATIONS;
+}
+
 static uint16_t read_u16(const uint8_t * p) {
     return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
 }
@@ -337,16 +344,26 @@ static int build_catalogs(const uint8_t * consumer,
                : EDGEKV_BLOCKGTQ_STATIC_LAYOUT_MISMATCH;
 }
 
-int edgekv_blockgtq_validate_static(const uint8_t * transform,
-                                    size_t transform_bytes,
-                                    const uint8_t * consumer,
-                                    size_t consumer_bytes,
-                                    const uint8_t * shared,
-                                    size_t shared_bytes) {
+static int validate_static_layout(const uint8_t * transform,
+                                  size_t transform_bytes,
+                                  size_t transform_v_rotations_offset,
+                                  const uint8_t * consumer,
+                                  size_t consumer_bytes,
+                                  const uint8_t * shared,
+                                  size_t shared_bytes) {
     if (transform == NULL || consumer == NULL || shared == NULL ||
-        transform_bytes != EDGEKV_BLOCKGTQ_TRANSFORM_BYTES ||
         consumer_bytes != EDGEKV_BLOCKGTQ_CONSUMER_BYTES ||
         shared_bytes != EDGEKV_BLOCKGTQ_SHARED_BYTES) {
+        return EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
+    }
+    const bool legacy_layout =
+        transform_bytes == EDGEKV_BLOCKGTQ_TRANSFORM_BYTES &&
+        transform_v_rotations_offset == TRANSFORM_V_ROTATIONS;
+    const bool producer_layout =
+        transform_bytes == EDGEKV_BLOCKGTQ_PRODUCER_BYTES &&
+        transform_v_rotations_offset ==
+            EDGEKV_BLOCKGTQ_PRODUCER_V_ROTATIONS_OFFSET;
+    if (!legacy_layout && !producer_layout) {
         return EDGEKV_BLOCKGTQ_INVALID_ARGUMENT;
     }
     size_t rotation_offsets[85];
@@ -427,6 +444,29 @@ int edgekv_blockgtq_validate_static(const uint8_t * transform,
     }
     return semantic_groups == 319 ? EDGEKV_BLOCKGTQ_OK
                                   : EDGEKV_BLOCKGTQ_STATIC_LAYOUT_MISMATCH;
+}
+
+int edgekv_blockgtq_validate_static(const uint8_t * transform,
+                                    size_t transform_bytes,
+                                    const uint8_t * consumer,
+                                    size_t consumer_bytes,
+                                    const uint8_t * shared,
+                                    size_t shared_bytes) {
+    return validate_static_layout(
+        transform, transform_bytes, TRANSFORM_V_ROTATIONS, consumer,
+        consumer_bytes, shared, shared_bytes);
+}
+
+int edgekv_blockgtq_validate_static_v2(const uint8_t * producer,
+                                       size_t producer_bytes,
+                                       const uint8_t * consumer,
+                                       size_t consumer_bytes,
+                                       const uint8_t * shared,
+                                       size_t shared_bytes) {
+    return validate_static_layout(
+        producer, producer_bytes,
+        EDGEKV_BLOCKGTQ_PRODUCER_V_ROTATIONS_OFFSET, consumer,
+        consumer_bytes, shared, shared_bytes);
 }
 
 #ifdef EDGEKV_BLOCKGTQ_TARGET_QUERY_ROTATION_FORENSICS
@@ -518,8 +558,9 @@ static int edgekv_blockgtq_attn_decode_impl(
         stage_start);
     stage_start = attribution_start(attribution);
 #endif
-    int status = edgekv_blockgtq_validate_static(
-        inputs->transform, inputs->transform_bytes, inputs->consumer,
+    int status = validate_static_layout(
+        inputs->transform, inputs->transform_bytes,
+        v_rotations_offset(inputs), inputs->consumer,
         inputs->consumer_bytes, inputs->shared, inputs->shared_bytes);
     if (status != EDGEKV_BLOCKGTQ_OK) {
         return status;
@@ -901,7 +942,7 @@ static int edgekv_blockgtq_attn_decode_impl(
             inputs->consumer + CONSUMER_V_ROTATION_INDEX +
             (size_t) head * 2u);
         const size_t rotation_base =
-            TRANSFORM_V_ROTATIONS +
+            v_rotations_offset(inputs) +
             (size_t) rotation * EDGEKV_BLOCKGTQ_HEAD_DIM *
                 EDGEKV_BLOCKGTQ_HEAD_DIM * 4u;
         for (int original = 0; original < EDGEKV_BLOCKGTQ_HEAD_DIM;
