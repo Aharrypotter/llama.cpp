@@ -249,6 +249,17 @@ llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-edgekv-attn-decode.cpp)
 
+add_executable(test-htp-opbatch-status test-htp-opbatch-status.cpp)
+target_include_directories(test-htp-opbatch-status PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/src/ggml-hexagon/htp)
+llama_test(test-htp-opbatch-status)
+
+if (TARGET ggml-hexagon)
+    add_executable(test-htp-status-propagation test-htp-status-propagation.cpp)
+    target_link_libraries(test-htp-status-propagation PRIVATE ggml ggml-hexagon)
+    llama_test(test-htp-status-propagation)
+endif()
+
 set(LLAMA_EDGEKV_BLOCKGTQ_H7_FIXTURE "" CACHE FILEPATH
     "Path to the frozen B2-T4P-H7 Block-GTQ fixture")
 set(LLAMA_EDGEKV_BLOCKGTQ_PACKAGE "" CACHE FILEPATH

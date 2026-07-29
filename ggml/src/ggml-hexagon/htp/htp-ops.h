@@ -2,8 +2,9 @@
 #define HTP_OPS_H
 
 #include <assert.h>
+#include <stdint.h>
 
-// ggml-common.h must be included prio to this header
+// ggml-common.h must be included prior to this header.
 
 enum htp_status {
     HTP_STATUS_OK             = 1,
@@ -12,6 +13,16 @@ enum htp_status {
     HTP_STATUS_INVAL_PARAMS   = 4,
     HTP_STATUS_VTCM_TOO_SMALL = 5,
 };
+
+#define HTP_OP_INDEX_NONE UINT32_MAX
+
+static inline int htp_status_is_known(uint32_t status) {
+    return status >= HTP_STATUS_OK && status <= HTP_STATUS_VTCM_TOO_SMALL;
+}
+
+static inline int htp_status_poison_session(uint32_t status, int response_valid) {
+    return !response_valid || status == HTP_STATUS_INTERNAL_ERR;
+}
 
 // First set of values must match the ggml_type.
 // Duplicated here because we can't include full ggml.h in the htp build.
@@ -232,8 +243,56 @@ struct htp_opbatch_rsp {
     uint32_t n_bufs;     // Number of buffers
     uint32_t n_tensors;  // Number of tensors
     uint32_t n_ops;      // Number of op profile descriptors
-    uint32_t pad;        // unused
+    uint32_t failed_op;  // First failed op index, or HTP_OP_INDEX_NONE
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
+
+struct htp_status_counts {
+    uint64_t submitted;
+    uint64_t completed;
+    uint64_t failed;
+    uint64_t unsupported;
+    uint64_t response_errors;
+};
+
+static inline void htp_status_counts_reset(struct htp_status_counts * counts) {
+    counts->submitted       = 0;
+    counts->completed       = 0;
+    counts->failed          = 0;
+    counts->unsupported     = 0;
+    counts->response_errors = 0;
+}
+
+static inline int htp_opbatch_rsp_is_consistent(const struct htp_opbatch_rsp * rsp) {
+    if (!htp_status_is_known(rsp->status) || rsp->n_ops == 0) {
+        return 0;
+    }
+    if (rsp->status == HTP_STATUS_OK) {
+        return rsp->failed_op == HTP_OP_INDEX_NONE;
+    }
+    return rsp->failed_op < rsp->n_ops;
+}
+
+static inline uint32_t htp_opbatch_rsp_attempted(const struct htp_opbatch_rsp * rsp) {
+    return rsp->status == HTP_STATUS_OK ? rsp->n_ops : rsp->failed_op + 1;
+}
+
+static inline uint32_t htp_opbatch_rsp_completed(const struct htp_opbatch_rsp * rsp) {
+    return rsp->status == HTP_STATUS_OK ? rsp->n_ops : rsp->failed_op;
+}
+
+static inline void htp_status_counts_record_submission(
+        struct htp_status_counts * counts, uint32_t n_ops) {
+    counts->submitted += n_ops;
+}
+
+static inline void htp_status_counts_record_response(
+        struct htp_status_counts * counts, const struct htp_opbatch_rsp * rsp) {
+    counts->completed += htp_opbatch_rsp_completed(rsp);
+    if (rsp->status != HTP_STATUS_OK) {
+        counts->failed += 1;
+        counts->unsupported += rsp->status == HTP_STATUS_NO_SUPPORT;
+    }
+}
 
 #endif /* HTP_OPS_H */

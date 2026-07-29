@@ -163,6 +163,15 @@ struct ggml_hexagon_session {
     ggml_hexagon_opbatch* op_batch;
     ggml_hexagon_opqueue* op_queue;
 
+    htp_status_counts total_counts = {};
+    htp_status_counts graph_counts = {};
+    uint64_t          graph_id     = 0;
+    uint32_t          first_status = HTP_STATUS_OK;
+    uint32_t          first_batch  = HTP_OP_INDEX_NONE;
+    uint32_t          first_op     = HTP_OP_INDEX_NONE;
+    uint32_t          first_opcode = HTP_OP_INVALID;
+    bool              poisoned     = false;
+
     ggml_backend_buffer_type buffer_type        = {};
     ggml_backend_buffer_type repack_buffer_type = {};
 
@@ -174,11 +183,16 @@ struct ggml_hexagon_session {
     void allocate(int dev_id) noexcept(false);
     void release() noexcept(true);
 
-    void enqueue_op(htp_op_code opcode, const ggml_tensor *op);
-    void flush(bool all = true);
+    bool enqueue_op(htp_op_code opcode, const ggml_tensor *op);
+    uint32_t flush(bool all = true);
 
-    void flush_pending(bool all = false);
-    void flush_batch();
+    uint32_t flush_pending(bool all = false);
+    bool flush_batch();
+    void begin_graph();
+    void record_submission(uint32_t n_ops);
+    void record_response(const htp_opbatch_rsp & rsp, bool response_valid, uint32_t failed_opcode);
+    uint32_t consume_status();
+    void log_status_summary(const char * scope, const htp_status_counts & counts) const;
 };
 
 // ** backend buffers
@@ -1749,6 +1763,10 @@ struct ggml_hexagon_opqueue {
 
     std::queue<unsigned int>    done;       // completed batch ids
     std::vector<opvec>          op_cache;   // per batch op cache
+    std::vector<u32vec>         opcode_cache;
+    std::vector<uint32_t>       n_bufs_cache;
+    std::vector<uint32_t>       n_tensors_cache;
+    std::vector<uint32_t>       n_ops_cache;
     std::vector<uint64_t>       start_usec; // per batch start time
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
@@ -1764,6 +1782,10 @@ struct ggml_hexagon_opqueue {
         shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
 
         op_cache.resize(depth);
+        opcode_cache.resize(depth);
+        n_bufs_cache.resize(depth, 0);
+        n_tensors_cache.resize(depth, 0);
+        n_ops_cache.resize(depth, 0);
         start_usec.resize(depth, 0);
 
         // init done queue
@@ -1797,6 +1819,13 @@ struct ggml_hexagon_opqueue {
 
         op_cache[req.id]   = op_batch->ops;
         start_usec[req.id] = ggml_time_us();
+        n_bufs_cache[req.id] = req.n_bufs;
+        n_tensors_cache[req.id] = req.n_tensors;
+        n_ops_cache[req.id] = req.n_ops;
+        opcode_cache[req.id].resize(req.n_ops);
+        for (uint32_t i = 0; i < req.n_ops; ++i) {
+            opcode_cache[req.id][i] = op_batch->h_ops[i].opcode;
+        }
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
         const size_t t_size = sizeof(htp_tensor)    * req.n_tensors;
@@ -1843,48 +1872,128 @@ struct ggml_hexagon_opqueue {
         return true;
     }
 
-    void pop(htp_opbatch_rsp rsp, dspqueue_buffer dbuf) {
+    bool response_matches(const htp_opbatch_rsp & rsp) const {
+        if (rsp.id >= op_cache.size()) {
+            return false;
+        }
+
+        return rsp.n_bufs == n_bufs_cache[rsp.id] &&
+               rsp.n_tensors == n_tensors_cache[rsp.id] &&
+               rsp.n_ops == n_ops_cache[rsp.id] &&
+               htp_opbatch_rsp_is_consistent(&rsp);
+    }
+
+    uint32_t failed_opcode(const htp_opbatch_rsp & rsp) const {
+        if (rsp.id >= opcode_cache.size() || rsp.status == HTP_STATUS_OK ||
+            rsp.failed_op >= opcode_cache[rsp.id].size()) {
+            return HTP_OP_INVALID;
+        }
+        return opcode_cache[rsp.id][rsp.failed_op];
+    }
+
+    void pop(htp_opbatch_rsp rsp, dspqueue_buffer dbuf, bool response_valid) {
         GGML_ASSERT(rsp.id < op_cache.size());
 
         done.push(rsp.id);
 
-        const size_t b_size = sizeof(htp_buf_desc)  * rsp.n_bufs;
-        const size_t t_size = sizeof(htp_tensor)    * rsp.n_tensors;
-        const size_t o_size = sizeof(htp_op_desc)   * rsp.n_ops;
-        const size_t p_size = sizeof(htp_prof_desc) * rsp.n_ops;
+        const uint32_t n_bufs = n_bufs_cache[rsp.id];
+        const uint32_t n_tensors = n_tensors_cache[rsp.id];
+        const uint32_t n_ops = n_ops_cache[rsp.id];
+        const size_t b_size = sizeof(htp_buf_desc)  * n_bufs;
+        const size_t t_size = sizeof(htp_tensor)    * n_tensors;
+        const size_t o_size = sizeof(htp_op_desc)   * n_ops;
+        const size_t p_size = sizeof(htp_prof_desc) * n_ops;
 
         const size_t m_size = b_size + t_size + o_size + p_size;
         GGML_ASSERT(m_size <= shm_blk_size);
 
         HEX_VERBOSE("ggml-hex: %s op-queue pop batch #%u : n-bufs %u n-tensors %u n-ops %u : m-size %zu b-size %zu t-size %zu o-size %zu\n",
-                shm_buf->sess->c_name(), rsp.id, rsp.n_bufs, rsp.n_tensors, rsp.n_ops,
+                shm_buf->sess->c_name(), rsp.id, n_bufs, n_tensors, n_ops,
                 (size_t) dbuf.size, b_size, t_size, o_size);
 
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
 
-        if (opt_profile && rsp.n_ops > 0) {
+        if (opt_profile && response_valid) {
             auto & ops = op_cache[rsp.id];
 
             uint64_t batch_usec = ggml_time_us() - start_usec[rsp.id];
             uint32_t htp_usec   = 0;
+            const uint32_t n_attempted = htp_opbatch_rsp_attempted(&rsp);
 
-            GGML_ASSERT(rsp.n_ops <= ops.size());
+            GGML_ASSERT(n_attempted <= ops.size());
 
             const htp_prof_desc * pd = (const htp_prof_desc *) p_ptr;
-            for (uint32_t i = 0; i < rsp.n_ops; i++) {
+            for (uint32_t i = 0; i < n_attempted; i++) {
                 htp_usec += pd[i].usecs;
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i].usecs, pd[i].cycles, pd[i].pmu);
             }
 
             GGML_LOG_DEBUG("ggml-hex: %s profile-batch n-ops %u batch-dur-usec %lld htp-ops-usec %u\n",
-                           shm_buf->sess->c_name(), rsp.n_ops, (long long) batch_usec, htp_usec);
+                           shm_buf->sess->c_name(), n_attempted, (long long) batch_usec, htp_usec);
         }
     }
 };
 
-// Flush HTP response queue i.e wait for all outstanding requests to complete
-void ggml_hexagon_session::flush_pending(bool all) {
+void ggml_hexagon_session::begin_graph() {
+    graph_id++;
+    htp_status_counts_reset(&graph_counts);
+}
+
+void ggml_hexagon_session::record_submission(uint32_t n_ops) {
+    htp_status_counts_record_submission(&total_counts, n_ops);
+    htp_status_counts_record_submission(&graph_counts, n_ops);
+}
+
+void ggml_hexagon_session::record_response(
+        const htp_opbatch_rsp & rsp, bool response_valid, uint32_t failed_opcode) {
+    if (response_valid) {
+        htp_status_counts_record_response(&total_counts, &rsp);
+        htp_status_counts_record_response(&graph_counts, &rsp);
+    } else {
+        total_counts.response_errors++;
+        graph_counts.response_errors++;
+    }
+
+    const uint32_t status = response_valid ? rsp.status : HTP_STATUS_INTERNAL_ERR;
+    poisoned = poisoned || htp_status_poison_session(status, response_valid);
+    if (status != HTP_STATUS_OK && first_status == HTP_STATUS_OK) {
+        first_status = status;
+        first_batch  = rsp.id;
+        first_op     = response_valid ? rsp.failed_op : HTP_OP_INDEX_NONE;
+        first_opcode = response_valid ? failed_opcode : HTP_OP_INVALID;
+    }
+}
+
+uint32_t ggml_hexagon_session::consume_status() {
+    const uint32_t status = first_status;
+    if (!poisoned) {
+        first_status = HTP_STATUS_OK;
+        first_batch  = HTP_OP_INDEX_NONE;
+        first_op     = HTP_OP_INDEX_NONE;
+        first_opcode = HTP_OP_INVALID;
+    }
+    return status;
+}
+
+void ggml_hexagon_session::log_status_summary(
+        const char * scope, const htp_status_counts & counts) const {
+    const uint64_t accounted = counts.completed + counts.failed;
+    const uint64_t skipped   = counts.submitted > accounted ? counts.submitted - accounted : 0;
+
+    GGML_LOG_INFO(
+            "ggml-hex: htp-status scope=%s session=%s graph=%llu status=%s submitted=%llu completed=%llu "
+            "failed=%llu unsupported=%llu skipped=%llu response-errors=%llu first-batch=%u first-op=%u "
+            "first-opcode=%u\n",
+            scope, this->c_name(), (unsigned long long) graph_id, status_to_str(first_status),
+            (unsigned long long) counts.submitted, (unsigned long long) counts.completed,
+            (unsigned long long) counts.failed, (unsigned long long) counts.unsupported,
+            (unsigned long long) skipped, (unsigned long long) counts.response_errors,
+            first_batch, first_op, first_opcode);
+}
+
+// Flush HTP response queue i.e wait for outstanding requests to complete.
+uint32_t ggml_hexagon_session::flush_pending(bool all) {
     while (this->op_pending) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1908,32 +2017,48 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
         }
 
-        if (rsp.status != HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+        const bool response_valid = op_queue->response_matches(rsp);
+        const uint32_t failed_opcode = op_queue->failed_opcode(rsp);
+        record_response(rsp, response_valid, failed_opcode);
+
+        if (!response_valid) {
+            GGML_LOG_ERROR(
+                    "ggml-hex: %s dspcall : malformed response batch=%u status=%u n-bufs=%u n-tensors=%u "
+                    "n-ops=%u failed-op=%u\n",
+                    this->c_name(), rsp.id, rsp.status, rsp.n_bufs, rsp.n_tensors, rsp.n_ops, rsp.failed_op);
+        } else if (rsp.status != HTP_STATUS_OK) {
+            GGML_LOG_ERROR(
+                    "ggml-hex: %s dspcall : batch=%u op=%u opcode=%u status=%s\n",
+                    this->c_name(), rsp.id, rsp.failed_op, failed_opcode, status_to_str(rsp.status));
         }
 
-        op_queue->pop(rsp, dbuf);
+        if (rsp.id < op_queue->op_cache.size()) {
+            op_queue->pop(rsp, dbuf, response_valid);
+        } else {
+            GGML_LOG_ERROR("ggml-hex: %s dspcall : cannot recycle invalid batch id %u\n", this->c_name(), rsp.id);
+        }
 
         this->op_pending--;  // atomic dec
 
         if (!all) break;
     }
+
+    return first_status;
 }
 
-void ggml_hexagon_session::flush_batch() {
-    if (op_batch->empty()) { return; }
+bool ggml_hexagon_session::flush_batch() {
+    if (op_batch->empty()) { return true; }
+    if (first_status != HTP_STATUS_OK) { return false; }
 
     htp_opbatch_req req {};
     dspqueue_buffer dbuf{};
 
     if (!op_queue->push(req, dbuf, op_batch)) {
-        flush_pending(false);
-        op_queue->push(req, dbuf, op_batch);
+        if (flush_pending(false) != HTP_STATUS_OK) {
+            return false;
+        }
+        GGML_ASSERT(op_queue->push(req, dbuf, op_batch));
     }
-
-    // Bump pending flag (cleared in the session::flush once we get the response)
-    this->op_pending++;  // atomic inc
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
@@ -1941,19 +2066,35 @@ void ggml_hexagon_session::flush_batch() {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
+
+    // Bump pending only after a successful queue write.
+    this->op_pending++;  // atomic inc
+    record_submission(req.n_ops);
+    return true;
 }
 
-void ggml_hexagon_session::enqueue_op(htp_op_code opcode, const ggml_tensor *op) {
+bool ggml_hexagon_session::enqueue_op(htp_op_code opcode, const ggml_tensor *op) {
+    if (first_status != HTP_STATUS_OK) {
+        return false;
+    }
     if (!op_batch->fit_op(op)) {
-        flush_batch();
+        if (!flush_batch()) {
+            return false;
+        }
     }
     op_batch->add_op(opcode, op);
+    return true;
 }
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
-void ggml_hexagon_session::flush(bool all) {
-    flush_batch();
-    flush_pending(all);
+uint32_t ggml_hexagon_session::flush(bool all) {
+    if (!flush_batch() && !op_batch->empty()) {
+        op_batch->reset();
+    }
+    if (this->op_pending) {
+        flush_pending(all);
+    }
+    return first_status;
 }
 
 static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
@@ -1996,7 +2137,15 @@ void ggml_hexagon_session::allocate(int dev_id) noexcept(false) {
     this->dev_id     = dev_id;
     this->name       = std::string("HTP") + std::to_string(dev_id);
 
-    this->op_pending  = 0;
+    this->op_pending = 0;
+    htp_status_counts_reset(&total_counts);
+    htp_status_counts_reset(&graph_counts);
+    graph_id     = 0;
+    first_status = HTP_STATUS_OK;
+    first_batch  = HTP_OP_INDEX_NONE;
+    first_op     = HTP_OP_INDEX_NONE;
+    first_opcode = HTP_OP_INVALID;
+    poisoned     = false;
 
     GGML_LOG_DEBUG("ggml-hex: %s allocating new session\n", this->name.c_str());
 
@@ -2154,6 +2303,10 @@ void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     int err;
+
+    if (this->op_queue) {
+        log_status_summary("session", total_counts);
+    }
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
@@ -2854,15 +3007,35 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    const uint32_t prior_status = sess->consume_status();
+    if (prior_status != HTP_STATUS_OK) {
+        GGML_LOG_ERROR(
+                "ggml-hex: %s graph-compute rejected after asynchronous HTP failure: %s\n",
+                sess->c_name(), status_to_str(prior_status));
+        return GGML_STATUS_FAILED;
+    }
+
+    sess->begin_graph();
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * n = graph->nodes[i];
         if (op_is_compute(n) && (opt_opstage & HTP_OPSTAGE_QUEUE)) {
-            sess->enqueue_op(op_remap_to_htp(n), n);
+            if (!sess->enqueue_op(op_remap_to_htp(n), n)) {
+                break;
+            }
         }
     }
 
     // Wait until all pending ops complete
-    sess->flush();
+    const uint32_t status = sess->flush();
+    if (opt_verbose || opt_profile || status != HTP_STATUS_OK) {
+        sess->log_status_summary("graph", sess->graph_counts);
+    }
+
+    if (status != HTP_STATUS_OK) {
+        sess->consume_status();
+        return GGML_STATUS_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2873,7 +3046,10 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
     // Wait until all pending ops complete
-    sess->flush();
+    const uint32_t status = sess->flush();
+    if (status != HTP_STATUS_OK) {
+        sess->log_status_summary("synchronize", sess->graph_counts);
+    }
 }
 
 struct node_info {
